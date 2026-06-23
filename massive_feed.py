@@ -59,6 +59,8 @@ def _row_from_contract(c: dict) -> OptionRow | None:
     details = c.get("details", {})              # CONFIRM: contract_type, strike_price
     greeks = c.get("greeks", {})                # CONFIRM: gamma, delta
     quote = c.get("last_quote", {})             # CONFIRM: bid, ask
+    details = c.get("details", {})
+    greeks = c.get("greeks", {})
     side = details.get("contract_type")         # "call" | "put"
     strike = details.get("strike_price")
     gamma = greeks.get("gamma")
@@ -67,6 +69,18 @@ def _row_from_contract(c: dict) -> OptionRow | None:
     bid = quote.get("bid")
     ask = quote.get("ask")
     if None in (side, strike, gamma, delta, oi, bid, ask):
+
+    # Prefer real-time last_quote; fall back to day.close (confirmed absent in API)
+    quote = c.get("last_quote", {})
+    bid = quote.get("bid")
+    ask = quote.get("ask")
+    if bid is None or ask is None:
+        close = c.get("day", {}).get("close")
+        if close is None:
+            return None
+        bid = ask = close  # spread_pct=0; mid=close
+
+    if None in (side, strike, gamma, delta, oi):
         return None
     if bid <= 0 or ask <= 0:
         return None
@@ -96,6 +110,25 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
             ua = c.get("underlying_asset", {})          # CONFIRM: underlying_asset.price
             if ua.get("price"):
                 spot = float(ua["price"])
+    best_delta = 0.0  # track deepest-ITM call for spot estimation
+
+    while url and pages < 25:            # safety cap on pagination
+        data = _get(url, key)
+        for c in data.get("results", []):
+            # Prefer API-provided spot; fall back to deep-ITM call intrinsic value
+            ua = c.get("underlying_asset", {})
+            if ua.get("price"):
+                spot = float(ua["price"])
+            elif not spot:
+                details = c.get("details", {})
+                greeks = c.get("greeks", {})
+                d = abs(greeks.get("delta") or 0)
+                close = c.get("day", {}).get("close") or 0
+                if (details.get("contract_type") == "call"
+                        and d > best_delta and d > 0.95 and close > 0):
+                    best_delta = d
+                    spot = float(details.get("strike_price", 0)) + float(close)
+
             if zero_dte_only and c.get("details", {}).get("expiration_date") != today:
                 continue
             row = _row_from_contract(c)
@@ -103,6 +136,7 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
                 rows.append(row)
         nxt = data.get("next_url")
         url = (nxt + (("&" if "?" in nxt else "?") )) if nxt else None
+        url = nxt if nxt else None
         pages += 1
 
     return spot, rows
