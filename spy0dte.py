@@ -21,7 +21,7 @@ Not financial advice. 0DTE directional buying is the highest-variance path
 there is; this engine is built to keep you in the game, not to promise wins.
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import floor
 
 # ----------------------------- knobs (few on purpose) ---------------------- #
@@ -54,6 +54,10 @@ class OptionRow:
     bid: float
     ask: float
     delta: float     # absolute value
+    # quote provenance — fallback quotes (bid=ask=close) make spread look like 0
+    # and silently defeat the spread filter. Track it; reject it for live trades.
+    quote_source: str = "live_quote"   # "live_quote" | "day_close_fallback"
+    quote_valid: bool = True
 
     @property
     def mid(self) -> float:
@@ -206,13 +210,15 @@ def decide(gm: GammaMap, price_accepting: int) -> Decision:
 
 
 # --------------------------- contract + sizing ----------------------------- #
-def select_order(chain: list[OptionRow], d: Decision, equity: float, risk_frac: float) -> Order | None:
+def select_order(chain: list[OptionRow], d: Decision, equity: float, risk_frac: float,
+                 require_live: bool = True) -> Order | None:
     if d.action not in ("CALL", "PUT"):
         return None
     want = "call" if d.action == "CALL" else "put"
     cands = [r for r in chain
              if r.side == want and DELTA_LOW <= r.delta <= DELTA_HIGH
-             and r.spread_pct <= MAX_SPREAD_PCT and r.mid > 0]
+             and r.spread_pct <= MAX_SPREAD_PCT and r.mid > 0
+             and (r.quote_valid or not require_live)]   # never size live off a fallback quote
     if not cands:
         return None
     mid_band = (DELTA_LOW + DELTA_HIGH) / 2
@@ -255,7 +261,7 @@ def _nearest(chain: list[OptionRow], side: str, strike: float) -> OptionRow | No
 
 
 def select_condor(chain: list[OptionRow], gm: GammaMap, equity: float,
-                  risk_frac: float) -> CondorOrder | None:
+                  risk_frac: float, require_live: bool = True) -> CondorOrder | None:
     """
     Sell the walls. Short put at the put wall, short call at the call wall, long
     wings CONDOR_WIDTH beyond. The walls are the natural short strikes: in a pin
@@ -269,6 +275,9 @@ def select_condor(chain: list[OptionRow], gm: GammaMap, equity: float,
     lc = _nearest(chain, "call", gm.call_wall + CONDOR_WIDTH)
     if not all((sp, lp, sc, lc)):
         return None
+    if require_live and not all((sp.quote_valid, lp.quote_valid,
+                                 sc.quote_valid, lc.quote_valid)):
+        return None  # any fallback-quoted leg -> credit is fiction -> abstain
     credit = (sp.mid - lp.mid) + (sc.mid - lc.mid)
     if credit <= 0:
         return None
@@ -287,7 +296,6 @@ def select_condor(chain: list[OptionRow], gm: GammaMap, equity: float,
                        round(credit, 2), round(max_loss_per, 2), contracts,
                        round(max_loss_per * contracts, 2),
                        round(credit * CONDOR_PROFIT_TARGET, 2), thesis)
-
 
 
 def synthetic_chain(spot: float, skew: str) -> list[OptionRow]:
@@ -317,13 +325,11 @@ def synthetic_chain(spot: float, skew: str) -> list[OptionRow]:
 
 
 def run_once(spot: float, skew: str, accepting: int, equity: float,
-             risk_frac: float, iv_annual: float = 0.15, minutes_left: int = 120,
-             n_trades: int = 0) -> None:
+             risk_frac: float, iv_annual: float = 0.15, minutes_left: int = 120) -> None:
     """
-    iv_annual: implied vol (annualised fraction) used by the MC prior.
-    minutes_left: session time remaining — feed real clock minutes in live use.
-    n_trades: logged trades in the journal; below MIN_TRADES_TO_SCALE the MC
-              prior substitutes for the journal-based risk fraction.
+    iv_annual / minutes_left: used by the MC to project the trade — informational
+    only. Risk is always sized from risk_frac (journal-derived or floor). MC is a
+    prior and a display; it does NOT override sizing.
     """
     import mc as _mc  # lazy import keeps mc/numpy optional for pure engine tests
 
@@ -335,7 +341,6 @@ def run_once(spot: float, skew: str, accepting: int, equity: float,
     print(f"DECISION: {d.action} — {d.reason}")
 
     if d.action in ("CALL", "PUT"):
-        # win_R: price distance to wall / distance to stop (R-ratio in spot space)
         dist_target = abs(d.target - spot)
         dist_stop = abs(spot - d.stop_ref) if d.stop_ref else dist_target / 2
         win_R = max(0.5, dist_target / dist_stop) if dist_stop > 0 else 1.0
@@ -344,39 +349,24 @@ def run_once(spot: float, skew: str, accepting: int, equity: float,
                            iv_annual=iv_annual, regime=gm.regime, win_R=win_R, seed=42)
         print(f"MC PRIOR:  {proj.note}")
 
-        # use MC-derived Kelly as prior when journal is below the sample threshold
-        eff_frac = risk_frac
-        if n_trades < MIN_TRADES_TO_SCALE:
-            mc_wr, mc_aw, mc_al = _mc.p_to_kelly_inputs(proj, win_R)
-            mc_frac, mc_why = scale_risk(MIN_TRADES_TO_SCALE, mc_wr, mc_aw, mc_al)
-            eff_frac = mc_frac
-            print(f"MC SIZING: {mc_why} -> {eff_frac:.0%} (journal < {MIN_TRADES_TO_SCALE} trades)")
-
-        order = select_order(chain, d, equity, eff_frac)
+        order = select_order(chain, d, equity, risk_frac)
         if order:
             print("ORDER:", order.thesis, f"| risk ${order.dollar_risk:.0f}")
         else:
-            print(f"NO ORDER: no contract fit, or stop-risk exceeds {eff_frac:.0%} of ${equity:.0f} — abstain")
+            print(f"NO ORDER: no contract fit, or stop-risk exceeds {risk_frac:.0%} of ${equity:.0f} — abstain")
 
     elif d.action == "SELL_CONDOR":
-        win_R = CONDOR_PROFIT_TARGET / (1 - CONDOR_PROFIT_TARGET)  # credit/maxloss ratio
+        win_R = CONDOR_PROFIT_TARGET / (1 - CONDOR_PROFIT_TARGET)
         proj = _mc.project_range(spot=spot, lower_short=gm.put_wall, upper_short=gm.call_wall,
                                  flip=gm.gamma_flip, minutes_left=minutes_left,
                                  iv_annual=iv_annual, regime=gm.regime, win_R=win_R, seed=42)
         print(f"MC PRIOR:  {proj.note}")
 
-        eff_frac = risk_frac
-        if n_trades < MIN_TRADES_TO_SCALE:
-            mc_wr, mc_aw, mc_al = _mc.p_to_kelly_inputs(proj, win_R)
-            mc_frac, mc_why = scale_risk(MIN_TRADES_TO_SCALE, mc_wr, mc_aw, mc_al)
-            eff_frac = mc_frac
-            print(f"MC SIZING: {mc_why} -> {eff_frac:.0%} (journal < {MIN_TRADES_TO_SCALE} trades)")
-
-        condor = select_condor(chain, gm, equity, eff_frac)
+        condor = select_condor(chain, gm, equity, risk_frac)
         if condor:
             print("ORDER:", condor.thesis, f"| risk ${condor.dollar_risk:.0f}")
         else:
-            print(f"NO ORDER: condor didn't fit {eff_frac:.0%} of ${equity:.0f} — abstain")
+            print(f"NO ORDER: condor didn't fit {risk_frac:.0%} of ${equity:.0f} — abstain")
 
 
 if __name__ == "__main__":
@@ -388,8 +378,9 @@ if __name__ == "__main__":
     riskE, whyE = scale_risk(n_trades=40, win_rate=0.40, avg_win=2.6, avg_loss=1.0)
     print(f"[risk] example after 40 trades: {riskE:.0%} — {whyE}")
 
-    print(f"\n--- running scenarios; n_trades=0 so MC prior drives sizing ---")
-    run_once(600.0, "trend_down", accepting=-1, equity=EQ, risk_frac=riskE, n_trades=0)
-    run_once(600.0, "trend_up",   accepting=+1, equity=EQ, risk_frac=riskE, n_trades=0)
-    run_once(600.0, "pin",        accepting=+1, equity=EQ, risk_frac=riskE, n_trades=0)
-    run_once(600.0, "trend_up",   accepting=0,  equity=EQ, risk_frac=riskE, n_trades=0)
+    print(f"\n--- running scenarios at the EARNED fraction ({riskE:.0%}); at the {risk0:.0%} "
+          f"floor nothing fits a $1k account, which is the honest result ---")
+    run_once(600.0, "trend_down", accepting=-1, equity=EQ, risk_frac=riskE)  # short gamma -> PUT
+    run_once(600.0, "trend_up",   accepting=+1, equity=EQ, risk_frac=riskE)  # long gamma -> SELL condor
+    run_once(600.0, "pin",        accepting=+1, equity=EQ, risk_frac=riskE)  # balanced OI -> flat ratio
+    run_once(600.0, "trend_up",   accepting=0,  equity=EQ, risk_frac=riskE)  # no acceptance -> aside

@@ -55,32 +55,45 @@ def _get(url: str, key: str) -> dict:
 
 
 def _row_from_contract(c: dict) -> OptionRow | None:
-    """Map one snapshot contract to an OptionRow. Returns None if data is incomplete."""
-    details = c.get("details", {})
-    greeks = c.get("greeks", {})
-    side = details.get("contract_type")         # "call" | "put"
+    """Map one snapshot contract to an OptionRow. Returns None if data is incomplete.
+    If live bid/ask is absent, fall back to the day close BUT tag it so live
+    selection rejects it — a fallback quote has spread 0 and would defeat the
+    liquidity filter."""
+    details = c.get("details", {})              # CONFIRM: contract_type, strike_price
+    greeks = c.get("greeks", {})                # CONFIRM: gamma, delta
+    quote = c.get("last_quote", {}) or {}       # CONFIRM: bid, ask
+    day = c.get("day", {}) or {}                # daily agg, has close
+    side = details.get("contract_type")
     strike = details.get("strike_price")
     gamma = greeks.get("gamma")
     delta = greeks.get("delta")
     oi = c.get("open_interest")
-
-    # Prefer real-time last_quote; fall back to day.close (confirmed absent in API)
-    quote = c.get("last_quote", {})
-    bid = quote.get("bid")
-    ask = quote.get("ask")
-    if bid is None or ask is None:
-        close = c.get("day", {}).get("close")
-        if close is None:
-            return None
-        bid = ask = close  # spread_pct=0; mid=close
-
     if None in (side, strike, gamma, delta, oi):
         return None
-    if bid <= 0 or ask <= 0:
-        return None
+
+    bid, ask = quote.get("bid"), quote.get("ask")
+    if bid is not None and ask is not None and bid > 0 and ask > 0:
+        source, valid = "live_quote", True
+    else:
+        close = day.get("close")
+        if not close or close <= 0:
+            return None                          # no quote AND no close -> unusable
+        bid = ask = float(close)                 # fallback: diagnostics only
+        source, valid = "day_close_fallback", False
+
     return OptionRow(side=side, strike=float(strike), oi=int(oi),
                      gamma=float(gamma), bid=float(bid), ask=float(ask),
-                     delta=abs(float(delta)))
+                     delta=abs(float(delta)), quote_source=source, quote_valid=valid)
+
+
+def _estimate_spot(rows: list[OptionRow]) -> float:
+    """If underlying_asset.price is missing, estimate spot from a deep-ITM call:
+    spot ~= strike + call_mid (intrinsic-dominated). Crude but bounded."""
+    deep = [r for r in rows if r.side == "call" and r.delta >= 0.9]
+    if not deep:
+        return 0.0
+    r = max(deep, key=lambda x: x.delta)
+    return round(r.strike + r.mid, 2)
 
 
 def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[OptionRow]]:
@@ -97,25 +110,13 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
     spot = 0.0
     pages = 0
 
-    best_delta = 0.0  # track deepest-ITM call for spot estimation
-
     while url and pages < 25:            # safety cap on pagination
         data = _get(url, key)
         for c in data.get("results", []):
-            # Prefer API-provided spot; fall back to deep-ITM call intrinsic value
-            ua = c.get("underlying_asset", {})
+            # underlying price lives on each contract's snapshot
+            ua = c.get("underlying_asset", {})          # CONFIRM: underlying_asset.price
             if ua.get("price"):
                 spot = float(ua["price"])
-            elif not spot:
-                details = c.get("details", {})
-                greeks = c.get("greeks", {})
-                d = abs(greeks.get("delta") or 0)
-                close = c.get("day", {}).get("close") or 0
-                if (details.get("contract_type") == "call"
-                        and d > best_delta and d > 0.95 and close > 0):
-                    best_delta = d
-                    spot = float(details.get("strike_price", 0)) + float(close)
-
             if zero_dte_only and c.get("details", {}).get("expiration_date") != today:
                 continue
             row = _row_from_contract(c)
@@ -124,6 +125,18 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
         nxt = data.get("next_url")
         url = nxt if nxt else None
         pages += 1
+
+    if spot <= 0:
+        spot = _estimate_spot(rows)              # underlying price absent -> estimate
+
+    live = sum(1 for r in rows if r.quote_valid)
+    if rows and live == 0:
+        print("WARNING: 0 live quotes — entire chain is day-close fallback. "
+              "This is NOT tradeable (no NBBO). Check your Massive plan's real-time "
+              "entitlement and that you're calling during market hours.")
+    elif rows and live < len(rows) * 0.5:
+        print(f"WARNING: only {live}/{len(rows)} contracts have live quotes — "
+              "live selection will reject the rest.")
 
     return spot, rows
 
@@ -167,7 +180,9 @@ def diagnose(underlying: str) -> None:
     print("\n--- mapping check (what the adapter extracts) ---")
     row = _row_from_contract(results[0])
     if row:
-        print(f"  OK -> {row.side} {row.strike} OI={row.oi} gamma={row.gamma} delta={row.delta} {row.bid}/{row.ask}")
+        src = "LIVE" if row.quote_valid else "FALLBACK(day close)"
+        print(f"  OK -> {row.side} {row.strike} OI={row.oi} gamma={row.gamma} "
+              f"delta={row.delta} {row.bid}/{row.ask} [{src}]")
     else:
         print("  MAPPING FAILED -> one of contract_type/strike_price/gamma/delta/"
               "open_interest/last_quote is named differently. Paste the structure above.")
@@ -180,9 +195,12 @@ if __name__ == "__main__":
         sys.exit(0)
     sym = sys.argv[1] if len(sys.argv) > 1 else "SPY"
     spot, rows = get_chain(sym)
-    print(f"{sym}: spot={spot} | {len(rows)} 0DTE rows with complete greeks/quotes")
+    live = sum(1 for r in rows if r.quote_valid)
+    print(f"{sym}: spot={spot} | {len(rows)} 0DTE rows ({live} live quotes, "
+          f"{len(rows)-live} day-close fallback)")
     for r in rows[:6]:
-        print(f"  {r.side:4s} {r.strike:7.1f}  OI={r.oi:<6d} Γ={r.gamma:.4f} "
+        src = "L" if r.quote_valid else "F"
+        print(f"  [{src}] {r.side:4s} {r.strike:7.1f}  OI={r.oi:<6d} Γ={r.gamma:.4f} "
               f"Δ={r.delta:.2f}  {r.bid:.2f}/{r.ask:.2f}")
     # end-to-end: feed straight into the engine
     if rows:

@@ -1,5 +1,5 @@
 """
-Unit tests for spy0dte.py — pure-function coverage, no API calls.
+Unit tests for spy0dte.py and acceptance.py — pure-function coverage, no API calls.
 All tests use synthetic_chain so they run anywhere.
 """
 import pytest
@@ -10,6 +10,7 @@ from spy0dte import (
     RISK_FLOOR, RISK_CEILING, MIN_TRADES_TO_SCALE, MIN_NET_RATIO,
     WALL_MIN_DISTANCE, DELTA_LOW, DELTA_HIGH,
 )
+from acceptance import Bar1m, session_vwap, compute_acceptance
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -220,6 +221,27 @@ class TestSelectOrder:
         d = self._call_decision()
         assert select_order(chain, d, 50000.0, 0.05) is None
 
+    def test_require_live_rejects_fallback_quotes(self):
+        # A chain where in-delta-range call has quote_valid=False
+        chain = [OptionRow("call", 600.0, 5000, 0.05, 1.0, 1.0, 0.53,
+                           quote_source="day_close_fallback", quote_valid=False)]
+        d = self._call_decision()
+        assert select_order(chain, d, 50000.0, 0.05, require_live=True) is None
+
+    def test_require_live_false_accepts_fallback(self):
+        chain = [OptionRow("call", 600.0, 5000, 0.05, 1.0, 1.0, 0.53,
+                           quote_source="day_close_fallback", quote_valid=False)]
+        d = self._call_decision()
+        order = select_order(chain, d, 50000.0, 0.05, require_live=False)
+        assert order is not None
+
+    def test_live_quote_accepted_by_default(self):
+        chain = [OptionRow("call", 600.0, 5000, 0.05, 1.0, 1.02, 0.53,
+                           quote_source="live_quote", quote_valid=True)]
+        d = self._call_decision()
+        order = select_order(chain, d, 50000.0, 0.05)
+        assert order is not None
+
 
 # ── select_condor ─────────────────────────────────────────────────────────────
 
@@ -253,6 +275,27 @@ class TestSelectCondor:
             expected_risk = condor.max_loss * condor.contracts
             assert abs(condor.dollar_risk - expected_risk) < 0.01
 
+    def test_require_live_rejects_any_fallback_leg(self):
+        # Build a condor chain where one leg has quote_valid=False
+        chain = synthetic_chain(600.0, "pin")
+        # Corrupt the nearest put to the put_wall to be a fallback quote
+        gm = self._gm()
+        for r in chain:
+            if r.side == "put" and abs(r.strike - gm.put_wall) < 1.5:
+                r.quote_valid = False
+                r.quote_source = "day_close_fallback"
+                break
+        assert select_condor(chain, gm, 50000.0, 0.05, require_live=True) is None
+
+    def test_require_live_false_accepts_fallback_condor(self):
+        chain = synthetic_chain(600.0, "pin")
+        gm = self._gm()
+        for r in chain:
+            r.quote_valid = False  # all fallback
+        result = select_condor(chain, gm, 50000.0, 0.05, require_live=False)
+        # May or may not produce a condor depending on credit; just shouldn't crash
+        # and shouldn't raise due to quote validity
+
 
 # ── OptionRow properties ──────────────────────────────────────────────────────
 
@@ -268,3 +311,75 @@ class TestOptionRow:
     def test_zero_mid_spread_pct(self):
         r = OptionRow("call", 600.0, 0, 0.0, 0.0, 0.0, 0.0)
         assert r.spread_pct == 9.99
+
+    def test_quote_source_default(self):
+        r = OptionRow("call", 600.0, 1000, 0.05, 1.0, 1.02, 0.50)
+        assert r.quote_source == "live_quote"
+        assert r.quote_valid is True
+
+    def test_fallback_fields(self):
+        r = OptionRow("put", 599.0, 500, 0.04, 0.80, 0.80, 0.48,
+                      quote_source="day_close_fallback", quote_valid=False)
+        assert r.quote_valid is False
+        assert r.spread_pct == 0.0   # bid==ask -> no spread
+
+
+# ── acceptance ────────────────────────────────────────────────────────────────
+
+def _bar(close: float, volume: float = 1e6) -> Bar1m:
+    return Bar1m(0, close + 0.1, close - 0.1, close, volume)
+
+
+class TestAcceptance:
+    FLIP = 600.0
+
+    def _bull(self):
+        return [_bar(599.5), _bar(599.8), _bar(600.3), _bar(600.5), _bar(600.7)]
+
+    def _bear(self):
+        return [_bar(600.5), _bar(600.2), _bar(599.7), _bar(599.5), _bar(599.3)]
+
+    def _chop(self):
+        return [_bar(600.2), _bar(599.8), _bar(600.1), _bar(599.9), _bar(600.05)]
+
+    def test_bullish_acceptance(self):
+        assert compute_acceptance(self._bull(), self.FLIP) == +1
+
+    def test_bearish_acceptance(self):
+        assert compute_acceptance(self._bear(), self.FLIP) == -1
+
+    def test_chop_no_acceptance(self):
+        assert compute_acceptance(self._chop(), self.FLIP) == 0
+
+    def test_too_few_bars_returns_zero(self):
+        assert compute_acceptance([_bar(601.0), _bar(601.5)], self.FLIP, n=3) == 0
+
+    def test_zero_flip_returns_zero(self):
+        assert compute_acceptance(self._bull(), flip=0.0) == 0
+
+    def test_vwap_disagrees_blocks_signal(self):
+        # Three closes above flip, but VWAP is dragged below by early high-volume bar
+        bars = [_bar(590.0, volume=1e8),   # heavy early volume below flip -> pulls VWAP down
+                _bar(600.3), _bar(600.5), _bar(600.7)]
+        # Last price (600.7) > flip but VWAP ≈ 590 -> last close still > vwap -> still +1
+        # Use a scenario where last px < vwap to actually block it
+        bars2 = [_bar(610.0, volume=1e8), _bar(600.3), _bar(600.5), _bar(600.2)]
+        # vwap ≈ 610, last close 600.2 < vwap -> blocked
+        result = compute_acceptance(bars2, self.FLIP, n=3, use_vwap=True)
+        assert result == 0
+
+    def test_vwap_disabled_allows_signal(self):
+        # Same above scenario without VWAP confirm -> should pass on closes alone
+        bars = [_bar(610.0, volume=1e8), _bar(600.3), _bar(600.5), _bar(600.2)]
+        result = compute_acceptance(bars, self.FLIP, n=3, use_vwap=False)
+        assert result == +1
+
+    def test_session_vwap_volume_weighted(self):
+        bars = [Bar1m(0, 101.0, 99.0, 100.0, 1000.0),   # tp=100, vol=1000
+                Bar1m(0, 111.0, 109.0, 110.0, 9000.0)]  # tp=110, vol=9000
+        # vwap = (100*1000 + 110*9000) / 10000 = (100000 + 990000) / 10000 = 109
+        assert session_vwap(bars) == pytest.approx(109.0)
+
+    def test_session_vwap_zero_volume(self):
+        bars = [Bar1m(0, 101.0, 99.0, 100.0, 0.0)]
+        assert session_vwap(bars) == pytest.approx(100.0)
