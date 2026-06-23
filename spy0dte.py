@@ -161,8 +161,10 @@ def build_gamma_map(chain: list[OptionRow], spot: float) -> GammaMap:
     # walls: largest gamma concentration on each side of spot
     calls_above = {k: g for k, g in call_g.items() if k >= spot}
     puts_below = {k: g for k, g in put_g.items() if k <= spot}
-    call_wall = max(calls_above, key=calls_above.get) if calls_above else max(call_g, key=call_g.get)
-    put_wall = max(puts_below, key=puts_below.get) if puts_below else min(put_g, key=put_g.get)
+    call_wall = (max(calls_above, key=calls_above.get) if calls_above
+                 else max(call_g, key=call_g.get) if call_g else spot)
+    put_wall = (max(puts_below, key=puts_below.get) if puts_below
+                else min(put_g, key=put_g.get) if put_g else spot)
 
     regime = "pin" if spot > flip else "trend"
     return GammaMap(spot, round(net_gex, 3), round(net_ratio, 3), round(flip, 2),
@@ -315,25 +317,66 @@ def synthetic_chain(spot: float, skew: str) -> list[OptionRow]:
 
 
 def run_once(spot: float, skew: str, accepting: int, equity: float,
-             risk_frac: float) -> None:
+             risk_frac: float, iv_annual: float = 0.15, minutes_left: int = 120,
+             n_trades: int = 0) -> None:
+    """
+    iv_annual: implied vol (annualised fraction) used by the MC prior.
+    minutes_left: session time remaining — feed real clock minutes in live use.
+    n_trades: logged trades in the journal; below MIN_TRADES_TO_SCALE the MC
+              prior substitutes for the journal-based risk fraction.
+    """
+    import mc as _mc  # lazy import keeps mc/numpy optional for pure engine tests
+
     chain = synthetic_chain(spot, skew)
     gm = build_gamma_map(chain, spot)
     d = decide(gm, accepting)
     print(f"\nspot {spot} | netGEX {gm.net_gex} $bn (ratio {gm.net_ratio}) | flip {gm.gamma_flip} | "
           f"call_wall {gm.call_wall} | put_wall {gm.put_wall} | regime {gm.regime.upper()}")
     print(f"DECISION: {d.action} — {d.reason}")
+
     if d.action in ("CALL", "PUT"):
-        order = select_order(chain, d, equity, risk_frac)
+        # win_R: price distance to wall / distance to stop (R-ratio in spot space)
+        dist_target = abs(d.target - spot)
+        dist_stop = abs(spot - d.stop_ref) if d.stop_ref else dist_target / 2
+        win_R = max(0.5, dist_target / dist_stop) if dist_stop > 0 else 1.0
+        proj = _mc.project(spot=spot, target=d.target, stop=d.stop_ref,
+                           flip=gm.gamma_flip, minutes_left=minutes_left,
+                           iv_annual=iv_annual, regime=gm.regime, win_R=win_R, seed=42)
+        print(f"MC PRIOR:  {proj.note}")
+
+        # use MC-derived Kelly as prior when journal is below the sample threshold
+        eff_frac = risk_frac
+        if n_trades < MIN_TRADES_TO_SCALE:
+            mc_wr, mc_aw, mc_al = _mc.p_to_kelly_inputs(proj, win_R)
+            mc_frac, mc_why = scale_risk(MIN_TRADES_TO_SCALE, mc_wr, mc_aw, mc_al)
+            eff_frac = mc_frac
+            print(f"MC SIZING: {mc_why} -> {eff_frac:.0%} (journal < {MIN_TRADES_TO_SCALE} trades)")
+
+        order = select_order(chain, d, equity, eff_frac)
         if order:
             print("ORDER:", order.thesis, f"| risk ${order.dollar_risk:.0f}")
         else:
-            print(f"NO ORDER: no contract fit, or stop-risk exceeds {risk_frac:.0%} of ${equity:.0f} — abstain")
+            print(f"NO ORDER: no contract fit, or stop-risk exceeds {eff_frac:.0%} of ${equity:.0f} — abstain")
+
     elif d.action == "SELL_CONDOR":
-        condor = select_condor(chain, gm, equity, risk_frac)
+        win_R = CONDOR_PROFIT_TARGET / (1 - CONDOR_PROFIT_TARGET)  # credit/maxloss ratio
+        proj = _mc.project_range(spot=spot, lower_short=gm.put_wall, upper_short=gm.call_wall,
+                                 flip=gm.gamma_flip, minutes_left=minutes_left,
+                                 iv_annual=iv_annual, regime=gm.regime, win_R=win_R, seed=42)
+        print(f"MC PRIOR:  {proj.note}")
+
+        eff_frac = risk_frac
+        if n_trades < MIN_TRADES_TO_SCALE:
+            mc_wr, mc_aw, mc_al = _mc.p_to_kelly_inputs(proj, win_R)
+            mc_frac, mc_why = scale_risk(MIN_TRADES_TO_SCALE, mc_wr, mc_aw, mc_al)
+            eff_frac = mc_frac
+            print(f"MC SIZING: {mc_why} -> {eff_frac:.0%} (journal < {MIN_TRADES_TO_SCALE} trades)")
+
+        condor = select_condor(chain, gm, equity, eff_frac)
         if condor:
             print("ORDER:", condor.thesis, f"| risk ${condor.dollar_risk:.0f}")
         else:
-            print(f"NO ORDER: condor didn't fit {risk_frac:.0%} of ${equity:.0f} — abstain")
+            print(f"NO ORDER: condor didn't fit {eff_frac:.0%} of ${equity:.0f} — abstain")
 
 
 if __name__ == "__main__":
@@ -345,9 +388,8 @@ if __name__ == "__main__":
     riskE, whyE = scale_risk(n_trades=40, win_rate=0.40, avg_win=2.6, avg_loss=1.0)
     print(f"[risk] example after 40 trades: {riskE:.0%} — {whyE}")
 
-    print(f"\n--- running scenarios at the EARNED fraction ({riskE:.0%}); at the {risk0:.0%} "
-          f"floor nothing fits a $1k account, which is the honest result ---")
-    run_once(600.0, "trend_down", accepting=-1, equity=EQ, risk_frac=riskE)  # short gamma -> PUT
-    run_once(600.0, "trend_up",   accepting=+1, equity=EQ, risk_frac=riskE)  # long gamma -> SELL condor
-    run_once(600.0, "pin",        accepting=+1, equity=EQ, risk_frac=riskE)  # long gamma -> SELL condor
-    run_once(600.0, "trend_up",   accepting=0,  equity=EQ, risk_frac=riskE)  # flat/at flip -> aside
+    print(f"\n--- running scenarios; n_trades=0 so MC prior drives sizing ---")
+    run_once(600.0, "trend_down", accepting=-1, equity=EQ, risk_frac=riskE, n_trades=0)
+    run_once(600.0, "trend_up",   accepting=+1, equity=EQ, risk_frac=riskE, n_trades=0)
+    run_once(600.0, "pin",        accepting=+1, equity=EQ, risk_frac=riskE, n_trades=0)
+    run_once(600.0, "trend_up",   accepting=0,  equity=EQ, risk_frac=riskE, n_trades=0)
