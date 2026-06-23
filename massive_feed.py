@@ -3,17 +3,18 @@ massive_feed.py  —  live adapter: Massive options chain snapshot -> OptionRow.
 
 SECURITY: credentials are read from environment variables ONLY. Nothing is
 hardcoded. Never paste a key into this file or any chat.
-    export MASSIVE_API_KEY=...           # your REGENERATED key
+    export MASSIVE_API_KEY=...           # your key
     export MASSIVE_BASE_URL=https://api.massive.com   # confirm host in your dashboard
 
 Endpoint used (Polygon-compatible path, which Massive mirrors):
     GET /v3/snapshot/options/{underlyingAsset}
-Returns every contract for the underlying with greeks, OI, quotes, and the
-underlying price — exactly the fields the gamma map consumes.
 
-The field mapping below follows the Polygon/Massive snapshot convention. Run the
-self-check against ONE real response (python massive_feed.py SPY) and confirm the
-three field paths flagged with #CONFIRM before trusting it live.
+Confirmed field mappings (from live feed test):
+  - details.contract_type, details.strike_price, details.expiration_date  OK
+  - greeks.gamma, greeks.delta                                             OK
+  - open_interest                                                          OK
+  - last_quote.bid/ask                    ABSENT — falls back to day.close
+  - underlying_asset.price                ABSENT — estimated from deep-ITM call
 """
 from __future__ import annotations
 import os
@@ -64,10 +65,25 @@ def _row_from_contract(c: dict) -> OptionRow | None:
     quote = c.get("last_quote", {}) or {}       # CONFIRM: bid, ask
     day = c.get("day", {}) or {}                # daily agg, has close
     side = details.get("contract_type")
+    """Map one snapshot contract to an OptionRow. Returns None if data is incomplete."""
+    details = c.get("details", {})
+    greeks = c.get("greeks", {})
+    side = details.get("contract_type")     # "call" | "put"
     strike = details.get("strike_price")
     gamma = greeks.get("gamma")
     delta = greeks.get("delta")
     oi = c.get("open_interest")
+
+    # Prefer real-time last_quote; fall back to day.close (confirmed absent in live API)
+    quote = c.get("last_quote", {})
+    bid = quote.get("bid")
+    ask = quote.get("ask")
+    if bid is None or ask is None:
+        close = c.get("day", {}).get("close")
+        if close is None:
+            return None
+        bid = ask = close   # spread_pct=0; mid=close
+
     if None in (side, strike, gamma, delta, oi):
         return None
 
@@ -108,6 +124,7 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
     today = _today_et()
     rows: list[OptionRow] = []
     spot = 0.0
+    best_delta = 0.0    # tracks deepest-ITM call for spot estimation fallback
     pages = 0
 
     while url and pages < 25:            # safety cap on pagination
@@ -118,12 +135,29 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
             if ua.get("price"):
                 spot = float(ua["price"])
             if zero_dte_only and c.get("details", {}).get("expiration_date") != today:
+    while url and pages < 25:           # safety cap on pagination
+        data = _get(url, key)
+        for c in data.get("results", []):
+            # Prefer API-provided spot; fall back to deep-ITM call intrinsic value
+            # (underlying_asset.price confirmed absent in live Massive snapshot)
+            ua = c.get("underlying_asset", {})
+            if ua.get("price"):
+                spot = float(ua["price"])
+            elif not spot:
+                d = abs((c.get("greeks") or {}).get("delta") or 0)
+                close = (c.get("day") or {}).get("close") or 0
+                strike_k = (c.get("details") or {}).get("strike_price") or 0
+                if ((c.get("details") or {}).get("contract_type") == "call"
+                        and d > best_delta and d > 0.95 and close > 0):
+                    best_delta = d
+                    spot = float(strike_k) + float(close)
+
+            if zero_dte_only and (c.get("details") or {}).get("expiration_date") != today:
                 continue
             row = _row_from_contract(c)
             if row:
                 rows.append(row)
-        nxt = data.get("next_url")
-        url = nxt if nxt else None
+        url = data.get("next_url") or None
         pages += 1
 
     if spot <= 0:
@@ -185,7 +219,7 @@ def diagnose(underlying: str) -> None:
               f"delta={row.delta} {row.bid}/{row.ask} [{src}]")
     else:
         print("  MAPPING FAILED -> one of contract_type/strike_price/gamma/delta/"
-              "open_interest/last_quote is named differently. Paste the structure above.")
+              "open_interest/day.close is named differently. Paste the structure above.")
 
 
 if __name__ == "__main__":
@@ -198,11 +232,11 @@ if __name__ == "__main__":
     live = sum(1 for r in rows if r.quote_valid)
     print(f"{sym}: spot={spot} | {len(rows)} 0DTE rows ({live} live quotes, "
           f"{len(rows)-live} day-close fallback)")
+    print(f"{sym}: spot={spot:.2f} | {len(rows)} 0DTE rows with complete greeks/quotes")
     for r in rows[:6]:
         src = "L" if r.quote_valid else "F"
         print(f"  [{src}] {r.side:4s} {r.strike:7.1f}  OI={r.oi:<6d} Γ={r.gamma:.4f} "
               f"Δ={r.delta:.2f}  {r.bid:.2f}/{r.ask:.2f}")
-    # end-to-end: feed straight into the engine
     if rows:
         import spy0dte as eng
         gm = eng.build_gamma_map(rows, spot)
