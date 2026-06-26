@@ -1,134 +1,288 @@
 """
-journal.py  —  the decision log that turns 'I feel ready to scale' into a number.
+journal.py
+==========
+SQLite persistence for the 0DTE system.
 
-Every decision is recorded with the MC's predicted probability at the time.
-Later you record what price actually did (15/30/60 min) and, once live, the
-realized P&L. Two payoffs:
+Records every evaluation — trades AND no-trades — so settlement can fill
+hypothetical P&L for blocked candidates and gate_effectiveness() can later
+compare the two populations. That comparison IS the measurement thesis:
+if the gate is doing its job, blocked days should have worse hypothetical
+outcomes than the days it let through.
 
-  performance()  -> win_rate, avg_win, avg_loss, n   (feeds scale_risk)
-  calibration()  -> did the MC's predicted P(target) match reality?
-
-The calibration check is the honesty governor on the Monte Carlo. If MC predicts
-60% and you realize 45% across a sample, the model is optimistic — you trust the
-journal's realized numbers for sizing and you recalibrate the MC knobs.
-
-SQLite, stdlib only, runs anywhere, ~zero cost.
+Entry points consumed by orchestrator.py:
+  log(row: dict) -> int
+  settle_session(date, close_price) -> SettlementResult
+  gate_effectiveness(lookback_days) -> GateEffectiveness
+  component_correlations(lookback_days) -> dict
 """
 from __future__ import annotations
-import sqlite3
-import time
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS decisions (
-  id INTEGER PRIMARY KEY, ts INTEGER, mode TEXT, action TEXT, regime TEXT,
-  net_ratio REAL, flip REAL, spot REAL, target REAL, stop REAL,
-  instrument TEXT, contracts INTEGER, risk_frac REAL,
-  mc_p REAL, mc_ev REAL, win_R REAL
+import sqlite3
+import json
+import datetime as dt
+from dataclasses import dataclass
+from typing import Optional
+
+
+_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS evaluations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_date    TEXT    NOT NULL,
+    ts              TEXT    NOT NULL,
+    spot            REAL,
+    net_gex         REAL,
+    gex_regime      TEXT,
+    gex_pct_rank    REAL,
+    zero_gamma_dist REAL,
+    zero_gamma_dist_pct REAL,
+    adx             REAL,
+    call_wall       REAL,
+    put_wall        REAL,
+    selected_family TEXT,
+    short_strikes   TEXT,
+    long_strikes    TEXT,
+    legs_json       TEXT,
+    credit          REAL,
+    candidate_score REAL,
+    ev              REAL,
+    max_loss        REAL,
+    ev_per_risk     REAL,
+    theta           REAL,
+    gamma           REAL,
+    prob_profit     REAL,
+    prob_touch_short REAL,
+    liquidity_score REAL,
+    wall_safety     REAL,
+    gamma_safety    REAL,
+    touch_safety    REAL,
+    gate_pass       INTEGER,
+    gate_score      REAL,
+    gate_failed     TEXT,
+    veto_reasons    TEXT,
+    decision        TEXT,
+    no_trade_reason TEXT,
+    was_traded      INTEGER DEFAULT 0,
+    candidate_present INTEGER DEFAULT 0,
+    close_price     REAL,
+    realized_pnl    REAL,
+    hypothetical_pnl REAL,
+    settled         INTEGER DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS outcomes (
-  decision_id INTEGER PRIMARY KEY, spot_15 REAL, spot_30 REAL, spot_60 REAL,
-  hit_target INTEGER, realized_pnl REAL, note TEXT,
-  FOREIGN KEY(decision_id) REFERENCES decisions(id)
-);
+CREATE INDEX IF NOT EXISTS idx_ev_date     ON evaluations(session_date);
+CREATE INDEX IF NOT EXISTS idx_ev_decision ON evaluations(decision);
+CREATE INDEX IF NOT EXISTS idx_ev_settled  ON evaluations(settled);
 """
+
+
+@dataclass
+class SettlementResult:
+    date: str
+    n_trades: int
+    n_no_trades: int
+    trade_pnl: float
+    blocked_pnl: float
+    gate_helped: bool
+
+
+@dataclass
+class GateEffectiveness:
+    n_trades: int
+    n_gate_blocked: int
+    n_selector_blocked: int
+    avg_trade_pnl: float
+    avg_gate_blocked_pnl: float
+    avg_selector_blocked_pnl: float
+    gate_net_contribution: float
 
 
 class Journal:
-    def __init__(self, path: str = "spy0dte.sqlite") -> None:
-        self.con = sqlite3.connect(path)
-        self.con.executescript(SCHEMA)
-        self.con.commit()
+    def __init__(self, db_path: str = "0dte_journal.db"):
+        self.db_path = db_path
+        self._init_db()
 
-    def record_decision(self, *, mode, action, regime, net_ratio, flip, spot,
-                        target, stop, instrument, contracts, risk_frac,
-                        mc_p, mc_ev, win_R) -> int:
-        cur = self.con.execute(
-            """INSERT INTO decisions(ts,mode,action,regime,net_ratio,flip,spot,target,stop,
-               instrument,contracts,risk_frac,mc_p,mc_ev,win_R)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (int(time.time()*1000), mode, action, regime, net_ratio, flip, spot, target, stop,
-             instrument, contracts, risk_frac, mc_p, mc_ev, win_R))
-        self.con.commit()
-        return cur.lastrowid
+    def _init_db(self) -> None:
+        with sqlite3.connect(self.db_path) as con:
+            con.executescript(_CREATE_SQL)
 
-    def record_outcome(self, decision_id, *, spot_15=None, spot_30=None, spot_60=None,
-                       hit_target=None, realized_pnl=None, note="") -> None:
-        self.con.execute(
-            """INSERT OR REPLACE INTO outcomes(decision_id,spot_15,spot_30,spot_60,
-               hit_target,realized_pnl,note) VALUES(?,?,?,?,?,?,?)""",
-            (decision_id, spot_15, spot_30, spot_60,
-             None if hit_target is None else int(hit_target), realized_pnl, note))
-        self.con.commit()
+    def log(self, row: dict) -> int:
+        """Insert one evaluation row (from TradeDecision.as_row()). Returns row id."""
+        cols = list(row.keys())
+        ph = ", ".join("?" * len(cols))
+        sql = f"INSERT INTO evaluations ({', '.join(cols)}) VALUES ({ph})"
+        with sqlite3.connect(self.db_path) as con:
+            cur = con.execute(sql, [row[c] for c in cols])
+            return cur.lastrowid
 
-    def performance(self, action: str | None = None) -> dict:
-        """Realized win_rate / avg_win / avg_loss for scale_risk. Uses realized_pnl
-        when present, else falls back to hit_target with win_R/-1 as an R proxy."""
-        q = """SELECT d.win_R, o.hit_target, o.realized_pnl
-               FROM decisions d JOIN outcomes o ON o.decision_id=d.id
-               WHERE (o.hit_target IS NOT NULL OR o.realized_pnl IS NOT NULL)"""
-        params: tuple = ()
-        if action:
-            q += " AND d.action=?"
-            params = (action,)
-        rows = self.con.execute(q, params).fetchall()
-        wins, losses = [], []
-        for win_R, hit, pnl in rows:
-            val = pnl if pnl is not None else ((win_R or 1.0) if hit else -1.0)
-            (wins if val > 0 else losses).append(val)
-        n = len(wins) + len(losses)
-        if n == 0:
-            return {"n": 0, "win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0}
-        return {
-            "n": n,
-            "win_rate": round(len(wins) / n, 3),
-            "avg_win": round(sum(wins) / len(wins), 3) if wins else 0.0,
-            "avg_loss": round(abs(sum(losses) / len(losses)), 3) if losses else 1.0,
-        }
+    def settle_session(self, date: str, close_price: float) -> SettlementResult:
+        """
+        Post-close settlement. For each unsettled evaluation on `date`:
+        - Traded: fills realized_pnl from spread payoff at close_price.
+        - No-trade with candidate: fills hypothetical_pnl (what it would have returned).
+        """
+        with sqlite3.connect(self.db_path) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                "SELECT * FROM evaluations WHERE session_date=? AND settled=0", (date,)
+            ).fetchall()
 
-    def calibration(self) -> dict:
-        """Compare MC predicted P(target) to realized hit rate — the MC honesty check."""
-        rows = self.con.execute(
-            """SELECT d.mc_p, o.hit_target FROM decisions d JOIN outcomes o
-               ON o.decision_id=d.id WHERE o.hit_target IS NOT NULL AND d.mc_p IS NOT NULL"""
-        ).fetchall()
-        if not rows:
-            return {"n": 0, "note": "no resolved decisions with MC predictions yet"}
-        pred = sum(r[0] for r in rows) / len(rows)
-        real = sum(r[1] for r in rows) / len(rows)
-        gap = real - pred
-        verdict = ("MC well-calibrated" if abs(gap) < 0.05 else
-                   "MC OPTIMISTIC — trust journal, lower MC drift knobs" if gap < 0 else
-                   "MC pessimistic — it's underclaiming")
-        return {"n": len(rows), "mc_predicted": round(pred, 3),
-                "realized": round(real, 3), "gap": round(gap, 3), "verdict": verdict}
+            n_trades = n_no_trades = 0
+            trade_pnl = blocked_pnl = 0.0
+
+            for r in rows:
+                pnl = _settle_legs(r["legs_json"], r["credit"], close_price)
+                if r["was_traded"] == 1:
+                    con.execute(
+                        "UPDATE evaluations SET close_price=?, realized_pnl=?, settled=1 WHERE id=?",
+                        (close_price, pnl, r["id"]),
+                    )
+                    trade_pnl += pnl or 0.0
+                    n_trades += 1
+                else:
+                    hypo = pnl if r["candidate_present"] == 1 else None
+                    con.execute(
+                        "UPDATE evaluations SET close_price=?, hypothetical_pnl=?, settled=1 WHERE id=?",
+                        (close_price, hypo, r["id"]),
+                    )
+                    if hypo is not None:
+                        blocked_pnl += hypo
+                    n_no_trades += 1
+
+        gate_helped = n_no_trades > 0 and blocked_pnl < 0.0
+        return SettlementResult(date, n_trades, n_no_trades,
+                                round(trade_pnl, 4), round(blocked_pnl, 4), gate_helped)
+
+    def gate_effectiveness(self, lookback_days: int = 30) -> GateEffectiveness:
+        """
+        Compare realized P&L of trades vs hypothetical P&L of gate-blocked days.
+        Positive gate_net_contribution means the gate filtered out worse outcomes.
+        """
+        cutoff = (dt.date.today() - dt.timedelta(days=lookback_days)).isoformat()
+        with sqlite3.connect(self.db_path) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                "SELECT * FROM evaluations WHERE session_date >= ? AND settled=1", (cutoff,)
+            ).fetchall()
+
+        trades = [r for r in rows if r["was_traded"] == 1 and r["realized_pnl"] is not None]
+        blocked_gate = [r for r in rows
+                        if r["was_traded"] == 0 and r["gate_pass"] == 0
+                        and r["hypothetical_pnl"] is not None]
+        blocked_sel = [r for r in rows
+                       if r["was_traded"] == 0 and r["gate_pass"] == 1
+                       and r["hypothetical_pnl"] is not None]
+
+        def _avg(vals: list) -> float:
+            return sum(vals) / len(vals) if vals else 0.0
+
+        avg_trade = _avg([r["realized_pnl"] for r in trades])
+        avg_gate = _avg([r["hypothetical_pnl"] for r in blocked_gate])
+        avg_sel = _avg([r["hypothetical_pnl"] for r in blocked_sel])
+
+        return GateEffectiveness(
+            n_trades=len(trades),
+            n_gate_blocked=len(blocked_gate),
+            n_selector_blocked=len(blocked_sel),
+            avg_trade_pnl=round(avg_trade, 4),
+            avg_gate_blocked_pnl=round(avg_gate, 4),
+            avg_selector_blocked_pnl=round(avg_sel, 4),
+            gate_net_contribution=round(avg_trade - avg_gate, 4),
+        )
+
+    def component_correlations(self, lookback_days: int = 30) -> dict:
+        """Gate score vs realized P&L Pearson correlation on settled trades."""
+        cutoff = (dt.date.today() - dt.timedelta(days=lookback_days)).isoformat()
+        with sqlite3.connect(self.db_path) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                "SELECT gate_score, realized_pnl FROM evaluations "
+                "WHERE session_date >= ? AND settled=1 AND was_traded=1 "
+                "AND gate_score IS NOT NULL AND realized_pnl IS NOT NULL",
+                (cutoff,),
+            ).fetchall()
+        if len(rows) < 5:
+            return {"error": f"only {len(rows)} settled trades"}
+        scores = [r["gate_score"] for r in rows]
+        pnls = [r["realized_pnl"] for r in rows]
+        return {"gate_score_vs_pnl_pearson": round(_pearson(scores, pnls), 4), "n": len(rows)}
 
 
+def _settle_legs(legs_json: Optional[str], credit: Optional[float],
+                 close: float) -> Optional[float]:
+    if not legs_json or credit is None:
+        return None
+    try:
+        legs = json.loads(legs_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    pnl = float(credit)
+    for lg in legs:
+        K = float(lg["strike"])
+        qty = int(lg["qty"])
+        intrinsic = max(close - K, 0.0) if lg["kind"] == "C" else max(K - close, 0.0)
+        pnl += qty * intrinsic
+    return round(pnl, 4)
+
+
+def _pearson(xs: list, ys: list) -> float:
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    dx = sum((x - mx) ** 2 for x in xs) ** 0.5
+    dy = sum((y - my) ** 2 for y in ys) ** 0.5
+    return num / (dx * dy) if dx * dy > 0 else 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Demo                                                                         #
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    # --- full loop smoke test: engine -> MC -> size -> journal -> performance ---
     import os
-    if os.path.exists("demo.sqlite"):
-        os.remove("demo.sqlite")
-    import spy0dte as eng
-    import mc
+    import tempfile
 
-    j = Journal("demo.sqlite")
-    # simulate 35 short-gamma trend decisions with a realistic ~45% realized hit rate
-    import numpy as np
-    rng = np.random.default_rng(7)
-    for i in range(35):
-        spot, target, stop, flip = 600.0, 602.0, 599.5, 599.5
-        proj = mc.project(spot, target, stop, flip, minutes_left=120,
-                          iv_annual=0.13, regime="trend", win_R=2.0, seed=i)
-        did = bool(rng.random() < 0.45)   # ground-truth ~45% (MC will read higher)
-        did_ = j.record_decision(mode="shadow", action="PUT", regime="trend",
-                                 net_ratio=-0.35, flip=flip, spot=spot, target=target,
-                                 stop=stop, instrument="SPY", contracts=1, risk_frac=0.02,
-                                 mc_p=proj.p_target, mc_ev=proj.ev_R, win_R=2.0)
-        j.record_outcome(did_, hit_target=did,
-                         realized_pnl=(2.0 if did else -1.0))
+    db = os.path.join(tempfile.mkdtemp(), "test_journal.db")
+    j = Journal(db)
+    today = dt.date.today().isoformat()
 
-    perf = j.performance()
-    print("performance:", perf)
-    r, why = eng.scale_risk(perf["n"], perf["win_rate"], perf["avg_win"], perf["avg_loss"])
-    print(f"scaled risk -> {r:.0%} | {why}")
-    print("calibration:", j.calibration())
+    j.log({
+        "session_date": today, "ts": "2026-06-26T11:20:00-04:00",
+        "spot": 602.50, "net_gex": 4.2e9, "gex_regime": "long",
+        "gex_pct_rank": 0.88, "zero_gamma_dist": 6.5, "zero_gamma_dist_pct": 0.0108,
+        "adx": 12.5, "call_wall": 603.0, "put_wall": 598.0,
+        "selected_family": "put_credit",
+        "short_strikes": "[598.0]", "long_strikes": "[597.0]",
+        "legs_json": json.dumps([{"strike": 598.0, "kind": "P", "qty": -1},
+                                  {"strike": 597.0, "kind": "P", "qty": 1}]),
+        "credit": 0.30, "candidate_score": 0.012, "ev": 0.18, "max_loss": 0.70,
+        "ev_per_risk": 0.257, "theta": 0.35, "gamma": -0.05,
+        "prob_profit": 0.72, "prob_touch_short": 0.18,
+        "liquidity_score": 0.85, "wall_safety": 0.92, "gamma_safety": 0.88,
+        "touch_safety": 0.82,
+        "gate_pass": 1, "gate_score": 76.5, "gate_failed": "[]", "veto_reasons": "[]",
+        "decision": "TRADE", "no_trade_reason": "", "was_traded": 1, "candidate_present": 1,
+    })
+    j.log({
+        "session_date": today, "ts": "2026-06-26T09:10:00-04:00",
+        "spot": 588.0, "net_gex": -1.1e9, "gex_regime": "short",
+        "gex_pct_rank": 0.40, "zero_gamma_dist": -5.0, "zero_gamma_dist_pct": -0.0085,
+        "adx": 28.0, "call_wall": 596.0, "put_wall": 585.0,
+        "selected_family": "put_credit",
+        "short_strikes": "[585.0]", "long_strikes": "[584.0]",
+        "legs_json": json.dumps([{"strike": 585.0, "kind": "P", "qty": -1},
+                                  {"strike": 584.0, "kind": "P", "qty": 1}]),
+        "credit": 0.25, "candidate_score": 0.006, "ev": 0.08, "max_loss": 0.75,
+        "ev_per_risk": 0.107, "theta": 0.28, "gamma": -0.03,
+        "prob_profit": 0.61, "prob_touch_short": 0.42,
+        "liquidity_score": 0.70, "wall_safety": 0.55, "gamma_safety": 0.10,
+        "touch_safety": 0.58,
+        "gate_pass": 0, "gate_score": 0.0,
+        "gate_failed": json.dumps(["GEX_SHORT", "TRENDING: ADX 28.0 >= 20"]),
+        "veto_reasons": "[]",
+        "decision": "NO_TRADE", "no_trade_reason": "gate:GEX_SHORT,TRENDING",
+        "was_traded": 0, "candidate_present": 1,
+    })
+
+    res = j.settle_session(today, close_price=602.30)
+    print(f"Settlement : {res}")
+    eff = j.gate_effectiveness(lookback_days=7)
+    print(f"Gate eff   : {eff}")
+    print("journal OK")
