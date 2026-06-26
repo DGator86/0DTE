@@ -45,7 +45,7 @@ from decision_engine import decide, EngineConfig, TradeDecision
 from resample import RawBars, build_mtf_input
 from mtf_matrix import build_matrix, regime_rows
 from decision_matrix import decide_from_matrix, TradeIntent
-from regime_classifier import RegimeClassifier, RegimeState, ClassifierContext, ClassifierConfig
+from regime_classifier import RegimeClassifier, RegimeState, ClassifierContext, ClassifierConfig, ScaleBook
 from journal import Journal
 
 ET = ZoneInfo("America/New_York")
@@ -95,6 +95,7 @@ class UnifiedOrchestrator:
             cfg=self.classifier_cfg or ClassifierConfig()
         )
         self._prev_std: Optional[dict] = None   # for information-gain computation
+        self._matrix_scale_book = ScaleBook()   # adaptive scales for MTF matrix variables
 
     def tick(self, now: dt.datetime) -> Optional[TickResult]:
         snap = self.feed.snapshot(now)
@@ -131,7 +132,7 @@ class UnifiedOrchestrator:
 
         # ---- Track B: matrix + decision routing ----
         mtf_in = build_mtf_input(snap.bars, snap_dict)
-        mat_rows = build_matrix(mtf_in)
+        mat_rows = build_matrix(mtf_in, self._matrix_scale_book)
         regimes = regime_rows(mat_rows)
         intent = decide_from_matrix(mat_rows, regimes, vetoes=regime_state.vetoes)
 

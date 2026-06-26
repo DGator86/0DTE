@@ -56,41 +56,43 @@ class MTFVar:
     domain: str
     name: str
     kind: str
-    std: Callable[[float], float]   # raw -> 0..100
+    std: Callable[[float], float]                              # raw -> 0..100 (fixed prior)
+    adapt_fn: Optional[Callable[[float, float], float]] = None # (x, scale) -> 0..100
+    prior_scale: float = 1.0                                   # prior std used until ScaleBook warms up
 
 
-# std_fn per variable (scales are reasonable fixed priors here; wire to a
-# ScaleBook for adaptive behavior in production)
+# adapt_fn=S or N means the ScaleBook's empirical std will replace prior_scale at runtime.
+# Variables using P() or bounded [0..1] inputs don't benefit from scale adaptation.
 VARS: list[MTFVar] = [
     # Price geometry
-    MTFVar("price", "dist_to_vwap", NATIVE, lambda x: N(x, 0.20)),          # x = % from vwap
-    MTFVar("price", "vwap_slope", NATIVE, lambda x: S(x, 0.05)),           # %/bar
-    MTFVar("price", "range_position", NATIVE, lambda x: clip100(100 * x)),  # 0..1 within TF range
+    MTFVar("price", "dist_to_vwap", NATIVE,    lambda x: N(x, 0.20),           N,    0.20),
+    MTFVar("price", "vwap_slope", NATIVE,      lambda x: S(x, 0.05),           S,    0.05),
+    MTFVar("price", "range_position", NATIVE,  lambda x: clip100(100 * x)),
     # Dealer (SNAPSHOT)
-    MTFVar("dealer", "gamma_sign", SNAPSHOT, lambda x: S(x, 2e9)),         # net GEX $
-    MTFVar("dealer", "gamma_magnitude", SNAPSHOT, lambda x: P(x)),         # pct rank 0..1
-    MTFVar("dealer", "flip_cushion", SNAPSHOT, lambda x: S(x, 0.004)),     # % above flip
-    MTFVar("dealer", "channel_tightness", SNAPSHOT, lambda x: clip100(100 * math.exp(-x / 0.012))),  # wall width %
-    MTFVar("dealer", "wall_proximity", SNAPSHOT, lambda x: N(x, 0.003)),   # % to nearest wall
+    MTFVar("dealer", "gamma_sign", SNAPSHOT,        lambda x: S(x, 2e9),       S,    2e9),
+    MTFVar("dealer", "gamma_magnitude", SNAPSHOT,   lambda x: P(x)),
+    MTFVar("dealer", "flip_cushion", SNAPSHOT,      lambda x: S(x, 0.004),     S,    0.004),
+    MTFVar("dealer", "channel_tightness", SNAPSHOT, lambda x: N(x, 0.012),     N,    0.012),
+    MTFVar("dealer", "wall_proximity", SNAPSHOT,    lambda x: N(x, 0.003),     N,    0.003),
     # Volatility
-    MTFVar("vol", "realized_vol", NATIVE, lambda x: P(x)),                 # pctile 0..1, per TF
-    MTFVar("vol", "rv_expansion", NATIVE, lambda x: S(x, 0.25)),          # bbw ratio - 1
-    MTFVar("vol", "term_structure", SNAPSHOT, lambda x: S(x, 0.08)),      # (vix3m-vix)/vix
-    MTFVar("vol", "vvix_elevation", SNAPSHOT, lambda x: S(x, 0.10)),      # (vvix/base - 1)
-    MTFVar("vol", "richness", SNAPSHOT, lambda x: P(x)),                  # variance ratio signal 0..1
+    MTFVar("vol", "realized_vol", NATIVE,      lambda x: P(x)),
+    MTFVar("vol", "rv_expansion", NATIVE,      lambda x: S(x, 0.25),           S,    0.25),
+    MTFVar("vol", "term_structure", SNAPSHOT,  lambda x: S(x, 0.08),           S,    0.08),
+    MTFVar("vol", "vvix_elevation", SNAPSHOT,  lambda x: S(x, 0.10),           S,    0.10),
+    MTFVar("vol", "richness", SNAPSHOT,        lambda x: P(x)),
     # Distribution shape (SNAPSHOT, from RND)
-    MTFVar("shape", "skew_dir", SNAPSHOT, lambda x: S(x, 0.20)),
-    MTFVar("shape", "tail_heaviness", SNAPSHOT, lambda x: clip100(100 * x / 3.0)),  # excess kurt
+    MTFVar("shape", "skew_dir", SNAPSHOT,      lambda x: S(x, 0.20),           S,    0.20),
+    MTFVar("shape", "tail_heaviness", SNAPSHOT, lambda x: clip100(100 * x / 3.0)),
     # Trend (NATIVE -- the multi-TF core)
-    MTFVar("trend", "adx_strength", NATIVE, lambda x: clip100(100 * x / 50.0)),
-    MTFVar("trend", "di_spread", NATIVE, lambda x: S(x, 20.0)),
-    MTFVar("trend", "ema_slope", NATIVE, lambda x: S(x, 0.05)),
-    MTFVar("trend", "rsi", NATIVE, lambda x: clip100(x)),
-    MTFVar("trend", "bb_compression", NATIVE, lambda x: clip100(100 * (1 - x))),    # x = bbw ratio
-    MTFVar("trend", "trend_cleanliness", NATIVE, lambda x: P(x)),         # R^2 0..1
+    MTFVar("trend", "adx_strength", NATIVE,    lambda x: clip100(100 * x / 50.0)),
+    MTFVar("trend", "di_spread", NATIVE,       lambda x: S(x, 20.0),           S,   20.0),
+    MTFVar("trend", "ema_slope", NATIVE,       lambda x: S(x, 0.05),           S,    0.05),
+    MTFVar("trend", "rsi", NATIVE,             lambda x: clip100(x)),
+    MTFVar("trend", "bb_compression", NATIVE,  lambda x: clip100(100 * (1 - x))),
+    MTFVar("trend", "trend_cleanliness", NATIVE, lambda x: P(x)),
     # Order flow (NATIVE, windowed)
-    MTFVar("flow", "cvd_persistence", NATIVE, lambda x: S(x, 0.4)),
-    MTFVar("flow", "tick_two_sided", NATIVE, lambda x: clip100(100 * math.exp(-x / 600.0))),
+    MTFVar("flow", "cvd_persistence", NATIVE,  lambda x: S(x, 0.4),            S,    0.40),
+    MTFVar("flow", "tick_two_sided", NATIVE,   lambda x: N(x, 600.0),          N,  600.0),
 ]
 
 
@@ -118,13 +120,33 @@ class MatrixRow:
     scores: dict          # tf -> 0..100 or None
 
 
-def build_matrix(inp: MTFInput) -> list[MatrixRow]:
+def build_matrix(inp: MTFInput, scale_book=None) -> list[MatrixRow]:
+    """
+    Build the scored matrix from inp.
+
+    scale_book: optional ScaleBook (from regime_classifier).  When provided,
+    raw values are fed to Welford online estimation; the learned std replaces
+    the fixed prior_scale for S/N variables once enough samples accumulate.
+    Snapshot variables are updated once per tick (not once per TF) to avoid
+    inflating the sample count.
+    """
     rows = []
     for v in VARS:
         scores = {}
+        sb_updated = False   # prevent 7x updates for broadcast snapshot values
         for tf in TIMEFRAMES:
             r = inp.raw(v, tf)
-            scores[tf] = round(v.std(r), 1) if r is not None else None
+            if r is None:
+                scores[tf] = None
+                continue
+            if scale_book is not None and v.adapt_fn is not None:
+                if v.kind == NATIVE or not sb_updated:
+                    scale_book.update(v.name, r)
+                    sb_updated = True
+                scale = scale_book.std(v.name, v.prior_scale)
+                scores[tf] = round(v.adapt_fn(r, scale), 1)
+            else:
+                scores[tf] = round(v.std(r), 1)
         rows.append(MatrixRow(v.domain, v.name, v.kind, scores))
     return rows
 
