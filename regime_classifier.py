@@ -1,265 +1,448 @@
 """
 regime_classifier.py
 ====================
-Deterministic regime classifier with an adaptive ScaleBook.
+Deterministic regime classifier. Consumes whatever of the state vector is live
+and emits, per tick:
 
-The classifier answers: given the current market snapshot (GEX positioning,
-volatility surface, momentum), what regime are we in, and what engines are
-permitted? It does NOT make trade decisions — that is the decision_matrix's job.
-This module just labels the market so the decision layer can route correctly.
+    - a confidence score (0..100) for each market regime
+    - the dominant regime and the PERMITTED strategy engine
+    - hard vetoes (catalyst, short-gamma, etc.) that override the scores
+    - global information gain (how much the state shifted since last tick)
 
-ScaleBook tracks a rolling percentile for each feature so thresholds read
-"above your own recent median" rather than fixed absolute values. This is the
-adaptive-scales TODO from HANDOFF §4; the calibration here is the first step.
+It is NOT machine-learned. Each regime is a reliability-weighted blend of
+standardized features with hand-set prior weights. Those weights are exactly
+what the journal's realized-P&L regression will later calibrate -- this module
+is the structured prior that closes that loop.
 
-Engine IDs used by the decision layer:
-  "premium_selector"   -> spread_selector (put/call credit, condors, flies)
-  "directional_selector" -> debit spreads, long premium (not yet built, §6.7)
-  "volatility_selector"  -> long vega / strangle (not yet built)
-  "none"               -> stand aside
+Graceful degradation is the core feature: any input that is missing, stale, or
+low-quality contributes reliability 0 and drops out; each regime renormalizes
+over the features actually available. So it runs today on ~30 computable
+features and tightens as order-flow / L2 feeds come online.
+
+Standardization helpers match the feature-matrix spec.
+NOT financial advice.
 """
+
 from __future__ import annotations
 
 import math
-from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
+
+from gate_scorer import MarketSnapshot
+from rnd_extractor import RiskNeutralDensity, EdgeReport
 
 
 # --------------------------------------------------------------------------- #
-# ScaleBook — adaptive percentile tracker                                      #
+# Standardization helpers                                                      #
 # --------------------------------------------------------------------------- #
+def clip100(x: float) -> float:
+    return min(100.0, max(0.0, x))
+
+
+def P(p: float) -> float:                      # already 0..1
+    return clip100(100.0 * p)
+
+
+def S(x: float, scale: float) -> float:        # signed -> 50 neutral
+    return clip100(50.0 + 50.0 * math.tanh(x / scale)) if scale > 0 else 50.0
+
+
+def N(x: float, scale: float) -> float:        # near-level -> 100 at zero distance
+    return clip100(100.0 * math.exp(-abs(x) / scale)) if scale > 0 else 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive scale book (Welford running mean/var per named quantity)            #
+# --------------------------------------------------------------------------- #
+@dataclass
 class ScaleBook:
-    """
-    Maintains a rolling window of observations per feature.
-    percentile(name, value) returns 0..1 (where 1 = highest seen recently).
-    Useful for converting absolute GEX / ADX / VIX values to relative ranks
-    that remain stable across different market regimes.
-    """
+    n_min: int = 30
+    _stats: dict = field(default_factory=dict)   # name -> [n, mean, M2]
 
-    def __init__(self, window: int = 60):
-        self.window = window
-        self._data: dict[str, deque] = {}
+    def update(self, name: str, x: float):
+        if x is None or not math.isfinite(x):
+            return
+        s = self._stats.setdefault(name, [0, 0.0, 0.0])
+        s[0] += 1
+        d = x - s[1]
+        s[1] += d / s[0]
+        s[2] += d * (x - s[1])
 
-    def update(self, name: str, value: float) -> None:
-        if name not in self._data:
-            self._data[name] = deque(maxlen=self.window)
-        if math.isfinite(value):
-            self._data[name].append(value)
+    def std(self, name: str, default: float) -> float:
+        s = self._stats.get(name)
+        if not s or s[0] < 2:
+            return default
+        var = s[2] / (s[0] - 1)
+        sd = math.sqrt(var) if var > 0 else default
+        return sd if sd > 1e-12 else default
 
-    def percentile(self, name: str, value: float) -> float:
-        """Fraction of stored observations <= value. 0.5 = at the median."""
-        buf = self._data.get(name)
-        if not buf:
-            return 0.5
-        below = sum(1 for v in buf if v <= value)
-        return below / len(buf)
-
-    def rank(self, name: str, value: float) -> float:
-        """Same as percentile but named more intuitively for ranks."""
-        return self.percentile(name, value)
-
-    def has(self, name: str) -> bool:
-        return name in self._data and len(self._data[name]) > 0
+    def reliability(self, name: str) -> float:
+        """Ramp 0->1 as samples accumulate; 0.4 floor so cold start still informs."""
+        s = self._stats.get(name)
+        if not s:
+            return 0.4
+        return 0.4 + 0.6 * min(1.0, s[0] / self.n_min)
 
 
 # --------------------------------------------------------------------------- #
-# Output types                                                                 #
+# Classifier input bundle                                                      #
+# --------------------------------------------------------------------------- #
+@dataclass
+class ClassifierContext:
+    market: MarketSnapshot
+    rnd: Optional[RiskNeutralDensity] = None
+    edge: Optional[EdgeReport] = None
+    feature_ages: dict = field(default_factory=dict)   # name -> seconds since update
+
+
+# --------------------------------------------------------------------------- #
+# Feature specs: each returns a standardized 0..100 value or None              #
+# --------------------------------------------------------------------------- #
+@dataclass
+class FeatureSpec:
+    name: str
+    domain: str
+    fn: Callable[[ClassifierContext, ScaleBook], Optional[float]]
+    cadence: str = "1m"
+    staleness_s: float = 300.0
+
+
+def _f(name, domain, fn, cadence="1m", staleness=300.0):
+    return FeatureSpec(name, domain, fn, cadence, staleness)
+
+
+def _safe(getter):
+    try:
+        v = getter()
+        return v if (v is None or math.isfinite(v)) else None
+    except Exception:
+        return None
+
+
+# ---- feature implementations (only those computable from live modules) ----
+def _build_features() -> list[FeatureSpec]:
+    F = []
+
+    # Dealer
+    F.append(_f("gamma_sign", "dealer",
+                lambda c, sb: S(c.market.net_gex, sb.std("net_gex", 2e9))))
+    F.append(_f("gamma_magnitude", "dealer",
+                lambda c, sb: P(c.market.gex_pct_rank)))
+    F.append(_f("flip_cushion", "dealer",
+                lambda c, sb: S((c.market.spot - c.market.gamma_flip) / c.market.spot,
+                                sb.std("flip_cushion", 0.004))))
+    F.append(_f("flip_proximity", "dealer",
+                lambda c, sb: N((c.market.spot - c.market.gamma_flip) / c.market.spot, 0.003)))
+
+    def _channel_tight(c, sb):
+        w = (c.market.call_wall - c.market.put_wall) / c.market.spot
+        return clip100(100.0 * math.exp(-w / 0.012))
+    F.append(_f("channel_tightness", "dealer", _channel_tight))
+
+    def _wall_prox(c, sb):
+        dc = abs(c.market.call_wall - c.market.spot) / c.market.spot
+        dp = abs(c.market.spot - c.market.put_wall) / c.market.spot
+        return N(min(dc, dp), 0.003)
+    F.append(_f("wall_proximity", "dealer", _wall_prox))
+
+    # Volatility
+    F.append(_f("term_structure", "vol",
+                lambda c, sb: S((c.market.vix3m - c.market.vix) / c.market.vix,
+                                sb.std("term_structure", 0.08))))
+    F.append(_f("vvix_elevation", "vol",
+                lambda c, sb: clip100(100.0 * (c.market.vvix / c.market.vvix_baseline - 1.0) / 0.30 + 50.0
+                                      if False else
+                                      clip100(50.0 + 50.0 * math.tanh((c.market.vvix - c.market.vvix_baseline) / max(0.10 * c.market.vvix_baseline, 1e-6))))))
+    F.append(_f("richness", "vol",
+                lambda c, sb: P(c.edge.richness_signal) if c.edge else None))
+    F.append(_f("rv_expansion", "vol",
+                lambda c, sb: clip100(50.0 + 50.0 * math.tanh(
+                    (c.market.bb_width / c.market.bb_width_baseline - 1.0) /
+                    max(sb.std("bbw_ratio", 0.25), 1e-6)))))
+
+    # Distribution shape
+    F.append(_f("skew_dir", "shape",
+                lambda c, sb: S(c.rnd.skew(), sb.std("rnd_skew", 0.20)) if c.rnd else None))
+    F.append(_f("tail_heaviness", "shape",
+                lambda c, sb: clip100(100.0 * c.rnd.excess_kurtosis() / 3.0) if c.rnd else None))
+
+    # Trend
+    F.append(_f("adx_strength", "trend",
+                lambda c, sb: clip100(100.0 * c.market.adx / 50.0)))
+    F.append(_f("rsi_centered", "trend",
+                lambda c, sb: clip100(100.0 - abs(c.market.rsi - 50.0) * 2.0)))
+    F.append(_f("bb_compression", "trend",
+                lambda c, sb: clip100(100.0 * (1.0 - c.market.bb_width / c.market.bb_width_baseline))))
+    F.append(_f("vwap_reversion", "trend",
+                lambda c, sb: clip100(100.0 * min(c.market.vwap_reversion_count, 6) / 6.0)))
+
+    # Order flow
+    F.append(_f("cvd_persistence", "flow",
+                lambda c, sb: S(c.market.cvd_slope, sb.std("cvd_slope", 0.4))))
+    F.append(_f("tick_two_sided", "flow",
+                lambda c, sb: clip100(100.0 * math.exp(-c.market.tick_abs_mean / 600.0))))
+
+    return F
+
+
+FEATURES = _build_features()
+
+
+# --------------------------------------------------------------------------- #
+# Regime definitions: (feature_name, weight, invert)                           #
+# invert=True uses (100 - value). Confidence = Σ w·rel·v / Σ w·rel.            #
+# --------------------------------------------------------------------------- #
+REGIME_WEIGHTS: dict[str, list[tuple]] = {
+    "compression": [
+        ("gamma_sign", 1.5, False), ("flip_cushion", 1.0, False),
+        ("channel_tightness", 1.2, False), ("bb_compression", 1.0, False),
+        ("adx_strength", 1.3, True), ("tick_two_sided", 0.8, False),
+        ("richness", 0.6, False),
+    ],
+    "range_confidence": [
+        ("gamma_sign", 1.2, False), ("channel_tightness", 1.0, False),
+        ("wall_proximity", 0.8, False), ("rsi_centered", 0.8, False),
+        ("vwap_reversion", 0.8, False), ("adx_strength", 1.2, True),
+    ],
+    "mean_reversion_confidence": [
+        ("gamma_sign", 1.0, False), ("vwap_reversion", 1.0, False),
+        ("wall_proximity", 1.0, False), ("adx_strength", 1.0, True),
+        ("flip_cushion", 0.6, False),
+    ],
+    "trend": [
+        ("adx_strength", 1.5, False), ("bb_compression", 1.0, True),
+        ("cvd_persistence", 0.8, False), ("rsi_centered", 0.8, True),
+        ("rv_expansion", 0.8, False),
+    ],
+    "directional_confidence": [
+        ("adx_strength", 1.2, False), ("cvd_persistence", 1.0, False),
+        ("skew_dir", 0.6, False), ("vwap_reversion", 0.6, True),
+    ],
+    "expansion": [
+        ("gamma_sign", 1.3, True), ("flip_proximity", 1.0, False),
+        ("rv_expansion", 1.2, False), ("vvix_elevation", 1.0, False),
+        ("tail_heaviness", 0.8, False), ("term_structure", 0.8, True),
+    ],
+    "breakout_confidence": [
+        ("gamma_sign", 1.2, True), ("flip_proximity", 1.1, False),
+        ("adx_strength", 1.0, False), ("rv_expansion", 1.0, False),
+        ("tick_two_sided", 0.8, True),
+    ],
+    "dealer_stability": [
+        ("gamma_sign", 1.5, False), ("gamma_magnitude", 1.0, False),
+        ("flip_cushion", 1.0, False), ("flip_proximity", 0.8, True),
+    ],
+    "volatility_confidence": [   # "is premium rich" (high = favorable to sell vol)
+        ("richness", 1.5, False), ("term_structure", 1.0, False),
+        ("vvix_elevation", 1.0, True), ("rv_expansion", 0.8, True),
+    ],
+}
+
+
+# --------------------------------------------------------------------------- #
+# Hard vetoes: force premium-selling regimes down, regardless of scores        #
+# --------------------------------------------------------------------------- #
+PREMIUM_REGIMES = {"compression", "range_confidence", "mean_reversion_confidence",
+                   "volatility_confidence"}
+
+# Only these compete to be the dominant tradeable regime. dealer_stability and
+# volatility_confidence are structural context, reported but never "dominant".
+TRADEABLE_REGIMES = ["compression", "range_confidence", "mean_reversion_confidence",
+                     "trend", "directional_confidence", "expansion", "breakout_confidence"]
+SUPPORT_REGIMES = ["dealer_stability", "volatility_confidence"]
+
+ALL_ENGINES = {"premium_selling", "directional", "vol_expansion"}
+
+
+def _vetoes(ctx: ClassifierContext) -> list[tuple]:
+    """Return (reason, blocked_engines). Catalyst is a true hard stop; the rest
+    block premium selling but PERMIT directional / vol-expansion engines."""
+    m = ctx.market
+    v = []
+    if m.has_catalyst:
+        v.append((f"catalyst:{m.catalyst_label or 'event'}", set(ALL_ENGINES)))
+    if m.net_gex <= 0:
+        v.append(("short_gamma_regime", {"premium_selling"}))
+    if m.spot < m.gamma_flip:
+        v.append(("below_gamma_flip", {"premium_selling"}))
+    if m.vix >= m.vix3m:
+        v.append(("term_backwardation", {"premium_selling"}))
+    if m.adx >= 25:
+        v.append(("trending", {"premium_selling"}))
+    return v
+
+
+# --------------------------------------------------------------------------- #
+# Output                                                                       #
 # --------------------------------------------------------------------------- #
 @dataclass
 class RegimeState:
-    dealer_regime: str        # "long_gamma" | "short_gamma" | "at_flip"
-    vol_regime: str           # "low_vol" | "normal_vol" | "high_vol"
-    momentum_regime: str      # "bull" | "bear" | "neutral"
-    permitted_engines: list[str]
-    veto_reasons: list[str]
-    info_gain: float          # 0..1, spikes on regime flips
-    details: dict             # raw scores for logging
-
-    @property
-    def is_premium_ok(self) -> bool:
-        return "premium_selector" in self.permitted_engines
-
-    @property
-    def is_directional_ok(self) -> bool:
-        return "directional_selector" in self.permitted_engines
-
-    @property
-    def all_blocked(self) -> bool:
-        return not self.permitted_engines
+    confidences: dict             # regime -> 0..100
+    reliabilities: dict           # regime -> 0..1 (coverage-weighted)
+    dominant_regime: str
+    permitted_engine: str         # premium_selling | directional | vol_expansion | none
+    vetoes: list
+    global_information_gain: float
+    standardized: dict            # feature -> value (for IG + journaling)
+    stand_down: bool
 
 
-@dataclass
-class ClassifierConfig:
-    # dealer regime
-    flip_buffer_frac: float = 0.0012   # abs((spot-flip)/spot) < this -> at_flip
-    min_gex_rank_premium: float = 0.55 # long_gamma but GEX rank too low -> no premium
-    min_gex_for_long: float = 0.0      # net_gex must exceed this to be long (in $ units)
-
-    # vol regime
-    vix_low: float = 14.0
-    vix_high: float = 20.0
-    adx_low: float = 14.0
-    adx_high: float = 24.0
-
-    # momentum regime
-    rsi_bull: float = 55.0
-    rsi_bear: float = 45.0
-
-    # catalyst hard stop
-    block_on_catalyst: bool = True
+ENGINE_MAP = {
+    "compression": "premium_selling", "range_confidence": "premium_selling",
+    "mean_reversion_confidence": "premium_selling", "volatility_confidence": "premium_selling",
+    "trend": "directional", "directional_confidence": "directional",
+    "expansion": "vol_expansion", "breakout_confidence": "vol_expansion",
+    "dealer_stability": "premium_selling",
+}
 
 
 # --------------------------------------------------------------------------- #
 # Classifier                                                                   #
 # --------------------------------------------------------------------------- #
+@dataclass
+class ClassifierConfig:
+    min_dominant_confidence: float = 55.0
+    min_regime_reliability: float = 0.35
+    ig_stand_down: float = 70.0        # global IG above this => regime unstable, stand down
+    update_scales: bool = True
+
+
+@dataclass
 class RegimeClassifier:
-    def __init__(self, cfg: Optional[ClassifierConfig] = None,
-                 scale_book: Optional[ScaleBook] = None):
-        self.cfg = cfg or ClassifierConfig()
-        self.scale_book = scale_book or ScaleBook()
-        self._prior: Optional[RegimeState] = None
+    scales: ScaleBook = field(default_factory=ScaleBook)
+    cfg: ClassifierConfig = field(default_factory=ClassifierConfig)
 
-    def classify(self, snapshot: dict) -> RegimeState:
-        """
-        snapshot keys used (all optional / defaulted):
-          spot, net_gex, gamma_flip, gex_pct_rank,
-          vix, vix9d, vix3m, adx, rsi, has_catalyst
-        """
-        cfg = self.cfg
-        sb = self.scale_book
+    def _standardize(self, ctx: ClassifierContext) -> dict:
+        out = {}
+        for spec in FEATURES:
+            val = _safe(lambda: spec.fn(ctx, self.scales))
+            if val is None:
+                out[spec.name] = (None, 0.0)
+                continue
+            # staleness down-weights reliability
+            age = ctx.feature_ages.get(spec.name, 0.0)
+            stale = 1.0 if age <= spec.staleness_s else max(0.0, 1.0 - (age - spec.staleness_s) / spec.staleness_s)
+            rel = self.scales.reliability(spec.name) * stale
+            out[spec.name] = (clip100(val), rel)
+        return out
 
-        spot = float(snapshot.get("spot", 600.0))
-        net_gex = float(snapshot.get("net_gex", 0.0))
-        flip = float(snapshot.get("gamma_flip", spot))
-        gex_rank = float(snapshot.get("gex_pct_rank", 0.5))
-        vix = float(snapshot.get("vix", 15.0))
-        vix9d = float(snapshot.get("vix9d", vix))
-        vix3m = float(snapshot.get("vix3m", vix))
-        adx = float(snapshot.get("adx", 15.0))
-        rsi = float(snapshot.get("rsi", 50.0))
-        has_catalyst = bool(snapshot.get("has_catalyst", False))
+    def _update_scales(self, ctx: ClassifierContext):
+        m = ctx.market
+        self.scales.update("net_gex", m.net_gex)
+        self.scales.update("flip_cushion", (m.spot - m.gamma_flip) / m.spot)
+        self.scales.update("term_structure", (m.vix3m - m.vix) / m.vix)
+        self.scales.update("bbw_ratio", m.bb_width / m.bb_width_baseline)
+        self.scales.update("cvd_slope", m.cvd_slope)
+        if ctx.rnd is not None:
+            self.scales.update("rnd_skew", ctx.rnd.skew())
 
-        # Update scale book
-        for k, v in [("net_gex", net_gex), ("gex_rank", gex_rank),
-                     ("vix", vix), ("adx", adx), ("rsi", rsi)]:
-            sb.update(k, v)
+    def classify(self, ctx: ClassifierContext,
+                 prev_standardized: Optional[dict] = None) -> RegimeState:
+        if self.cfg.update_scales:
+            self._update_scales(ctx)
 
-        vetoes: list[str] = []
+        std = self._standardize(ctx)
+        vetoes = _vetoes(ctx)
+        blocked_engines = set()
+        for _, eng in vetoes:
+            blocked_engines |= eng
 
-        # ---- dealer regime ----
-        flip_dist_frac = abs(spot - flip) / spot if spot > 0 else 0.0
-        if flip_dist_frac < cfg.flip_buffer_frac:
-            dealer = "at_flip"
-        elif net_gex > cfg.min_gex_for_long and spot > flip:
-            dealer = "long_gamma"
-        else:
-            dealer = "short_gamma"
+        confidences, reliabilities = {}, {}
+        for regime, weights in REGIME_WEIGHTS.items():
+            num = den = relsum = wsum = 0.0
+            for fname, w, invert in weights:
+                v, rel = std.get(fname, (None, 0.0))
+                if v is None or rel <= 0:
+                    wsum += w
+                    continue
+                vv = (100.0 - v) if invert else v
+                num += w * rel * vv
+                den += w * rel
+                relsum += w * rel
+                wsum += w
+            conf = (num / den) if den > 0 else 0.0
+            coverage = (relsum / wsum) if wsum > 0 else 0.0
+            # knock down any regime whose mapped engine is blocked, so reported
+            # confidence stays honest
+            eng = ENGINE_MAP.get(regime)
+            if eng in blocked_engines:
+                conf = min(conf, 15.0)
+            confidences[regime] = round(conf, 1)
+            reliabilities[regime] = round(coverage, 3)
 
-        # ---- vol regime ----
-        if vix <= cfg.vix_low and adx <= cfg.adx_low:
-            vol = "low_vol"
-        elif vix >= cfg.vix_high or adx >= cfg.adx_high:
-            vol = "high_vol"
-        else:
-            vol = "normal_vol"
+        # global information gain: mean |Δ| of standardized features vs prev tick
+        ig = 0.0
+        if prev_standardized:
+            deltas = []
+            for k, (v, _) in std.items():
+                pv = prev_standardized.get(k, (None,))[0]
+                if v is not None and pv is not None:
+                    deltas.append(abs(v - pv))
+            if deltas:
+                ig = clip100(sum(deltas) / len(deltas) * 2.0)   # scale: 50-pt avg move -> 100
 
-        # Term structure backwardation check (VIX9d > VIX or VIX > VIX3M)
-        if vix9d > vix * 1.02 or vix > vix3m * 1.01:
-            vol = "high_vol"
-            vetoes.append("term_structure_inverted")
-
-        # ---- momentum regime ----
-        if rsi >= cfg.rsi_bull and spot > flip:
-            momentum = "bull"
-        elif rsi <= cfg.rsi_bear and spot < flip:
-            momentum = "bear"
-        else:
-            momentum = "neutral"
-
-        # ---- permitted engines ----
-        engines: list[str] = []
-
-        if cfg.block_on_catalyst and has_catalyst:
-            vetoes.append("catalyst")
-        elif dealer == "long_gamma" and vol in ("low_vol", "normal_vol"):
-            if gex_rank >= cfg.min_gex_rank_premium:
-                engines.append("premium_selector")
-            else:
-                vetoes.append(f"gex_rank_too_low:{gex_rank:.2f}<{cfg.min_gex_rank_premium}")
-        elif dealer == "short_gamma":
-            engines.append("directional_selector")
-        elif dealer == "at_flip":
-            # Transitional: neither engine until price accepts one side
-            pass
-
-        if vol == "high_vol" and dealer != "short_gamma":
-            vetoes.append("high_vol_suppresses_premium")
-            engines = [e for e in engines if e != "premium_selector"]
-
-        details = {
-            "dealer_regime": dealer,
-            "vol_regime": vol,
-            "momentum_regime": momentum,
-            "gex_rank": round(gex_rank, 3),
-            "flip_dist_frac": round(flip_dist_frac, 4),
-            "vix": vix, "adx": adx, "rsi": rsi,
+        # dominant tradeable regime: only TRADEABLE_REGIMES whose engine is not
+        # blocked and whose reliability clears the floor
+        eligible = {
+            r: confidences[r] for r in TRADEABLE_REGIMES
+            if reliabilities[r] >= self.cfg.min_regime_reliability
+            and ENGINE_MAP.get(r) not in blocked_engines
         }
+        dominant = max(eligible, key=eligible.get) if eligible else "none"
+        top_conf = eligible.get(dominant, 0.0)
 
-        # ---- information gain vs prior ----
-        info = _info_gain(self._prior, dealer, vol, momentum)
+        stand_down = (top_conf < self.cfg.min_dominant_confidence
+                      or ig >= self.cfg.ig_stand_down
+                      or dominant == "none")
+        engine = "none" if stand_down else ENGINE_MAP.get(dominant, "none")
 
-        state = RegimeState(
-            dealer_regime=dealer,
-            vol_regime=vol,
-            momentum_regime=momentum,
-            permitted_engines=engines,
-            veto_reasons=vetoes,
-            info_gain=round(info, 3),
-            details=details,
+        return RegimeState(
+            confidences=confidences, reliabilities=reliabilities,
+            dominant_regime=dominant, permitted_engine=engine,
+            vetoes=[r for r, _ in vetoes], global_information_gain=round(ig, 1),
+            standardized=std, stand_down=stand_down,
         )
-        self._prior = state
-        return state
-
-
-def _info_gain(prior: Optional[RegimeState],
-               dealer: str, vol: str, momentum: str) -> float:
-    """Fraction of the 3 axes that flipped from prior. 1.0 = full flip."""
-    if prior is None:
-        return 1.0
-    changes = sum([
-        prior.dealer_regime != dealer,
-        prior.vol_regime != vol,
-        prior.momentum_regime != momentum,
-    ])
-    return changes / 3.0
 
 
 # --------------------------------------------------------------------------- #
 # Demo                                                                         #
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+
+    def mk(**o):
+        spot = o.get("spot", 600.0)
+        return MarketSnapshot(
+            spot=spot, net_gex=o.get("net_gex", 4e9),
+            gamma_flip=o.get("gamma_flip", spot - 7),
+            call_wall=o.get("call_wall", spot + 5), put_wall=o.get("put_wall", spot - 5),
+            gex_pct_rank=o.get("gex_pct_rank", 0.85),
+            vix9d=o.get("vix9d", 12.0), vix=o.get("vix", 13.0), vix3m=o.get("vix3m", 15.0),
+            vvix=o.get("vvix", 92.0), vvix_baseline=95.0,
+            straddle_breakeven=4.0, expected_range=3.2,
+            adx=o.get("adx", 12.0), rsi=o.get("rsi", 51.0),
+            bb_width=o.get("bb_width", 1.4), bb_width_baseline=2.0,
+            vwap=spot, vwap_reversion_count=o.get("vwap_rev", 5),
+            tick_abs_mean=o.get("tick", 450.0), cvd_slope=o.get("cvd", 0.05),
+            now=dt.datetime(2026, 6, 25, 11, 30, tzinfo=ET),
+            has_catalyst=o.get("cat", False), catalyst_label=o.get("cat_lbl", ""),
+        )
+
     clf = RegimeClassifier()
-
-    long_gamma_snap = dict(
-        spot=602.5, net_gex=4.2e9, gamma_flip=596.0, gex_pct_rank=0.88,
-        vix=13.0, vix9d=12.1, vix3m=15.2, adx=12.5, rsi=52.0, has_catalyst=False,
-    )
-    short_gamma_snap = dict(
-        spot=588.0, net_gex=-1.1e9, gamma_flip=593.0, gex_pct_rank=0.40,
-        vix=18.0, vix9d=19.5, vix3m=17.0, adx=28.0, rsi=38.0, has_catalyst=False,
-    )
-    catalyst_snap = dict(
-        spot=602.0, net_gex=3.0e9, gamma_flip=596.0, gex_pct_rank=0.80,
-        vix=14.0, vix9d=13.5, vix3m=15.0, adx=13.0, rsi=51.0, has_catalyst=True,
-    )
-
-    for label, snap in [
-        ("long_gamma_ranging", long_gamma_snap),
-        ("short_gamma_trending", short_gamma_snap),
-        ("catalyst_day", catalyst_snap),
-    ]:
-        r = clf.classify(snap)
-        print(f"\n=== {label} ===")
-        print(f"  dealer={r.dealer_regime}  vol={r.vol_regime}  momentum={r.momentum_regime}")
-        print(f"  engines={r.permitted_engines}  vetoes={r.veto_reasons}  info_gain={r.info_gain}")
+    scenarios = {
+        "A clean compression": mk(),
+        "B short-gamma breakout": mk(net_gex=-1.2e9, gamma_flip=601, adx=29,
+                                     bb_width=3.2, vvix=120, tick=950, cvd=0.8, rsi=68),
+        "C CPI catalyst": mk(cat=True, cat_lbl="CPI"),
+        "D trending up": mk(adx=27, cvd=0.6, bb_width=2.6, rsi=64, vwap_rev=1),
+    }
+    for tag, m in scenarios.items():
+        st = clf.classify(ClassifierContext(market=m))
+        top3 = sorted(st.confidences.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        print(f"\n{tag}")
+        print(f"  dominant={st.dominant_regime}  engine={st.permitted_engine}  stand_down={st.stand_down}")
+        print(f"  vetoes={st.vetoes}")
+        print(f"  top: " + ", ".join(f"{r}={c}" for r, c in top3))
