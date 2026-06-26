@@ -151,7 +151,8 @@ class UnifiedOrchestrator:
         decision = None
         if snap.chain is not None:
             decision = decide(snap.market, snap.chain, cfg,
-                              physical_pdf=self.physical_pdf)
+                              physical_pdf=self.physical_pdf,
+                              target_structure=intent.decision.structure)
             if self.journal:
                 self.journal.log(decision.as_row())
         else:
