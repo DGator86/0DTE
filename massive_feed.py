@@ -68,18 +68,10 @@ def _get(url: str, key: str) -> dict:
 
 def _row_from_contract(c: dict) -> OptionRow | None:
     """Map one snapshot contract to an OptionRow. Returns None if data is incomplete.
-    If live bid/ask is absent, fall back to the day close BUT tag it so live
-    selection rejects it — a fallback quote has spread 0 and would defeat the
-    liquidity filter."""
-    details = c.get("details", {})              # CONFIRM: contract_type, strike_price
-    greeks = c.get("greeks", {})                # CONFIRM: gamma, delta
-    side = details.get("contract_type")         # "call" | "put"
-    quote = c.get("last_quote", {}) or {}       # CONFIRM: bid, ask
-    day = c.get("day", {}) or {}                # daily agg, has close
-    side = details.get("contract_type")
-    """Map one snapshot contract to an OptionRow. Returns None if data is incomplete."""
-    details = c.get("details", {})
-    greeks = c.get("greeks", {})
+    Falls back to day.close if live bid/ask absent; tags fallback rows as invalid
+    for live selection."""
+    details = c.get("details", {}) or {}
+    greeks = c.get("greeks", {}) or {}
     side = details.get("contract_type")     # "call" | "put"
     strike = details.get("strike_price")
     gamma = greeks.get("gamma")
@@ -89,30 +81,18 @@ def _row_from_contract(c: dict) -> OptionRow | None:
     if None in (side, strike, gamma, delta, oi):
         return None
 
-    # Prefer real-time last_quote; fall back to day.close
     # Prefer real-time last_quote; fall back to day.close (confirmed absent in live API)
-    quote = c.get("last_quote", {})
+    quote = c.get("last_quote", {}) or {}
+    day = c.get("day", {}) or {}
     bid = quote.get("bid")
     ask = quote.get("ask")
-    if bid is None or ask is None:
-        close = c.get("day", {}).get("close")
-        if close is None:
-            return None
-        bid = ask = close   # spread_pct=0; mid=close
-
-    if bid <= 0 or ask <= 0:
-        return None
-    if None in (side, strike, gamma, delta, oi):
-        return None
-
-    bid, ask = quote.get("bid"), quote.get("ask")
     if bid is not None and ask is not None and bid > 0 and ask > 0:
         source, valid = "live_quote", True
     else:
         close = day.get("close")
         if not close or close <= 0:
-            return None                          # no quote AND no close -> unusable
-        bid = ask = float(close)                 # fallback: diagnostics only
+            return None
+        bid = ask = float(close)
         source, valid = "day_close_fallback", False
 
     return OptionRow(side=side, strike=float(strike), oi=int(oi),
@@ -142,26 +122,14 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
     today = _today_et()
     rows: list[OptionRow] = []
     spot = 0.0
-    best_delta = 0.0  # fallback: track deepest-ITM call for spot estimation
     best_delta = 0.0    # tracks deepest-ITM call for spot estimation fallback
     pages = 0
 
-    while url and pages < 25:            # safety cap on pagination
-        data = _get(url, key)
-        for c in data.get("results", []):
-            # Prefer API-provided spot; fall back to deep-ITM call intrinsic value
-            ua = c.get("underlying_asset", {})          # CONFIRM: underlying_asset.price
-            # underlying price lives on each contract's snapshot
-            ua = c.get("underlying_asset", {})          # CONFIRM: underlying_asset.price
-            if ua.get("price"):
-                spot = float(ua["price"])
-            if zero_dte_only and c.get("details", {}).get("expiration_date") != today:
     while url and pages < 25:           # safety cap on pagination
         data = _get(url, key)
         for c in data.get("results", []):
-            # Prefer API-provided spot; fall back to deep-ITM call intrinsic value
-            # (underlying_asset.price confirmed absent in live Massive snapshot)
-            ua = c.get("underlying_asset", {})
+            # underlying_asset.price confirmed absent in live Massive snapshot
+            ua = c.get("underlying_asset", {}) or {}
             if ua.get("price"):
                 spot = float(ua["price"])
             elif not spot:
@@ -178,13 +146,11 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
             row = _row_from_contract(c)
             if row:
                 rows.append(row)
-        nxt = data.get("next_url")
-        url = nxt if nxt else None
         url = data.get("next_url") or None
         pages += 1
 
     if spot <= 0:
-        spot = _estimate_spot(rows)              # underlying price absent -> estimate
+        spot = _estimate_spot(rows)
 
     live = sum(1 for r in rows if r.quote_valid)
     if rows and live == 0:
