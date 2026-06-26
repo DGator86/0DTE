@@ -84,6 +84,33 @@ class MarketSnapshot:
         t = self.now if self.now.tzinfo else self.now.replace(tzinfo=ET)
         return t.astimezone(ET).time()
 
+    def mtf_snapshot(self) -> dict:
+        """Snapshot dict for mtf_matrix SNAPSHOT-kind variables (pre-standardized inputs)."""
+        s = self.spot
+        return {
+            "gamma_sign":        self.net_gex,
+            "gamma_magnitude":   self.gex_pct_rank,
+            "flip_cushion":      (s - self.gamma_flip) / s,
+            "channel_tightness": (self.call_wall - self.put_wall) / s,
+            "wall_proximity":    min(abs(self.call_wall - s), abs(s - self.put_wall)) / s,
+            "term_structure":    (self.vix3m - self.vix) / self.vix if self.vix else 0.0,
+            "vvix_elevation":    self.vvix / self.vvix_baseline - 1.0 if self.vvix_baseline else 0.0,
+            # richness / skew_dir / tail_heaviness injected from RND after extraction
+        }
+
+    def dealer_vetoes(self) -> list:
+        """Hard vetoes for the regime classifier and Track B routing."""
+        v = []
+        if self.net_gex <= 0:
+            v.append("short_gamma")
+        if self.spot < self.gamma_flip:
+            v.append("below_flip")
+        if self.vix >= self.vix3m:
+            v.append("term_backwardation")
+        if self.has_catalyst:
+            v.append(f"catalyst:{self.catalyst_label or 'event'}")
+        return v
+
 
 @dataclass
 class GateConfig:

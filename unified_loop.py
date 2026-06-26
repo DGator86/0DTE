@@ -1,0 +1,361 @@
+"""
+unified_loop.py
+===============
+Single tick loop combining Track B (regime routing) and Track A (premium engine).
+
+Per tick:
+  1. Track A RND first — extract_rnd + compute_edge from the chain (if present).
+     RND-derived richness/skew/kurtosis are injected into the mtf_snapshot dict
+     so the matrix sees them as SNAPSHOT variables.
+  2. Track B — resample bars -> build_matrix -> regime_classifier.classify ->
+     decide_from_matrix. Produces a TradeIntent (structure family, conviction,
+     size_mult) and a RegimeState (dominant_regime, permitted_engine, stand_down).
+  3. Combine — if regime stands down, or TradeIntent is NT, log a NO_TRADE row
+     and return. Otherwise run Track A decide() for a concrete SpreadCandidate.
+  4. Size — final_size_mult = intent.size_mult. Track A's gate and selector
+     veto independently; the regime multiplier scales the position on top.
+  5. Journal every tick (trade and no-trade), because no-trades are first-class.
+
+DataFeed protocol (superset of both prior orchestrator protocols):
+    snapshot(now: datetime) -> Optional[TickSnapshot]
+    settlement_price(session_date: str) -> Optional[float]
+
+TickSnapshot bundles everything both tracks need in one place:
+    market: gate_scorer.MarketSnapshot   (has .mtf_snapshot() + .dealer_vetoes())
+    bars:   resample.RawBars             (Track B indicator computation)
+    chain:  Optional[ChainSnapshot]      (Track A options pricing; None = no data yet)
+
+NOT financial advice.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Optional, Protocol, Sequence
+from zoneinfo import ZoneInfo
+
+import numpy as np
+
+from gate_scorer import MarketSnapshot
+from rnd_extractor import ChainSnapshot, extract_rnd, compute_edge, RNDConfig
+from decision_engine import decide, EngineConfig, TradeDecision
+from resample import RawBars, build_mtf_input
+from mtf_matrix import build_matrix, regime_rows
+from decision_matrix import decide_from_matrix, TradeIntent
+from regime_classifier import RegimeClassifier, RegimeState, ClassifierContext, ClassifierConfig
+from journal import Journal
+
+ET = ZoneInfo("America/New_York")
+
+
+# --------------------------------------------------------------------------- #
+# Unified tick bundle                                                          #
+# --------------------------------------------------------------------------- #
+@dataclass
+class TickSnapshot:
+    market: MarketSnapshot
+    bars: RawBars
+    chain: Optional[ChainSnapshot] = None
+
+
+@dataclass
+class TickResult:
+    ts: dt.datetime
+    regime: RegimeState
+    intent: TradeIntent
+    decision: Optional[TradeDecision]
+    final_size_mult: float      # intent.size_mult, 0 if regime stand_down
+    vetoes: list
+
+
+# --------------------------------------------------------------------------- #
+# DataFeed protocol                                                            #
+# --------------------------------------------------------------------------- #
+class DataFeed(Protocol):
+    def snapshot(self, now: dt.datetime) -> Optional[TickSnapshot]: ...
+    def settlement_price(self, session_date: str) -> Optional[float]: ...
+
+
+# --------------------------------------------------------------------------- #
+# Unified Orchestrator                                                         #
+# --------------------------------------------------------------------------- #
+@dataclass
+class UnifiedOrchestrator:
+    feed: DataFeed
+    journal: Optional[Journal] = None
+    engine_cfg: Optional[EngineConfig] = None
+    classifier_cfg: Optional[ClassifierConfig] = None
+    physical_pdf: Optional[Callable] = None     # callable(grid)->density for Track A
+
+    def __post_init__(self):
+        self._classifier = RegimeClassifier(
+            cfg=self.classifier_cfg or ClassifierConfig()
+        )
+        self._prev_std: Optional[dict] = None   # for information-gain computation
+
+    def tick(self, now: dt.datetime) -> Optional[TickResult]:
+        snap = self.feed.snapshot(now)
+        if snap is None:
+            return None
+
+        cfg = self.engine_cfg or EngineConfig()
+
+        # ---- Track A RND (feeds both regime and selector) ----
+        rnd = edge = None
+        if snap.chain is not None:
+            try:
+                rnd = extract_rnd(snap.chain, cfg.rnd)
+                edge = compute_edge(rnd, snap.chain, cfg.rnd,
+                                    physical_pdf=self.physical_pdf)
+            except Exception:
+                pass
+
+        # ---- Build mtf snapshot, inject RND-derived vars ----
+        snap_dict = snap.market.mtf_snapshot()
+        if edge is not None:
+            snap_dict["richness"] = edge.richness_signal
+        if rnd is not None:
+            try:
+                snap_dict["skew_dir"] = rnd.skew()
+                snap_dict["tail_heaviness"] = rnd.excess_kurtosis()
+            except Exception:
+                pass
+
+        # ---- Track B: regime classifier ----
+        clf_ctx = ClassifierContext(market=snap.market, rnd=rnd, edge=edge)
+        regime_state = self._classifier.classify(clf_ctx, self._prev_std)
+        self._prev_std = regime_state.standardized
+
+        # ---- Track B: matrix + decision routing ----
+        mtf_in = build_mtf_input(snap.bars, snap_dict)
+        mat_rows = build_matrix(mtf_in)
+        regimes = regime_rows(mat_rows)
+        intent = decide_from_matrix(mat_rows, regimes, vetoes=regime_state.vetoes)
+
+        # ---- Stand-down: regime unstable or NT cell ----
+        if regime_state.stand_down or intent.decision.structure == "NT":
+            result = TickResult(
+                ts=now, regime=regime_state, intent=intent,
+                decision=None, final_size_mult=0.0,
+                vetoes=regime_state.vetoes,
+            )
+            if self.journal:
+                self.journal.log(_no_trade_row(snap.market, intent, regime_state))
+            return result
+
+        # ---- Track A: full engine (requires chain) ----
+        decision = None
+        if snap.chain is not None:
+            decision = decide(snap.market, snap.chain, cfg,
+                              physical_pdf=self.physical_pdf)
+            if self.journal:
+                self.journal.log(decision.as_row())
+        else:
+            # No chain yet — log intent as a no-trade stub for calibration
+            if self.journal:
+                self.journal.log(_no_trade_row(snap.market, intent, regime_state,
+                                               reason="no_chain"))
+
+        # size_mult from Track B scales the Track A position
+        final_size = intent.size_mult if (decision is not None
+                                          and decision.decision == "TRADE") else 0.0
+
+        return TickResult(
+            ts=now, regime=regime_state, intent=intent,
+            decision=decision,
+            final_size_mult=round(final_size, 2),
+            vetoes=regime_state.vetoes,
+        )
+
+    def run_replay(self, timestamps: Sequence[dt.datetime]) -> list[TickResult]:
+        out = []
+        for t in timestamps:
+            r = self.tick(t)
+            if r is not None:
+                out.append(r)
+        return out
+
+    def run_live(self, interval_seconds: int, until: dt.datetime,
+                 clock=None) -> list[TickResult]:
+        if clock is None:
+            clock = lambda: dt.datetime.now(ET)
+        out = []
+        while clock() < until:
+            r = self.tick(clock())
+            if r is not None:
+                out.append(r)
+            time.sleep(interval_seconds)
+        return out
+
+    def settle(self, session_date: str) -> int:
+        if self.journal is None:
+            return 0
+        price = self.feed.settlement_price(session_date)
+        if price is None:
+            return 0
+        return self.journal.settle_session(session_date, price)
+
+
+# --------------------------------------------------------------------------- #
+# Row builder for no-trade / no-chain ticks                                   #
+# --------------------------------------------------------------------------- #
+def _no_trade_row(market: MarketSnapshot, intent: TradeIntent,
+                  regime: RegimeState, reason: str = "") -> dict:
+    now = market.now
+    session_date = now.astimezone(ET).date().isoformat()
+    gex_regime = "long" if market.net_gex > 0 else ("short" if market.net_gex < 0 else "flat")
+    zg = market.spot - market.gamma_flip
+    no_reason = reason or ("regime_nt" if intent.decision.structure == "NT"
+                           else f"stand_down:{regime.dominant_regime}")
+    return {
+        "session_date": session_date,
+        "ts": now.isoformat(),
+        "spot": market.spot,
+        "net_gex": market.net_gex,
+        "gex_regime": gex_regime,
+        "gex_pct_rank": market.gex_pct_rank,
+        "zero_gamma_dist": zg,
+        "zero_gamma_dist_pct": zg / market.spot,
+        "adx": market.adx,
+        "call_wall": market.call_wall,
+        "put_wall": market.put_wall,
+        "selected_family": (intent.decision.structure
+                            if intent.decision.structure != "NT" else None),
+        "short_strikes": None, "long_strikes": None, "legs_json": None,
+        "credit": None, "candidate_score": None, "ev": None,
+        "max_loss": None, "ev_per_risk": None,
+        "theta": None, "gamma": None,
+        "prob_profit": None, "prob_touch_short": None,
+        "liquidity_score": None, "wall_safety": None,
+        "gamma_safety": None, "touch_safety": None,
+        "gate_pass": 0, "gate_score": 0.0,
+        "gate_failed": json.dumps([no_reason]),
+        "veto_reasons": json.dumps(intent.vetoes),
+        "decision": "NO_TRADE",
+        "no_trade_reason": no_reason,
+        "was_traded": 0,
+        "candidate_present": 0,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic feed for replay / tests                                            #
+# --------------------------------------------------------------------------- #
+@dataclass
+class SyntheticUnifiedFeed:
+    """
+    Builds a multi-day bar stream and a static market snapshot.
+    Optionally injects a ChainSnapshot at every tick for Track A testing.
+    """
+    days: int = 20
+    seed: int = 7
+    base_spot: float = 600.0
+    settle: float = 600.0
+    chain: Optional[ChainSnapshot] = None       # inject a fixed chain for seam testing
+    _raw: RawBars = field(init=False)
+    _market: MarketSnapshot = field(init=False)
+    _ts_iter: object = field(init=False)
+
+    def __post_init__(self):
+        from resample import _synth_bars
+        self._raw = _synth_bars(days=self.days, seed=self.seed)
+        spot = float(self._raw.close[-1])
+        self._market = MarketSnapshot(
+            spot=spot, net_gex=4.0e9, gamma_flip=spot - 6.0,
+            call_wall=spot + 5.0, put_wall=spot - 5.0, gex_pct_rank=0.86,
+            vix9d=12.0, vix=13.0, vix3m=15.0, vvix=92.0, vvix_baseline=95.0,
+            straddle_breakeven=4.0, expected_range=3.2,
+            adx=13.0, rsi=51.0, bb_width=1.4, bb_width_baseline=2.0,
+            vwap=spot, vwap_reversion_count=3,
+            tick_abs_mean=480.0, cvd_slope=0.02,
+            now=dt.datetime(2026, 6, 26, 9, 30, tzinfo=ET),
+            has_catalyst=False,
+        )
+        # Walk through timestamps one tick at a time
+        self._idx = 0
+
+    def snapshot(self, now: dt.datetime) -> Optional[TickSnapshot]:
+        i = self._idx + 1
+        if i > len(self._raw.close):
+            return None
+        self._idx = i
+        # rolling bar window up to current bar
+        bars = RawBars(
+            ts=self._raw.ts[:i], open=self._raw.open[:i], high=self._raw.high[:i],
+            low=self._raw.low[:i], close=self._raw.close[:i], volume=self._raw.volume[:i],
+        )
+        # update spot from last close
+        import dataclasses
+        market = dataclasses.replace(self._market,
+                                     spot=float(self._raw.close[i - 1]),
+                                     now=now)
+        return TickSnapshot(market=market, bars=bars, chain=self.chain)
+
+    def settlement_price(self, session_date: str) -> Optional[float]:
+        return self.settle
+
+
+# --------------------------------------------------------------------------- #
+# Demo                                                                         #
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    from journal import Journal
+
+    # ---- no-chain run (Track B only, no options data) ----
+    print("=== Unified loop — no chain (regime routing only) ===")
+    feed = SyntheticUnifiedFeed(days=5)
+    jrn = Journal(":memory:")
+    orch = UnifiedOrchestrator(feed=feed, journal=jrn)
+
+    start = dt.datetime(2026, 6, 26, 9, 30, tzinfo=ET)
+    ticks = [start + dt.timedelta(minutes=i) for i in range(5 * 390)]
+    results = orch.run_replay(ticks)
+
+    trades = [r for r in results if r.decision is not None and r.decision.decision == "TRADE"]
+    standed = [r for r in results if r.final_size_mult == 0.0]
+    print(f"  {len(results)} ticks  |  {len(trades)} TRADE  |  {len(standed)} stand-down/NT")
+    if results:
+        last = results[-1]
+        print(f"  last tick: regime={last.regime.dominant_regime} "
+              f"engine={last.regime.permitted_engine} "
+              f"struct={last.intent.decision.structure} "
+              f"size_mult={last.final_size_mult}")
+
+    # ---- with chain (full Track A seam) ----
+    print("\n=== Unified loop — with chain (full Track A seam) ===")
+    from rnd_extractor import ChainSnapshot, ChainQuote, _bs_call_fwd
+    spot0 = 600.0
+    T0, r0 = 4.0 / (24 * 365), 0.05
+    DF0 = math.exp(-r0 * T0)
+    F0 = spot0 * math.exp(r0 * T0)
+    qs = []
+    for K in np.arange(spot0 - 15, spot0 + 16, 1.0):
+        k = math.log(K / F0)
+        s = max(0.0050 - 0.030 * k, 0.0008)
+        cm = _bs_call_fwd(F0, K, s) * DF0
+        pm = max(cm - DF0 * (F0 - K), 0.0)
+        cm = max(cm, 0.0)
+        h = 0.01 + 0.002 * max(cm, pm)
+        qs.append(ChainQuote(float(K), max(cm - h, 0), cm + h,
+                             max(pm - h, 0), pm + h))
+    chain = ChainSnapshot(qs, spot=spot0, t_years=T0, r=r0)
+
+    feed2 = SyntheticUnifiedFeed(days=5, chain=chain)
+    jrn2 = Journal(":memory:")
+    orch2 = UnifiedOrchestrator(feed=feed2, journal=jrn2)
+    ticks2 = [start + dt.timedelta(minutes=i) for i in range(20)]
+    results2 = orch2.run_replay(ticks2)
+    trades2 = [r for r in results2 if r.decision is not None and r.decision.decision == "TRADE"]
+    print(f"  20 ticks  |  {len(trades2)} TRADE decisions from Track A")
+    if trades2:
+        d = trades2[0].decision
+        print(f"  first trade: {d.candidate.family if d.candidate else 'no candidate'} "
+              f"gate={'PASS' if d.gate_pass else 'FAIL'} "
+              f"size_mult={trades2[0].final_size_mult}")
+
+    eff = jrn2.gate_effectiveness()
+    print(f"\n  journal: {eff['trades_taken']['n']} taken, "
+          f"{eff['blocked_by_gate']['n']} blocked by gate")
