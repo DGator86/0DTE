@@ -16,15 +16,26 @@ self-check against ONE real response (python massive_feed.py SPY) and confirm th
 three field paths flagged with #CONFIRM before trusting it live.
 """
 from __future__ import annotations
+import math
 import os
 import json
 import gzip
 import urllib.request
 import urllib.error
+import datetime as dt
+from collections import deque
 from datetime import datetime
+from typing import Optional
 from zoneinfo import ZoneInfo
 
-from spy0dte import OptionRow   # reuse the engine's dataclass — single source of truth
+import numpy as np
+import pandas as pd
+
+from spy0dte import OptionRow, build_gamma_map
+from resample import RawBars, compute_tf_features, resample_ohlcv
+from rnd_extractor import ChainSnapshot, ChainQuote
+from gate_scorer import MarketSnapshot
+from unified_loop import TickSnapshot
 
 ET = ZoneInfo("America/New_York")
 
@@ -171,6 +182,310 @@ def diagnose(underlying: str) -> None:
     else:
         print("  MAPPING FAILED -> one of contract_type/strike_price/gamma/delta/"
               "open_interest/last_quote is named differently. Paste the structure above.")
+
+
+# --------------------------------------------------------------------------- #
+# Task #3: MassiveDataFeed — live DataFeed for UnifiedOrchestrator            #
+# --------------------------------------------------------------------------- #
+
+def get_bars_raw(symbol: str, lookback_minutes: int = 7800) -> RawBars:
+    """
+    Fetch 1-min OHLCV bars from the Polygon-compatible /v2/aggs endpoint.
+
+    lookback_minutes=7800 ≈ 20 trading days; enough for all MTF indicators.
+    Credentials from MASSIVE_API_KEY / MASSIVE_BASE_URL env vars.
+    """
+    key = os.environ.get("MASSIVE_API_KEY")
+    if not key:
+        raise RuntimeError("MASSIVE_API_KEY not set")
+    base = os.environ.get("MASSIVE_BASE_URL", "https://api.massive.com").rstrip("/")
+
+    now_et = datetime.now(ET)
+    from_dt = now_et - dt.timedelta(minutes=lookback_minutes + 60)
+    from_str = from_dt.strftime("%Y-%m-%d")
+    to_str = now_et.strftime("%Y-%m-%d")
+
+    url = (f"{base}/v2/aggs/ticker/{symbol}/range/1/minute/{from_str}/{to_str}"
+           f"?adjusted=true&sort=asc&limit=50000")
+
+    bars: list[dict] = []
+    while url:
+        data = _get(url, key)
+        bars.extend(data.get("results", []))
+        url = data.get("next_url") or None
+
+    if not bars:
+        raise RuntimeError(f"No bars returned for {symbol}")
+
+    # Polygon bar format: {t: epoch_ms, o, h, l, c, v}
+    ts = np.array([b["t"] for b in bars], dtype="datetime64[ms]").astype("datetime64[ns]")
+    return RawBars(
+        ts=ts,
+        open=np.array([b["o"] for b in bars], dtype=float),
+        high=np.array([b["h"] for b in bars], dtype=float),
+        low=np.array([b["l"] for b in bars], dtype=float),
+        close=np.array([b["c"] for b in bars], dtype=float),
+        volume=np.array([b["v"] for b in bars], dtype=float),
+    )
+
+
+def _option_rows_to_chain_snapshot(spot: float, rows: list[OptionRow],
+                                    t_years: float, r: float = 0.05) -> ChainSnapshot | None:
+    """
+    Convert a flat list of OptionRows (one per contract) into a ChainSnapshot.
+
+    Groups by strike, requiring both a call and a put at each strike for
+    put-call parity and RND extraction. Drops any strike missing either side.
+    """
+    calls: dict[float, OptionRow] = {}
+    puts: dict[float, OptionRow] = {}
+    for row in rows:
+        bucket = calls if row.side == "call" else puts
+        # prefer tighter quote if the same strike appears twice
+        if row.strike not in bucket or row.spread_pct < bucket[row.strike].spread_pct:
+            bucket[row.strike] = row
+
+    quotes: list[ChainQuote] = []
+    for strike in sorted(set(calls) & set(puts)):
+        c, p = calls[strike], puts[strike]
+        quotes.append(ChainQuote(
+            strike=strike,
+            call_bid=c.bid, call_ask=c.ask,
+            put_bid=p.bid, put_ask=p.ask,
+        ))
+
+    if len(quotes) < 5:
+        return None
+    return ChainSnapshot(quotes=quotes, spot=spot, t_years=t_years, r=r)
+
+
+def get_settlement(symbol: str, session_date: str) -> float | None:
+    """EOD close price for a session date (YYYY-MM-DD) used in P&L settlement."""
+    key = os.environ.get("MASSIVE_API_KEY")
+    if not key:
+        return None
+    base = os.environ.get("MASSIVE_BASE_URL", "https://api.massive.com").rstrip("/")
+    url = (f"{base}/v2/aggs/ticker/{symbol}/range/1/day/{session_date}/{session_date}"
+           f"?adjusted=true&sort=asc&limit=1")
+    try:
+        data = _get(url, key)
+        results = data.get("results", [])
+        if results:
+            return float(results[0]["c"])
+    except Exception:
+        pass
+    return None
+
+
+def _atm_straddle_price(rows: list[OptionRow], spot: float) -> float:
+    """Dollar value of the ATM straddle (call_mid + put_mid at the nearest strike)."""
+    if not rows:
+        return 0.0
+    strikes = sorted(set(r.strike for r in rows))
+    atm = min(strikes, key=lambda k: abs(k - spot))
+    call_mid = put_mid = 0.0
+    for r in rows:
+        if r.strike == atm:
+            if r.side == "call":
+                call_mid = r.mid
+            else:
+                put_mid = r.mid
+    return call_mid + put_mid
+
+
+def _bb_width_from_bars(close: np.ndarray, p: int = 20) -> tuple[float, float]:
+    """
+    Returns (current_bb_width_pct, baseline_bb_width_pct) as % of price.
+    baseline = trailing median of the width series.
+    """
+    if len(close) < p * 2:
+        return 1.0, 2.0
+    s = pd.Series(close.astype(float))
+    mid = s.rolling(p).mean()
+    sd = s.rolling(p).std(ddof=0)
+    width_pct = (4.0 * sd / mid * 100.0).dropna()
+    if len(width_pct) < 1 or not np.isfinite(width_pct.iloc[-1]):
+        return 1.0, 2.0
+    return float(width_pct.iloc[-1]), float(width_pct.median())
+
+
+def _session_vwap_and_reversions(raw: RawBars, now: dt.datetime) -> tuple[float, int]:
+    """
+    VWAP from the session open (09:30 ET) and count of price-to-VWAP crossings.
+    If bar timestamps are naive they are treated as UTC.
+    """
+    today = now.astimezone(ET)
+    session_open = today.replace(hour=9, minute=30, second=0, microsecond=0)
+
+    ts_pd = pd.DatetimeIndex(raw.ts.astype("datetime64[ms]"))
+    if ts_pd.tzinfo is None:
+        ts_pd = ts_pd.tz_localize("UTC").tz_convert(ET)
+    else:
+        ts_pd = ts_pd.tz_convert(ET)
+
+    mask = np.array(ts_pd >= session_open, dtype=bool)
+    if not mask.any():
+        return float(raw.close[-1]) if len(raw.close) else 0.0, 0
+
+    c = raw.close[mask].astype(float)
+    v = raw.volume[mask].astype(float)
+    cum_v = np.cumsum(v)
+    cum_v = np.where(cum_v > 0, cum_v, 1.0)
+    vwap_series = np.cumsum(c * v) / cum_v
+    vwap = float(vwap_series[-1])
+
+    if len(c) > 1:
+        diff = c - vwap_series
+        crossings = int(np.sum(np.diff(np.sign(diff)) != 0))
+    else:
+        crossings = 0
+
+    return vwap, crossings
+
+
+def _bar_technicals(raw: RawBars) -> dict:
+    """
+    Compute bar-derived MarketSnapshot fields by resampling to 5m.
+    Returns: adx, rsi, cvd_slope, bb_width, bb_width_baseline.
+    """
+    df = raw.to_frame()
+    rs5 = resample_ohlcv(df, "5min")
+    feats = compute_tf_features(rs5)
+    bb_w, bb_base = _bb_width_from_bars(raw.close)
+    return {
+        "adx":                feats.get("adx_strength") or 20.0,
+        "rsi":                feats.get("rsi") or 50.0,
+        "cvd_slope":          feats.get("cvd_persistence") or 0.0,
+        "bb_width":           bb_w,
+        "bb_width_baseline":  bb_base,
+    }
+
+
+class MassiveDataFeed:
+    """
+    Live DataFeed adapter for UnifiedOrchestrator backed by the Massive API.
+
+    SECURITY: credentials from environment ONLY.
+        export MASSIVE_API_KEY=...
+        export MASSIVE_BASE_URL=https://api.massive.com
+
+    VIX / VVIX are not available from the chain endpoint. Supply them from a
+    separate feed (e.g. CBOE data) or keep the configurable defaults until
+    that pipe is built. The system degrades gracefully: regime classifier uses
+    whatever values are present.
+
+    GEX percentile rank is maintained as a rolling window across ticks; it
+    starts at 0.5 until enough history accumulates.
+    """
+
+    def __init__(
+        self,
+        underlying: str = "SPY",
+        lookback_minutes: int = 7800,           # ~20 trading days
+        r: float = 0.05,
+        # Vol surface defaults until a VIX feed is wired
+        vix9d: float = 14.0,
+        vix: float = 15.0,
+        vix3m: float = 17.0,
+        vvix: float = 92.0,
+        vvix_baseline: float = 95.0,
+        # State: rolling GEX history for percentile rank
+        gex_history_len: int = 100,
+        has_catalyst: bool = False,
+        catalyst_label: str | None = None,
+    ) -> None:
+        self.underlying = underlying
+        self.lookback_minutes = lookback_minutes
+        self.r = r
+        self._vix9d = vix9d
+        self._vix = vix
+        self._vix3m = vix3m
+        self._vvix = vvix
+        self._vvix_baseline = vvix_baseline
+        self._gex_history: deque[float] = deque(maxlen=gex_history_len)
+        self.has_catalyst = has_catalyst
+        self.catalyst_label = catalyst_label
+
+    # -- vol overrides (wire live VIX feed here) --
+    def set_vix(self, vix9d: float, vix: float, vix3m: float) -> None:
+        self._vix9d, self._vix, self._vix3m = vix9d, vix, vix3m
+
+    def set_vvix(self, vvix: float, vvix_baseline: float) -> None:
+        self._vvix, self._vvix_baseline = vvix, vvix_baseline
+
+    def _gex_pct_rank(self, net_gex: float) -> float:
+        self._gex_history.append(net_gex)
+        h = list(self._gex_history)
+        return float(sum(1 for x in h if x < net_gex) / len(h)) if len(h) > 1 else 0.5
+
+    def _t_years(self, now: dt.datetime) -> float:
+        """Minutes remaining to 4 pm ET expiry, expressed as a fraction of a year."""
+        today = now.astimezone(ET)
+        expiry = dt.datetime(today.year, today.month, today.day,
+                             16, 0, 0, tzinfo=ET)
+        secs = max((expiry - today).total_seconds(), 60.0)
+        return secs / (365.25 * 24.0 * 3600.0)
+
+    # -- DataFeed protocol --
+
+    def snapshot(self, now: dt.datetime) -> TickSnapshot | None:
+        try:
+            raw = get_bars_raw(self.underlying, self.lookback_minutes)
+        except Exception:
+            return None
+
+        try:
+            spot, rows = get_chain(self.underlying, zero_dte_only=True)
+        except Exception:
+            return None
+        if not rows or spot <= 0.0:
+            return None
+
+        # GEX structure
+        gm = build_gamma_map(rows, spot)
+        gex_rank = self._gex_pct_rank(gm.net_gex)
+
+        # Options chain for Track A (RND + spread selector)
+        chain = _option_rows_to_chain_snapshot(spot, rows, self._t_years(now), self.r)
+
+        # Bar-derived technicals
+        tech = _bar_technicals(raw)
+        vwap, vwap_rev = _session_vwap_and_reversions(raw, now)
+
+        # Straddle implied move
+        straddle_be = _atm_straddle_price(rows, spot)
+        expected_range = straddle_be / 1.25   # rough log-normal 1-sigma scaling
+
+        market = MarketSnapshot(
+            spot=spot,
+            net_gex=gm.net_gex,
+            gamma_flip=gm.gamma_flip,
+            call_wall=gm.call_wall,
+            put_wall=gm.put_wall,
+            gex_pct_rank=gex_rank,
+            vix9d=self._vix9d,
+            vix=self._vix,
+            vix3m=self._vix3m,
+            vvix=self._vvix,
+            vvix_baseline=self._vvix_baseline,
+            straddle_breakeven=straddle_be,
+            expected_range=expected_range,
+            adx=tech["adx"],
+            rsi=tech["rsi"],
+            bb_width=tech["bb_width"],
+            bb_width_baseline=tech["bb_width_baseline"],
+            vwap=vwap,
+            vwap_reversion_count=vwap_rev,
+            tick_abs_mean=480.0,    # $TICK not available from Massive chain; use calm default
+            cvd_slope=tech["cvd_slope"],
+            now=now,
+            has_catalyst=self.has_catalyst,
+            catalyst_label=self.catalyst_label,
+        )
+        return TickSnapshot(market=market, bars=raw, chain=chain)
+
+    def settlement_price(self, session_date: str) -> float | None:
+        return get_settlement(self.underlying, session_date)
 
 
 if __name__ == "__main__":
