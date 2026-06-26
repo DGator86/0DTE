@@ -1,40 +1,17 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Callable, Optional, Protocol, Any
+import datetime as dt
+from dataclasses import dataclass
+from typing import Optional, Protocol
 import numpy as np
-import pandas as pd
+from gate_scorer import MarketSnapshot  # single source of truth for market state
 from resample import RawBars, build_mtf_input
 from mtf_matrix import build_matrix, regime_rows, render_text
 from decision_matrix import TradeIntent, decide_from_matrix
 
 @dataclass
-class MarketSnapshot:
-    gamma_sign: float; gamma_magnitude: float; flip_cushion: float
-    channel_tightness: float; wall_proximity: float
-    term_structure: float; vvix_elevation: float; richness: float
-    skew_dir: float; tail_heaviness: float
-    spot: Optional[float] = None; call_wall: Optional[float] = None
-    put_wall: Optional[float] = None; gamma_flip: Optional[float] = None
-    net_gex: Optional[float] = None; gex_pct_rank: Optional[float] = None
-    timestamp: Optional[pd.Timestamp] = None; extra: dict = field(default_factory=dict)
-    def mtf_snapshot(self):
-        return {"gamma_sign": self.gamma_sign,"gamma_magnitude": self.gamma_magnitude,
-            "flip_cushion": self.flip_cushion,"channel_tightness": self.channel_tightness,
-            "wall_proximity": self.wall_proximity,"term_structure": self.term_structure,
-            "vvix_elevation": self.vvix_elevation,"richness": self.richness,
-            "skew_dir": self.skew_dir,"tail_heaviness": self.tail_heaviness}
-    def dealer_vetoes(self):
-        v=[]
-        if self.gamma_sign < 0: v.append("short_gamma")
-        if self.flip_cushion < 0: v.append("below_flip")
-        if self.term_structure < 0: v.append("term_backwardation")
-        if bool(self.extra.get("catalyst_now", False)): v.append("catalyst_now")
-        return v
-
-@dataclass
 class FeedSnapshot:
-    raw: RawBars; market: MarketSnapshot
+    raw: RawBars
+    market: MarketSnapshot
 
 class DataFeed(Protocol):
     def snapshot(self, symbol: str, lookback_minutes: int) -> FeedSnapshot: ...
@@ -65,23 +42,34 @@ class PipelineOrchestrator:
             "vetoes":result.intent.vetoes,"note":result.intent.note}
 
 class SyntheticFeed:
-    def __init__(self, days=30, seed=7, market=None):
+    """Replay feed using synthetic bars + a static gate_scorer.MarketSnapshot."""
+
+    def __init__(self, days=30, seed=7, market: Optional[MarketSnapshot] = None):
         from resample import _synth_bars
-        self.raw=_synth_bars(days=days, seed=seed)
-        self.market=market or MarketSnapshot(
-            gamma_sign=4.0e9,gamma_magnitude=0.86,flip_cushion=0.006,
-            channel_tightness=0.010,wall_proximity=0.0025,term_structure=0.16,
-            vvix_elevation=-0.03,richness=0.66,skew_dir=-0.17,tail_heaviness=0.30,
-            spot=float(self.raw.close[-1]),call_wall=float(self.raw.close[-1]+5),
-            put_wall=float(self.raw.close[-1]-5),gamma_flip=float(self.raw.close[-1]-2),
-            net_gex=4.0e9,gex_pct_rank=0.86)
-    def snapshot(self, symbol, lookback_minutes):
-        n=min(int(lookback_minutes), len(self.raw.close))
-        raw=RawBars(ts=self.raw.ts[-n:],open=self.raw.open[-n:],high=self.raw.high[-n:],
-            low=self.raw.low[-n:],close=self.raw.close[-n:],volume=self.raw.volume[-n:],
-            signed_volume=None if self.raw.signed_volume is None else self.raw.signed_volume[-n:],
-            tick=None if self.raw.tick is None else self.raw.tick[-n:])
-        return FeedSnapshot(raw=raw, market=self.market)
+        self._raw = _synth_bars(days=days, seed=seed)
+        spot = float(self._raw.close[-1])
+        self._market = market or MarketSnapshot(
+            spot=spot, net_gex=4.0e9, gamma_flip=spot - 6.0,
+            call_wall=spot + 5.0, put_wall=spot - 5.0, gex_pct_rank=0.86,
+            vix9d=12.0, vix=13.0, vix3m=15.0, vvix=92.0, vvix_baseline=95.0,
+            straddle_breakeven=4.0, expected_range=3.2,
+            adx=13.0, rsi=51.0, bb_width=1.4, bb_width_baseline=2.0,
+            vwap=spot, vwap_reversion_count=3,
+            tick_abs_mean=480.0, cvd_slope=0.02,
+            now=dt.datetime.now(dt.timezone.utc),
+            has_catalyst=False,
+        )
+
+    def snapshot(self, symbol: str, lookback_minutes: int) -> FeedSnapshot:
+        n = min(int(lookback_minutes), len(self._raw.close))
+        raw = RawBars(
+            ts=self._raw.ts[-n:], open=self._raw.open[-n:], high=self._raw.high[-n:],
+            low=self._raw.low[-n:], close=self._raw.close[-n:], volume=self._raw.volume[-n:],
+            signed_volume=(None if self._raw.signed_volume is None
+                           else self._raw.signed_volume[-n:]),
+            tick=None if self._raw.tick is None else self._raw.tick[-n:],
+        )
+        return FeedSnapshot(raw=raw, market=self._market)
 
 if __name__ == "__main__":
     orch=PipelineOrchestrator(SyntheticFeed(days=30), lookback_minutes=30*390)
