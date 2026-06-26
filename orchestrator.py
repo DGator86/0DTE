@@ -1,249 +1,151 @@
 """
 orchestrator.py
-===============
-Track-A tick loop: DataFeed -> decision_engine.decide -> journal.log;
-settle() post-close fills realized P&L.
+==============
+The tick loop. Deliberately dumb: it owns the clock and the data feed, and on
+every tick it calls the pure decision_engine and writes the result to the
+journal. All intelligence lives downstream; all measurement lives in the journal.
 
-DataFeed is a Protocol: implement snapshot() to return the current
-(MarketSnapshot, ChainSnapshot) pair for any data source.
+    feed.snapshot(now) -> (MarketSnapshot, ChainSnapshot)
+        -> decision_engine.decide(...) -> TradeDecision
+        -> journal.log(decision.as_row())
 
-SyntheticFeed generates a self-contained demo session that needs no
-network, no API key, and no external data files.
+After the close, settle(session_date) pulls the settlement price from the feed
+and fills realized P&L for every logged candidate that day (hypothetical for
+no-trades), making the gate measurable.
+
+Bind it to production by implementing the DataFeed protocol against your VPS /
+options data / GEX module. A SyntheticFeed is included for replay tests.
+
+NOT financial advice.
 """
+
 from __future__ import annotations
 
 import datetime as dt
 import time
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Optional, Protocol, Sequence
 from zoneinfo import ZoneInfo
 
-import numpy as np
-
-from gate_scorer import MarketSnapshot, GateConfig
-from rnd_extractor import ChainSnapshot, ChainQuote, RNDConfig, _bs_call_fwd
-from decision_engine import decide, EngineConfig
-from journal import Journal, SettlementResult
+from gate_scorer import MarketSnapshot
+from rnd_extractor import ChainSnapshot
+from decision_engine import decide, EngineConfig, TradeDecision
+from journal import Journal
 
 ET = ZoneInfo("America/New_York")
 
 
-# --------------------------------------------------------------------------- #
-# DataFeed protocol                                                            #
-# --------------------------------------------------------------------------- #
 class DataFeed(Protocol):
-    def snapshot(self) -> tuple[MarketSnapshot, ChainSnapshot]:
-        """Return current (market, chain) pair. Blocking until data is ready."""
+    """Implement this against your real data sources."""
+    def snapshot(self, now: dt.datetime) -> Optional[tuple[MarketSnapshot, ChainSnapshot]]:
+        ...
+    def settlement_price(self, session_date: str) -> Optional[float]:
         ...
 
-    def has_next(self) -> bool:
-        """False when the session ends (used by the tick loop)."""
-        ...
+
+@dataclass
+class Orchestrator:
+    feed: DataFeed
+    journal: Journal
+    cfg: Optional[EngineConfig] = None
+    physical_pdf: Optional[object] = None      # callable(grid)->density; single source of truth
+
+    def tick(self, now: dt.datetime) -> Optional[TradeDecision]:
+        snap = self.feed.snapshot(now)
+        if snap is None:
+            return None
+        market, chain = snap
+        decision = decide(market, chain, self.cfg, physical_pdf=self.physical_pdf)
+        self.journal.log(decision.as_row())
+        return decision
+
+    def run_replay(self, timestamps: Sequence[dt.datetime]) -> list[TradeDecision]:
+        """Drive the loop over an explicit list of tick times (backtest/replay)."""
+        out = []
+        for t in timestamps:
+            d = self.tick(t)
+            if d is not None:
+                out.append(d)
+        return out
+
+    def run_live(self, interval_seconds: int, until: dt.datetime,
+                 clock=lambda: dt.datetime.now(ET)) -> list[TradeDecision]:
+        """Thin live loop; sleeps between ticks until `until`. Clock injectable."""
+        out = []
+        while clock() < until:
+            d = self.tick(clock())
+            if d is not None:
+                out.append(d)
+            time.sleep(interval_seconds)
+        return out
+
+    def settle(self, session_date: str) -> int:
+        price = self.feed.settlement_price(session_date)
+        if price is None:
+            return 0
+        return self.journal.settle_session(session_date, price)
 
 
 # --------------------------------------------------------------------------- #
-# Synthetic feed (demo / backtest stub)                                       #
+# Synthetic feed for replay tests                                              #
 # --------------------------------------------------------------------------- #
 @dataclass
-class _SyntheticTick:
-    now: dt.datetime
-    spot: float
-    net_gex: float
-    gex_pct_rank: float
-    gamma_flip: float
-    call_wall: float
-    put_wall: float
-    vix9d: float
-    vix: float
-    vix3m: float
-    vvix: float
-    adx: float
-    rsi: float
-    has_catalyst: bool
-
-
 class SyntheticFeed:
+    """Generates evolving market+chain snapshots from a scripted scenario list.
+
+    Each scenario is a dict overriding the defaults below; the feed builds a
+    consistent option chain around the given spot/vol so the engine has real
+    quotes to work with.
     """
-    Replays a fixed sequence of synthetic ticks for a demo session.
-    Tick 0-2: ranging clean day (should GO).
-    Tick 3: simulates late-session (post-lockout, should NO_GO on timing).
-    Tick 4: simulated catalyst (NO_GO).
-    """
+    scenarios: dict                      # ts -> overrides
+    settle: float
+    base_spot: float = 600.0
 
-    def __init__(self, date: Optional[dt.date] = None):
-        d = date or dt.date(2026, 6, 26)
-        self._ticks: list[_SyntheticTick] = [
-            _SyntheticTick(
-                now=dt.datetime(d.year, d.month, d.day, 10, 45, tzinfo=ET),
-                spot=602.50, net_gex=4.2e9, gex_pct_rank=0.88,
-                gamma_flip=596.0, call_wall=603.0, put_wall=598.0,
-                vix9d=12.1, vix=13.0, vix3m=15.2, vvix=92.0,
-                adx=12.5, rsi=52.0, has_catalyst=False,
-            ),
-            _SyntheticTick(
-                now=dt.datetime(d.year, d.month, d.day, 11, 30, tzinfo=ET),
-                spot=603.10, net_gex=4.5e9, gex_pct_rank=0.91,
-                gamma_flip=596.0, call_wall=603.0, put_wall=598.0,
-                vix9d=11.8, vix=12.8, vix3m=15.0, vvix=90.0,
-                adx=11.0, rsi=54.0, has_catalyst=False,
-            ),
-            _SyntheticTick(
-                now=dt.datetime(d.year, d.month, d.day, 13, 0, tzinfo=ET),
-                spot=602.80, net_gex=4.3e9, gex_pct_rank=0.89,
-                gamma_flip=596.0, call_wall=603.0, put_wall=598.0,
-                vix9d=12.0, vix=12.9, vix3m=15.1, vvix=91.0,
-                adx=12.0, rsi=51.0, has_catalyst=False,
-            ),
-            _SyntheticTick(
-                now=dt.datetime(d.year, d.month, d.day, 15, 35, tzinfo=ET),
-                spot=603.0, net_gex=4.0e9, gex_pct_rank=0.85,
-                gamma_flip=596.0, call_wall=603.0, put_wall=598.0,
-                vix9d=12.2, vix=13.1, vix3m=15.3, vvix=93.0,
-                adx=13.0, rsi=50.0, has_catalyst=False,
-            ),
-            _SyntheticTick(
-                now=dt.datetime(d.year, d.month, d.day, 9, 5, tzinfo=ET),
-                spot=588.0, net_gex=-1.1e9, gex_pct_rank=0.40,
-                gamma_flip=593.0, call_wall=596.0, put_wall=585.0,
-                vix9d=19.5, vix=18.0, vix3m=17.0, vvix=120.0,
-                adx=28.0, rsi=38.0, has_catalyst=True,
-            ),
-        ]
-        self._idx = 0
+    def _build_chain(self, spot, t_years, s_atm, skew_s) -> ChainSnapshot:
+        import numpy as np
+        from rnd_extractor import ChainQuote, _bs_call_fwd
+        F = spot
+        DF = 1.0
+        qs = []
+        for K in np.arange(spot - 20, spot + 21, 1.0):
+            k = np.log(K / F)
+            s = max(s_atm + skew_s * k, 0.0008)
+            cm = _bs_call_fwd(F, K, s) * DF
+            pm = max(cm - DF * (F - K), 0.0)
+            cm = max(cm, 0.0)
+            h = 0.01 + 0.002 * max(cm, pm)
+            qs.append(ChainQuote(float(K), max(cm - h, 0), cm + h, max(pm - h, 0), pm + h))
+        return ChainSnapshot(qs, spot=spot, t_years=t_years, r=0.05)
 
-    def has_next(self) -> bool:
-        return self._idx < len(self._ticks)
-
-    def snapshot(self) -> tuple[MarketSnapshot, ChainSnapshot]:
-        t = self._ticks[self._idx]
-        self._idx += 1
-
-        ms = MarketSnapshot(
-            spot=t.spot,
-            net_gex=t.net_gex,
-            gamma_flip=t.gamma_flip,
-            call_wall=t.call_wall,
-            put_wall=t.put_wall,
-            gex_pct_rank=t.gex_pct_rank,
-            vix9d=t.vix9d, vix=t.vix, vix3m=t.vix3m,
-            vvix=t.vvix, vvix_baseline=95.0,
-            straddle_breakeven=3.8, expected_range=3.0,
-            adx=t.adx, rsi=t.rsi,
-            bb_width=1.5, bb_width_baseline=2.1,
-            vwap=t.spot - 0.2, vwap_reversion_count=4,
-            tick_abs_mean=520.0, cvd_slope=0.03,
-            now=t.now, has_catalyst=t.has_catalyst,
-            catalyst_label="CPI 08:30" if t.has_catalyst else "",
-        )
-        chain = _synthetic_chain(t.spot, r=0.05, t_years=4.0 / (24 * 365))
-        return ms, chain
-
-
-def _synthetic_chain(spot: float, r: float, t_years: float) -> ChainSnapshot:
-    """Build a realistic-ish synthetic 0DTE chain around spot."""
-    F = spot * np.exp(r * t_years)
-    DF = np.exp(-r * t_years)
-    quotes = []
-    for K in np.arange(spot - 15, spot + 16, 1.0):
-        k = np.log(K / F)
-        s = max(0.0050 - 0.030 * k, 0.0008)
-        cm = _bs_call_fwd(F, K, s) * DF
-        pm = max(cm - DF * (F - K), 0.0)
-        cm = max(cm, 0.0)
-        h = 0.01 + 0.002 * max(cm, pm)
-        quotes.append(ChainQuote(
-            float(K),
-            max(cm - h, 0.0), cm + h,
-            max(pm - h, 0.0), pm + h,
-        ))
-    return ChainSnapshot(quotes, spot=spot, t_years=t_years, r=r)
-
-
-# --------------------------------------------------------------------------- #
-# Orchestrator                                                                 #
-# --------------------------------------------------------------------------- #
-class Orchestrator:
-    """
-    Drives the Track-A tick loop: feed -> decide -> journal.
-    Call run_session() during market hours.
-    Call settle() after close with the final underlying price.
-    """
-
-    def __init__(
-        self,
-        feed: DataFeed,
-        journal: Journal,
-        cfg: Optional[EngineConfig] = None,
-        tick_interval_s: float = 0.0,   # seconds between ticks (0 = as fast as feed)
-        verbose: bool = True,
-    ):
-        self.feed = feed
-        self.journal = journal
-        self.cfg = cfg or EngineConfig()
-        self.tick_interval_s = tick_interval_s
-        self.verbose = verbose
-        self._session_date: Optional[str] = None
-
-    def run_session(self) -> int:
-        """Run until feed.has_next() returns False. Returns number of ticks processed."""
-        n = 0
-        while self.feed.has_next():
-            market, chain = self.feed.snapshot()
-            self._session_date = market.now.astimezone(ET).date().isoformat()
-
-            td = decide(market, chain, self.cfg)
-            row = td.as_row()
-            self.journal.log(row)
-            n += 1
-
-            if self.verbose:
-                _print_tick(td)
-
-            if self.tick_interval_s > 0:
-                time.sleep(self.tick_interval_s)
-
-        return n
-
-    def settle(self, close_price: float,
-               date: Optional[str] = None) -> Optional[SettlementResult]:
-        """Post-close settlement pass. Uses session_date from the most recent tick."""
-        d = date or self._session_date
-        if d is None:
+    def snapshot(self, now: dt.datetime):
+        key = now.isoformat()
+        if key not in self.scenarios:
             return None
-        result = self.journal.settle_session(d, close_price)
-        if self.verbose:
-            print(f"\n[settle] {d}  close={close_price:.2f}  "
-                  f"trades={result.n_trades}  no-trades={result.n_no_trades}  "
-                  f"trade_pnl={result.trade_pnl:+.3f}  "
-                  f"blocked_pnl={result.blocked_pnl:+.3f}  "
-                  f"gate_helped={result.gate_helped}")
-        return result
+        o = self.scenarios[key]
+        spot = o.get("spot", self.base_spot)
+        market = MarketSnapshot(
+            spot=spot,
+            net_gex=o.get("net_gex", 3.5e9),
+            gamma_flip=o.get("gamma_flip", spot - 7),
+            call_wall=o.get("call_wall", spot + 6),
+            put_wall=o.get("put_wall", spot - 5),
+            gex_pct_rank=o.get("gex_pct_rank", 0.85),
+            vix9d=o.get("vix9d", 12.0), vix=o.get("vix", 13.0), vix3m=o.get("vix3m", 15.0),
+            vvix=o.get("vvix", 92.0), vvix_baseline=o.get("vvix_baseline", 95.0),
+            straddle_breakeven=o.get("straddle_breakeven", 4.0),
+            expected_range=o.get("expected_range", 3.2),
+            adx=o.get("adx", 13.0), rsi=o.get("rsi", 51.0),
+            bb_width=o.get("bb_width", 1.4), bb_width_baseline=o.get("bb_width_baseline", 2.0),
+            vwap=o.get("vwap", spot), vwap_reversion_count=o.get("vwap_reversion_count", 4),
+            tick_abs_mean=o.get("tick_abs_mean", 480.0), cvd_slope=o.get("cvd_slope", 0.05),
+            now=now, has_catalyst=o.get("has_catalyst", False),
+            catalyst_label=o.get("catalyst_label", ""),
+        )
+        chain = self._build_chain(
+            spot, o.get("t_years", 5.0 / (24 * 365)),
+            o.get("s_atm", 0.0050), o.get("skew_s", -0.030),
+        )
+        return market, chain
 
-
-def _print_tick(td) -> None:
-    cand = td.candidate
-    tag = f"{td.decision:<8}"
-    gate = f"gate={td.gate_score:.0f}" if td.gate_pass else f"gate=FAIL({','.join(g.split(':')[0] for g in td.gate_failed)})"
-    sel = f"{cand.family} cr={cand.credit:.2f} ml={cand.max_loss:.2f} ev={cand.ev:.3f}" if cand else "no_candidate"
-    print(f"  {td.ts[11:16]}  spot={td.spot:.2f}  {tag}  {gate}  {sel}")
-
-
-# --------------------------------------------------------------------------- #
-# Demo                                                                         #
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    import os, tempfile
-    db = os.path.join(tempfile.mkdtemp(), "orch_demo.db")
-
-    feed = SyntheticFeed()
-    jnl = Journal(db)
-    orch = Orchestrator(feed, jnl, verbose=True)
-
-    print("=== Track-A tick loop demo ===")
-    n = orch.run_session()
-    print(f"\nProcessed {n} ticks.")
-
-    orch.settle(close_price=602.50)
-
-    eff = jnl.gate_effectiveness(lookback_days=1)
-    print(f"\nGate effectiveness: {eff}")
+    def settlement_price(self, session_date: str):
+        return self.settle

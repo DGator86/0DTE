@@ -36,7 +36,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from resample import RawBars, build_mtf_input
-from mtf_matrix import MTFInput, build_matrix, regime_rows
+from mtf_matrix import MTFInput, build_matrix, regime_rows  # MTFInput is the mtf_matrix version
 from decision_matrix import decide_from_matrix, TradeIntent
 
 ET = ZoneInfo("America/New_York")
@@ -284,9 +284,7 @@ class RoutedTicket:
     matrix_snapshot: dict            # top-level matrix stats for logging
 
 
-_PREMIUM_STRUCTURES = {
-    "put_credit", "call_credit", "iron_condor", "broken_wing", "iron_fly",
-}
+_PREMIUM_STRUCTURES = {"PCS", "CCS", "IC", "IF"}
 
 
 def route_ticket(
@@ -306,7 +304,7 @@ def route_ticket(
 
     When no chain is available, returns the intent as a named stub only.
     """
-    if not intent.is_trade:
+    if intent.decision.structure == "NT":
         return RoutedTicket(intent=intent, candidate=None,
                             no_fill_reason="intent_no_trade",
                             matrix_snapshot={})
@@ -318,9 +316,9 @@ def route_ticket(
         "vix": ms.vix, "adx": ms.adx, "has_catalyst": ms.has_catalyst,
     }
 
-    if intent.structure not in _PREMIUM_STRUCTURES:
+    if intent.decision.structure not in _PREMIUM_STRUCTURES:
         return RoutedTicket(intent=intent, candidate=None,
-                            no_fill_reason=f"directional_engine_not_built:{intent.structure}",
+                            no_fill_reason=f"directional_engine_not_built:{intent.decision.structure}",
                             matrix_snapshot=matrix_snap)
 
     if not _TRACK_A_AVAILABLE:
@@ -397,10 +395,11 @@ class PipelineOrchestrator:
 
         self._tick += 1
         mtf_in = _snap_to_mtf(snap)
-        mat = build_matrix(mtf_in)
-        rows = regime_rows(mtf_in, mat)
-        intent = decide_from_matrix(mat, rows, has_catalyst=snap.market.has_catalyst)
-        ticket = route_ticket(intent, snap, self.selector_cfg)
+        mat_rows = build_matrix(mtf_in)
+        regimes = regime_rows(mat_rows)
+        vetoes = ["catalyst:event"] if snap.market.has_catalyst else []
+        intent = decide_from_matrix(mat_rows, regimes, vetoes=vetoes)
+        ticket = route_ticket(intent, snap, self.selector_cfg)  # type: ignore[arg-type]
 
         if self.verbose and self._tick % self.every_n == 0:
             _print_tick(snap, intent, ticket, self._tick)
@@ -419,9 +418,62 @@ class PipelineOrchestrator:
 
 
 def _snap_to_mtf(snap: FeedSnapshot) -> MTFInput:
-    """Convert FeedSnapshot -> MTFInput by resampling bars + injecting snapshot vars."""
-    mtf = build_mtf_input(snap.bars, snap.market.as_snap_dict())
-    return mtf
+    """
+    Convert FeedSnapshot -> mtf_matrix.MTFInput.
+
+    resample gives {tf -> {indicator -> val}}.
+    mtf_matrix expects {var_name -> {tf -> val}} for native,
+    plus a flat snapshot dict for SNAPSHOT-kind variables.
+    We transpose and map names here; 30m/4h/1d are left None
+    (mtf_matrix handles sparse data gracefully).
+    """
+    rsmp = build_mtf_input(snap.bars)  # resample.MTFInput
+
+    # resample indicator -> mtf_matrix var_name(s)
+    _MAP = {
+        "vwap_dist": ["dist_to_vwap", "ema_slope"],  # dist_to_vwap uses |vwap_dist|
+        "adx":       ["adx_strength"],
+        "rsi":       ["rsi"],
+        "bb_width":  ["rv_expansion", "bb_compression"],
+        "rv":        ["realized_vol"],
+        "cvd":       ["cvd_persistence"],
+        "tick_abs":  ["tick_two_sided"],
+    }
+    # Build native: var_name -> {tf -> val}
+    native: dict = {}
+    for resamp_key, var_names in _MAP.items():
+        for var_name in var_names:
+            native.setdefault(var_name, {})
+            for tf, ind in rsmp.native.items():
+                val = ind.get(resamp_key)
+                if val is None or (isinstance(val, float) and math.isnan(val)):
+                    val = None
+                # dist_to_vwap uses absolute value; ema_slope keeps sign
+                if var_name == "dist_to_vwap" and val is not None:
+                    val = abs(val)
+                native[var_name][tf] = val
+
+    # vwap_slope = sign * magnitude of vwap_dist (same as ema_slope above)
+    native["vwap_slope"] = native.get("ema_slope", {})
+
+    # Build snapshot from market snapshot fields
+    ms = snap.market
+    spot = ms.spot or 1.0
+    snapshot: dict = {
+        "gamma_sign":       ms.net_gex,
+        "gamma_magnitude":  ms.gex_pct_rank,
+        "flip_cushion":     (ms.spot - ms.gamma_flip) / spot,
+        "channel_tightness": (ms.call_wall - ms.put_wall) / spot,
+        "wall_proximity":   min(
+            abs(ms.call_wall - ms.spot) / spot,
+            abs(ms.spot - ms.put_wall) / spot,
+        ),
+        "term_structure":   (ms.vix3m - ms.vix) / ms.vix if ms.vix else None,
+        "vvix_elevation":   ms.vvix / ms.vvix_baseline - 1.0 if ms.vvix_baseline else None,
+        # richness / skew_dir / tail_heaviness require RND — not available here
+    }
+
+    return MTFInput(native=native, snapshot=snapshot)
 
 
 def _print_tick(snap: FeedSnapshot, intent: TradeIntent,
@@ -431,7 +483,7 @@ def _print_tick(snap: FeedSnapshot, intent: TradeIntent,
     cand_str = (f"{cand.family} cr={cand.credit:.2f} ml={cand.max_loss:.2f}"
                 if cand is not None else ticket.no_fill_reason or "no_candidate")
     print(f"  tick={tick:4d}  spot={ms.spot:.2f}  "
-          f"{intent.structure:14} {intent.conviction:6}  "
+          f"{intent.decision.structure:14} {intent.decision.conviction:6}  "
           f"chain={'Y' if snap.chain else 'N'}  {cand_str}")
 
 
@@ -446,14 +498,14 @@ if __name__ == "__main__":
     feed_pin = SyntheticFeed(regime="pin", n_bars=30)
     orch = PipelineOrchestrator(feed_pin, verbose=True, every_n=10)
     tickets_pin = orch.run_session()
-    trade_tix = [t for t in tickets_pin if t.intent.is_trade]
+    trade_tix = [t for t in tickets_pin if t.intent.decision.structure != "NT"]
     print(f"  {len(tickets_pin)} ticks | {len(trade_tix)} with trade intent")
 
     print("\n=== Track B demo — trend_down ===")
     feed_dn = SyntheticFeed(regime="trend_down", n_bars=30)
     orch2 = PipelineOrchestrator(feed_dn, verbose=True, every_n=10)
     tickets_dn = orch2.run_session()
-    trade_dn = [t for t in tickets_dn if t.intent.is_trade]
+    trade_dn = [t for t in tickets_dn if t.intent.decision.structure != "NT"]
     print(f"  {len(tickets_dn)} ticks | {len(trade_dn)} with trade intent")
 
     # ---- with a chain (Track B -> A seam) ----

@@ -1,366 +1,231 @@
 """
 mtf_matrix.py
 =============
-Multi-timeframe standardized feature matrix (0-100 scale) + per-TF regime rows.
+Multi-timeframe standardized feature matrix. For each variable, emits a 0..100
+score per timeframe (1m, 5m, 15m, 30m, 1h, 4h, 1d), plus per-timeframe regime
+confidence rows so you can read confluence vs divergence across the term
+structure of the signal.
 
-No external deps: stdlib math only.
+Two variable kinds, handled honestly:
+  * NATIVE   -- computed from bars at that resolution; genuinely differs by TF
+               (ADX, RSI, realized vol, BB width, VWAP slope, CVD, ATR ...).
+  * SNAPSHOT -- a point-in-time state (net GEX, gamma flip, walls, richness,
+               RND skew/kurtosis). One value "now"; broadcast across all
+               columns and flagged, because it has no per-TF resolution.
 
-The matrix is the single input tensor for the decision layer. Every variable
-is normalized to [0, 100] using one of four helper transforms:
+The decision-relevant payoff is the bottom block: compression / trend / breakout
+confidence per timeframe. Compression high on 1m-15m while trend builds on 1h-4h
+is a coiling setup -- premium-harvestable now, with a higher-TF break to respect.
 
-  clip100(x)        - raw 0..100 value, clamped
-  P(x, lo, hi)      - linear ramp lo->0, hi->100. Magnitude variable (100=strong).
-  S(x, lo, hi)      - symmetric around midpoint: lo->0, mid->50, hi->100.
-                       For signed variables where 50 = neutral.
-  N(x, mean, std)   - Gaussian CDF * 100: median->50, +2σ->97.7.
-
-build_matrix(inp) returns a flat dict {var_name: 0..100}.
-regime_rows(inp, matrix) returns per-TF regime dicts used by decision_matrix.
-
-110-variable layout:
-  32 native   = 4 TFs × 8 indicators
-  24 snapshot = dealer/vol positioning
-  18 derived  = cross-TF spreads + momentum comparisons
-  (remaining capacity for future additions)
+NOT financial advice.
 """
+
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
+
+TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+
+
+def clip100(x):
+    return min(100.0, max(0.0, x))
+
+
+def P(p):                      # already 0..1
+    return clip100(100.0 * p)
+
+
+def S(x, scale):               # signed -> 50 neutral
+    return clip100(50.0 + 50.0 * math.tanh(x / scale)) if scale > 0 else 50.0
+
+
+def N(x, scale):               # near-level -> 100 at zero
+    return clip100(100.0 * math.exp(-abs(x) / scale)) if scale > 0 else 0.0
 
 
 # --------------------------------------------------------------------------- #
-# Helpers                                                                      #
+# Variable registry                                                           #
 # --------------------------------------------------------------------------- #
-def clip100(x: float) -> float:
-    return max(0.0, min(100.0, x))
+NATIVE, SNAPSHOT = "native", "snapshot"
 
 
-def P(x: float, lo: float, hi: float) -> float:
-    """Linear ramp [lo, hi] -> [0, 100]. Magnitude variable."""
-    if hi == lo:
-        return 50.0
-    return clip100(100.0 * (x - lo) / (hi - lo))
+@dataclass
+class MTFVar:
+    domain: str
+    name: str
+    kind: str
+    std: Callable[[float], float]   # raw -> 0..100
 
 
-def S(x: float, lo: float, hi: float) -> float:
-    """Symmetric: mid -> 50. Directional variable (50 = neutral)."""
-    mid = 0.5 * (lo + hi)
-    half = 0.5 * (hi - lo)
-    if half == 0:
-        return 50.0
-    return clip100(50.0 + 50.0 * (x - mid) / half)
-
-
-def N(x: float, mean: float, std: float) -> float:
-    """Gaussian CDF * 100. Median -> 50."""
-    if std <= 0:
-        return 50.0
-    z = (x - mean) / std
-    return clip100(100.0 * _normcdf(z))
-
-
-def _normcdf(z: float) -> float:
-    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+# std_fn per variable (scales are reasonable fixed priors here; wire to a
+# ScaleBook for adaptive behavior in production)
+VARS: list[MTFVar] = [
+    # Price geometry
+    MTFVar("price", "dist_to_vwap", NATIVE, lambda x: N(x, 0.20)),          # x = % from vwap
+    MTFVar("price", "vwap_slope", NATIVE, lambda x: S(x, 0.05)),           # %/bar
+    MTFVar("price", "range_position", NATIVE, lambda x: clip100(100 * x)),  # 0..1 within TF range
+    # Dealer (SNAPSHOT)
+    MTFVar("dealer", "gamma_sign", SNAPSHOT, lambda x: S(x, 2e9)),         # net GEX $
+    MTFVar("dealer", "gamma_magnitude", SNAPSHOT, lambda x: P(x)),         # pct rank 0..1
+    MTFVar("dealer", "flip_cushion", SNAPSHOT, lambda x: S(x, 0.004)),     # % above flip
+    MTFVar("dealer", "channel_tightness", SNAPSHOT, lambda x: clip100(100 * math.exp(-x / 0.012))),  # wall width %
+    MTFVar("dealer", "wall_proximity", SNAPSHOT, lambda x: N(x, 0.003)),   # % to nearest wall
+    # Volatility
+    MTFVar("vol", "realized_vol", NATIVE, lambda x: P(x)),                 # pctile 0..1, per TF
+    MTFVar("vol", "rv_expansion", NATIVE, lambda x: S(x, 0.25)),          # bbw ratio - 1
+    MTFVar("vol", "term_structure", SNAPSHOT, lambda x: S(x, 0.08)),      # (vix3m-vix)/vix
+    MTFVar("vol", "vvix_elevation", SNAPSHOT, lambda x: S(x, 0.10)),      # (vvix/base - 1)
+    MTFVar("vol", "richness", SNAPSHOT, lambda x: P(x)),                  # variance ratio signal 0..1
+    # Distribution shape (SNAPSHOT, from RND)
+    MTFVar("shape", "skew_dir", SNAPSHOT, lambda x: S(x, 0.20)),
+    MTFVar("shape", "tail_heaviness", SNAPSHOT, lambda x: clip100(100 * x / 3.0)),  # excess kurt
+    # Trend (NATIVE -- the multi-TF core)
+    MTFVar("trend", "adx_strength", NATIVE, lambda x: clip100(100 * x / 50.0)),
+    MTFVar("trend", "di_spread", NATIVE, lambda x: S(x, 20.0)),
+    MTFVar("trend", "ema_slope", NATIVE, lambda x: S(x, 0.05)),
+    MTFVar("trend", "rsi", NATIVE, lambda x: clip100(x)),
+    MTFVar("trend", "bb_compression", NATIVE, lambda x: clip100(100 * (1 - x))),    # x = bbw ratio
+    MTFVar("trend", "trend_cleanliness", NATIVE, lambda x: P(x)),         # R^2 0..1
+    # Order flow (NATIVE, windowed)
+    MTFVar("flow", "cvd_persistence", NATIVE, lambda x: S(x, 0.4)),
+    MTFVar("flow", "tick_two_sided", NATIVE, lambda x: clip100(100 * math.exp(-x / 600.0))),
+]
 
 
 # --------------------------------------------------------------------------- #
-# Input type                                                                   #
+# Input + matrix build                                                        #
 # --------------------------------------------------------------------------- #
-# Imported from resample.py at runtime to avoid circular imports.
-# We repeat the struct here so mtf_matrix.py has no deps.
 @dataclass
 class MTFInput:
-    """
-    native:   {"1m": {"adx": float, ...}, "5m": {...}, "15m": {...}, "1h": {...}}
-    snapshot: gate_scorer.MarketSnapshot-compatible field dict.
-    """
-    native: dict[str, dict[str, float]]
-    snapshot: dict[str, float] = field(default_factory=dict)
+    # native[var_name][tf] -> raw value
+    native: dict
+    # snapshot[var_name] -> raw value (single, broadcast)
+    snapshot: dict
+
+    def raw(self, var: MTFVar, tf: str):
+        if var.kind == SNAPSHOT:
+            return self.snapshot.get(var.name)
+        return self.native.get(var.name, {}).get(tf)
 
 
-TIMEFRAMES = ("1m", "5m", "15m", "1h")
-
-# Scale references for native indicators (these are the PRIORS; ideally sourced
-# from ScaleBook at runtime — see HANDOFF §4 "Adaptive scales TODO").
-_ADX_REF_HI = 30.0        # ADX >= this => full-trend score
-_RSI_LO, _RSI_HI = 20.0, 80.0
-_EMA_DIST_HI = 0.01       # ±1% from EMA -> ±50 symmetric swing
-_BB_HI = 0.04             # BB width fraction at the high reference
-_RV_HI = 0.06             # annualized RV at the high reference
-_CVD_RANGE = 1.0          # CVD lives in (-1, +1)
-_VWAP_DIST_HI = 0.005     # ±0.5% vwap dist -> ±50 symmetric
-_TICK_HI = 1000.0         # |TICK| mean at thrust reference
+@dataclass
+class MatrixRow:
+    domain: str
+    variable: str
+    kind: str
+    scores: dict          # tf -> 0..100 or None
 
 
-def _native_vars(tf: str, ind: dict) -> dict[str, float]:
-    out = {}
-    prefix = tf + "_"
-
-    def g(k: float) -> float:
-        v = ind.get(k, float("nan"))
-        return float("nan") if (v is None or math.isnan(v)) else v
-
-    adx = g("adx")
-    out[prefix + "adx"] = P(adx, 0.0, _ADX_REF_HI) if math.isfinite(adx) else 50.0
-
-    rsi = g("rsi")
-    out[prefix + "rsi"] = S(rsi, _RSI_LO, _RSI_HI) if math.isfinite(rsi) else 50.0
-
-    ema = g("ema_dist")
-    out[prefix + "ema_dist"] = S(ema, -_EMA_DIST_HI, _EMA_DIST_HI) if math.isfinite(ema) else 50.0
-
-    bb = g("bb_width")
-    out[prefix + "bb_width"] = P(bb, 0.0, _BB_HI) if math.isfinite(bb) else 50.0
-
-    rv = g("rv")
-    out[prefix + "rv"] = P(rv, 0.0, _RV_HI) if math.isfinite(rv) else 50.0
-
-    cvd = g("cvd")
-    out[prefix + "cvd"] = S(cvd, -_CVD_RANGE, _CVD_RANGE) if math.isfinite(cvd) else 50.0
-
-    vd = g("vwap_dist")
-    out[prefix + "vwap_dist"] = S(vd, -_VWAP_DIST_HI, _VWAP_DIST_HI) if math.isfinite(vd) else 50.0
-
-    ta = g("tick_abs")
-    out[prefix + "tick_abs"] = P(ta, 0.0, _TICK_HI) if math.isfinite(ta) else 50.0
-
-    return out
-
-
-def _snapshot_vars(snap: dict) -> dict[str, float]:
-    out = {}
-
-    def g(k, default=float("nan")):
-        v = snap.get(k, default)
-        return default if (v is None or (isinstance(v, float) and math.isnan(v))) else float(v)
-
-    spot = g("spot", 600.0)
-    net_gex = g("net_gex", 0.0)
-    flip = g("gamma_flip", spot)
-    call_wall = g("call_wall", spot + 3.0)
-    put_wall = g("put_wall", spot - 3.0)
-    gex_rank = g("gex_pct_rank", 0.5)
-    vix = g("vix", 15.0)
-    vix9d = g("vix9d", vix)
-    vix3m = g("vix3m", vix)
-    vvix = g("vvix", 95.0)
-    vvix_baseline = g("vvix_baseline", 95.0)
-    adx = g("adx", 15.0)
-    rsi = g("rsi", 50.0)
-    straddle_be = g("straddle_breakeven", 0.0)
-    exp_range = g("expected_range", 0.0)
-    bb_w = g("bb_width", 0.0)
-    bb_base = g("bb_width_baseline", bb_w)
-
-    # Signed net GEX in standardized form (100 = very positive, 0 = very negative)
-    out["snap_gex_signed"] = N(net_gex / 1e9, 0.0, 2.0)
-    out["snap_gex_rank"] = P(gex_rank, 0.0, 1.0)
-
-    # Flip distance: above flip = high, below = low
-    flip_dist = (spot - flip) / spot if spot > 0 else 0.0
-    out["snap_flip_dist"] = S(flip_dist, -0.015, 0.015)
-
-    # Wall proximity (100 = right at a wall, 0 = far from both)
-    d_call = abs(call_wall - spot) / spot if spot > 0 else 0.05
-    d_put = abs(spot - put_wall) / spot if spot > 0 else 0.05
-    nearest = min(d_call, d_put)
-    out["snap_wall_prox"] = P(1.0 - nearest / 0.01, 0.0, 1.0)   # 0-1% to wall
-
-    # Vol structure
-    out["snap_vix"] = P(vix, 10.0, 30.0)
-    out["snap_vix9d_vix"] = S(vix9d / vix if vix > 0 else 1.0, 0.8, 1.2)
-    out["snap_vix_vix3m"] = S(vix / vix3m if vix3m > 0 else 1.0, 0.8, 1.2)
-    out["snap_vvix_ratio"] = S(vvix / vvix_baseline if vvix_baseline > 0 else 1.0, 0.7, 1.3)
-
-    # Straddle richness
-    if exp_range > 0:
-        rich = straddle_be / exp_range
-        out["snap_straddle_rich"] = P(rich, 0.8, 1.5)
-    else:
-        out["snap_straddle_rich"] = 50.0
-
-    # Trend / momentum from snapshot
-    out["snap_adx"] = P(adx, 0.0, 30.0)
-    out["snap_rsi"] = S(rsi, 20.0, 80.0)
-
-    # BB compression vs baseline
-    if bb_base > 0:
-        bb_ratio = bb_w / bb_base
-        out["snap_bb_compress"] = P(1.0 - bb_ratio, -0.5, 0.5)
-    else:
-        out["snap_bb_compress"] = 50.0
-
-    # Directional features
-    out["snap_cvd_slope"] = S(g("cvd_slope", 0.0), -1.0, 1.0)
-    out["snap_tick_calm"] = P(1.0 - g("tick_abs_mean", 600.0) / 1000.0, 0.0, 1.0)
-
-    # Position above call/put wall (100 = above call wall = near resistance)
-    out["snap_above_call_wall"] = P(spot - call_wall, -3.0, 3.0)
-    out["snap_above_put_wall"] = P(spot - put_wall, -3.0, 3.0)
-
-    return out
-
-
-def _derived_vars(native_mat: dict, snap: dict) -> dict[str, float]:
-    """Cross-TF spreads and agreement scores."""
-    out = {}
-
-    # Trend agreement across timeframes (all-same-direction ADX)
-    adx_vals = [native_mat.get(tf + "_adx", 50.0) for tf in TIMEFRAMES]
-    out["derived_adx_agreement"] = 100.0 - float(
-        sum(abs(a - b) for a, b in zip(adx_vals, adx_vals[1:])) / max(len(adx_vals) - 1, 1)
-    )
-
-    # RSI momentum coherence (1h RSI - 1m RSI): positive = higher-TF bullish
-    rsi_1m = native_mat.get("1m_rsi", 50.0)
-    rsi_1h = native_mat.get("1h_rsi", 50.0)
-    out["derived_rsi_tf_spread"] = S(rsi_1h - rsi_1m, -30.0, 30.0)
-
-    # CVD divergence (1m vs 1h): disagreement = early warning of reversal
-    cvd_1m = native_mat.get("1m_cvd", 50.0)
-    cvd_1h = native_mat.get("1h_cvd", 50.0)
-    out["derived_cvd_divergence"] = S(cvd_1m - cvd_1h, -50.0, 50.0)
-
-    # BB contraction uniformity across TFs (low variance = all compressed together)
-    bb_vals = [native_mat.get(tf + "_bb_width", 50.0) for tf in TIMEFRAMES]
-    bb_mean = sum(bb_vals) / len(bb_vals)
-    bb_var = sum((v - bb_mean) ** 2 for v in bb_vals) / len(bb_vals)
-    out["derived_bb_uniform_compress"] = P(100.0 - bb_mean, 0.0, 100.0)
-
-    # VWAP alignment across TFs
-    vd_vals = [native_mat.get(tf + "_vwap_dist", 50.0) for tf in TIMEFRAMES]
-    vd_mean = sum(vd_vals) / len(vd_vals)
-    out["derived_vwap_align"] = S(vd_mean, 20.0, 80.0)
-
-    # Combined ranging score: high = low ADX, low BB, calm tick
-    snap_adx = native_mat.get("snap_adx", 50.0)
-    tick_calm = native_mat.get("snap_tick_calm", 50.0)
-    bb_compress = native_mat.get("snap_bb_compress", 50.0)
-    out["derived_ranging_score"] = clip100(
-        (100.0 - snap_adx) * 0.4 + tick_calm * 0.3 + bb_compress * 0.3
-    )
-
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# Top-level                                                                    #
-# --------------------------------------------------------------------------- #
-def build_matrix(inp: MTFInput) -> dict[str, float]:
-    """Build the full standardized 0-100 feature matrix from an MTFInput."""
-    mat: dict[str, float] = {}
-
-    # 1. Native per-TF indicators
-    for tf in TIMEFRAMES:
-        ind = inp.native.get(tf, {})
-        mat.update(_native_vars(tf, ind))
-
-    # 2. Snapshot variables
-    snap_vars = _snapshot_vars(inp.snapshot)
-    mat.update(snap_vars)
-
-    # 3. Derived cross-TF
-    mat.update(_derived_vars(mat, inp.snapshot))
-
-    return mat
-
-
-def regime_rows(inp: MTFInput, matrix: Optional[dict] = None) -> list[dict]:
-    """
-    Per-TF regime classification dict list. Used by decision_matrix._dominant
-    to find the consensus regime across timeframes.
-
-    Returns list of dicts, one per TF:
-      {"tf": str, "dealer_regime": str, "vol_regime": str, "momentum_regime": str,
-       "adx": float, "rsi": float, "cvd": float, ...}
-    """
-    if matrix is None:
-        matrix = build_matrix(inp)
-
+def build_matrix(inp: MTFInput) -> list[MatrixRow]:
     rows = []
-    for tf in TIMEFRAMES:
-        adx_s = matrix.get(tf + "_adx", 50.0)
-        rsi_s = matrix.get(tf + "_rsi", 50.0)
-        cvd_s = matrix.get(tf + "_cvd", 50.0)
-
-        # dealer regime proxy from snapshot (same for all TFs — it's a snapshot)
-        flip_dist = matrix.get("snap_flip_dist", 50.0)
-        gex_signed = matrix.get("snap_gex_signed", 50.0)
-
-        if gex_signed >= 60.0 and flip_dist >= 55.0:
-            dealer = "long_gamma"
-        elif gex_signed <= 40.0 or flip_dist <= 45.0:
-            dealer = "short_gamma"
-        else:
-            dealer = "at_flip"
-
-        # vol regime from per-TF ADX + snapshot VIX
-        vix_s = matrix.get("snap_vix", 50.0)
-        if adx_s <= 40.0 and vix_s <= 40.0:
-            vol = "low_vol"
-        elif adx_s >= 70.0 or vix_s >= 70.0:
-            vol = "high_vol"
-        else:
-            vol = "normal_vol"
-
-        # momentum from RSI
-        if rsi_s >= 60.0:
-            momentum = "bull"
-        elif rsi_s <= 40.0:
-            momentum = "bear"
-        else:
-            momentum = "neutral"
-
-        rows.append({
-            "tf": tf,
-            "dealer_regime": dealer,
-            "vol_regime": vol,
-            "momentum_regime": momentum,
-            "adx_score": round(adx_s, 1),
-            "rsi_score": round(rsi_s, 1),
-            "cvd_score": round(cvd_s, 1),
-        })
+    for v in VARS:
+        scores = {}
+        for tf in TIMEFRAMES:
+            r = inp.raw(v, tf)
+            scores[tf] = round(v.std(r), 1) if r is not None else None
+        rows.append(MatrixRow(v.domain, v.name, v.kind, scores))
     return rows
 
 
 # --------------------------------------------------------------------------- #
-# Demo                                                                         #
+# Per-timeframe regime confidence (the decision rows)                          #
 # --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    # Build a minimal MTFInput manually (no bars needed)
-    native = {}
-    for tf in TIMEFRAMES:
-        native[tf] = {
-            "adx": 12.5, "rsi": 52.0, "ema_dist": 0.001,
-            "bb_width": 0.012, "rv": 0.02, "cvd": 0.08,
-            "vwap_dist": 0.0005, "tick_abs": 480.0,
-        }
+# (variable, weight, invert) — reuse the standardized cells
+_REGIME_DEF = {
+    "compression": [("adx_strength", 1.3, True), ("bb_compression", 1.0, False),
+                    ("rv_expansion", 1.0, True), ("tick_two_sided", 0.8, False),
+                    ("gamma_sign", 1.2, False), ("channel_tightness", 1.0, False)],
+    "trend": [("adx_strength", 1.5, False), ("di_spread", 0.8, False),
+              ("ema_slope", 0.8, False), ("rv_expansion", 0.8, False),
+              ("bb_compression", 1.0, True), ("trend_cleanliness", 0.8, False)],
+    "breakout": [("adx_strength", 1.0, False), ("rv_expansion", 1.0, False),
+                 ("tick_two_sided", 0.8, True), ("gamma_sign", 1.2, True),
+                 ("vvix_elevation", 0.8, False)],
+}
 
-    snap = {
-        "spot": 602.50, "net_gex": 4.2e9, "gamma_flip": 596.0,
-        "call_wall": 603.0, "put_wall": 598.0, "gex_pct_rank": 0.88,
-        "vix": 13.0, "vix9d": 12.1, "vix3m": 15.2,
-        "vvix": 92.0, "vvix_baseline": 95.0,
-        "straddle_breakeven": 4.1, "expected_range": 3.2,
-        "adx": 12.5, "rsi": 52.0,
-        "bb_width": 1.5, "bb_width_baseline": 2.1,
-        "cvd_slope": 0.03, "tick_abs_mean": 480.0,
-    }
 
-    inp = MTFInput(native=native, snapshot=snap)
-    mat = build_matrix(inp)
+def regime_rows(rows: list[MatrixRow]) -> dict:
+    by_name = {r.variable: r for r in rows}
+    out = {}
+    for regime, weights in _REGIME_DEF.items():
+        tf_scores = {}
+        for tf in TIMEFRAMES:
+            num = den = 0.0
+            for vname, w, invert in weights:
+                r = by_name.get(vname)
+                if not r:
+                    continue
+                val = r.scores.get(tf)
+                if val is None:
+                    continue
+                vv = (100.0 - val) if invert else val
+                num += w * vv
+                den += w
+            tf_scores[tf] = round(num / den, 1) if den > 0 else None
+        out[regime] = tf_scores
+    return out
 
-    print(f"Matrix has {len(mat)} variables")
-    print("\nSample:")
-    for k in ("1m_adx", "1m_rsi", "snap_gex_signed", "snap_flip_dist",
-              "snap_straddle_rich", "derived_ranging_score"):
-        print(f"  {k}: {mat[k]:.1f}")
 
-    rows = regime_rows(inp, mat)
-    print("\nRegime rows:")
+# --------------------------------------------------------------------------- #
+# Text renderer                                                                #
+# --------------------------------------------------------------------------- #
+def render_text(rows: list[MatrixRow], regimes: dict) -> str:
+    hdr = f"{'domain':<8}{'variable':<20}{'kind':<5}" + "".join(f"{tf:>6}" for tf in TIMEFRAMES)
+    lines = [hdr, "-" * len(hdr)]
+    cur = None
     for r in rows:
-        print(f"  {r['tf']}: dealer={r['dealer_regime']}  vol={r['vol_regime']}  "
-              f"momentum={r['momentum_regime']}")
-    print("mtf_matrix OK")
+        if r.domain != cur:
+            cur = r.domain
+        k = "S" if r.kind == SNAPSHOT else "N"
+        cells = "".join((f"{r.scores[tf]:>6.0f}" if r.scores[tf] is not None else f"{'·':>6}")
+                        for tf in TIMEFRAMES)
+        lines.append(f"{r.domain:<8}{r.variable:<20}{k:<5}{cells}")
+    lines.append("=" * len(hdr))
+    for regime, tfs in regimes.items():
+        cells = "".join((f"{tfs[tf]:>6.0f}" if tfs[tf] is not None else f"{'·':>6}")
+                        for tf in TIMEFRAMES)
+        lines.append(f"{'REGIME':<8}{regime:<20}{'':<5}{cells}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Demo: a "coiling" day -- compressed on low TFs, trend building on high TFs    #
+# --------------------------------------------------------------------------- #
+def demo_input() -> MTFInput:
+    def ramp(lo, hi):
+        return {tf: lo + (hi - lo) * i / (len(TIMEFRAMES) - 1)
+                for i, tf in enumerate(TIMEFRAMES)}
+    native = {
+        "dist_to_vwap": ramp(0.02, 0.30),
+        "vwap_slope": ramp(0.005, 0.09),
+        "range_position": ramp(0.50, 0.82),
+        "realized_vol": ramp(0.20, 0.70),
+        "rv_expansion": ramp(-0.25, 0.45),
+        "adx_strength": {"1m": 11, "5m": 13, "15m": 16, "30m": 19, "1h": 24, "4h": 28, "1d": 23},
+        "di_spread": ramp(3, 22),
+        "ema_slope": ramp(0.004, 0.085),
+        "rsi": {"1m": 52, "5m": 55, "15m": 58, "30m": 61, "1h": 65, "4h": 69, "1d": 63},
+        "bb_compression": {"1m": 0.65, "5m": 0.72, "15m": 0.85, "30m": 0.98,
+                           "1h": 1.15, "4h": 1.35, "1d": 1.10},   # raw bbw ratio
+        "trend_cleanliness": ramp(0.25, 0.80),
+        "cvd_persistence": ramp(0.05, 0.7),
+        "tick_two_sided": {"1m": 430, "5m": 470, "15m": 540, "30m": 640,
+                           "1h": 760, "4h": 880, "1d": 700},
+    }
+    snapshot = {
+        "gamma_sign": 4.0e9, "gamma_magnitude": 0.86, "flip_cushion": 0.006,
+        "channel_tightness": 0.010, "wall_proximity": 0.0025,
+        "term_structure": 0.16, "vvix_elevation": -0.03, "richness": 0.66,
+        "skew_dir": -0.17, "tail_heaviness": 0.30,
+    }
+    return MTFInput(native=native, snapshot=snapshot)
+
+
+if __name__ == "__main__":
+    inp = demo_input()
+    rows = build_matrix(inp)
+    regimes = regime_rows(rows)
+    print(render_text(rows, regimes))
+    print("\nN = native (varies by timeframe) · S = snapshot (point-in-time, broadcast) · '·' = no data")
