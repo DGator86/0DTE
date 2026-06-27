@@ -128,6 +128,14 @@ class SelectorConfig:
         "iron_fly": 0.80,
         "naked_defended_call": 0.88,
         "cash_secured_put": 0.55,
+        # debit families
+        "long_call_spread": 0.90,
+        "long_put_spread": 0.90,
+        "long_call": 0.70,           # undiversified premium buying; lower weight
+        "long_put": 0.70,
+        "long_strangle": 0.85,
+        "backspread_call": 0.80,
+        "backspread_put": 0.80,
     })
     iron_fly_pin_bonus: float = 0.20                 # restored toward 1.0 when pinned+GEX ok
     pin_band: float = 0.0025                         # within this % of a high-gamma strike = pinned
@@ -141,6 +149,11 @@ class SelectorConfig:
     naked_size_cap: float = 0.35                     # naked sizes much smaller than spreads
     csp_size_cap: float = 0.60
     naked_gap_multiplier: float = 2.0                # ranking haircut: stop can gap; risk > stop-defined
+
+    # ---- directional / debit families ----
+    enable_directional: bool = True      # include debit families when no target_families given
+    long_min_otm: float = -0.005         # buying leg: slightly ITM ...
+    long_max_otm: float = 0.015          # ... to 1.5% OTM (0DTE ~0.35-0.50Δ)
 
     top_n: int = 8
 
@@ -279,8 +292,11 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
               vol_cache: dict) -> Optional[SpreadCandidate]:
     cmid, pmid, spr = _chain_maps(chain)
     credit = _credit(legs, cmid, pmid)
-    if credit is None or credit <= 0:
-        return None                                        # not a credit structure / missing quote
+    if credit is None:
+        return None
+    is_debit = family in DEBIT_FAMILIES
+    if not is_debit and credit <= 0:
+        return None                                        # credit structure must collect premium
 
     grid = rnd.grid
     dx = grid[1] - grid[0]
@@ -352,8 +368,13 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
         rel += leg_spr / max(m, 0.02)
     liquidity_score = float(1.0 / (1.0 + rel))
 
-    wall_safety, dist_to_wall = _wall_safety(short_calls, short_puts, ctx, cfg)
-    gamma_safety, short_below_flip, regime_short = _gamma_safety(short_puts, ctx, cfg)
+    if is_debit:
+        # Debit (long) structures: wall/flip don't constrain the long side
+        wall_safety, dist_to_wall = 1.0, 0.0
+        gamma_safety, short_below_flip, regime_short = 1.0, False, False
+    else:
+        wall_safety, dist_to_wall = _wall_safety(short_calls, short_puts, ctx, cfg)
+        gamma_safety, short_below_flip, regime_short = _gamma_safety(short_puts, ctx, cfg)
 
     # ---- vetoes ----
     reasons = []
@@ -363,12 +384,13 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
         reasons.append(f"max_loss {max_loss:.2f}>cap")
     if liquidity_score < cfg.min_liquidity:
         reasons.append("illiquid")
-    if prob_touch_short > cfg.max_touch_short:
-        reasons.append(f"touch {prob_touch_short:.2f}>max")
-    if regime_short:
-        reasons.append("short_gamma_regime")
-    if cfg.veto_short_below_flip and short_below_flip:
-        reasons.append("short_put<=gamma_flip")
+    if not is_debit:
+        if prob_touch_short > cfg.max_touch_short:
+            reasons.append(f"touch {prob_touch_short:.2f}>max")
+        if regime_short:
+            reasons.append("short_gamma_regime")
+        if cfg.veto_short_below_flip and short_below_flip:
+            reasons.append("short_put<=gamma_flip")
 
     # ---- extra hard gating for undefined-risk families ----
     size_cap = 1.0
@@ -390,8 +412,11 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
     fam_w = cfg.family_weight.get(family, 0.9)
     risk_for_score = max_loss * (cfg.naked_gap_multiplier if naked else 1.0)
     ev_per_risk_scored = ev / risk_for_score if risk_for_score > 0 else 0.0
-    score = (max(ev_per_risk_scored, 0.0) * liquidity_score * wall_safety
-             * gamma_safety * touch_safety * fam_w)
+    if is_debit:
+        score = max(ev_per_risk_scored, 0.0) * liquidity_score * fam_w
+    else:
+        score = (max(ev_per_risk_scored, 0.0) * liquidity_score * wall_safety
+                 * gamma_safety * touch_safety * fam_w)
 
     return SpreadCandidate(
         family=family, short_strikes=short_strikes, long_strikes=long_strikes,
@@ -422,7 +447,23 @@ def _otm_strikes(chain: ChainSnapshot, F: float, side: str, cfg: SelectorConfig)
     return out
 
 
+def _long_strikes(chain: ChainSnapshot, F: float, side: str, cfg: SelectorConfig) -> list[float]:
+    """Strikes in the directional buying range: slightly ITM to slightly OTM."""
+    ks = sorted(q.strike for q in chain.quotes)
+    out = []
+    for k in ks:
+        rel = (k - F) / F if side == "call" else (F - k) / F
+        if cfg.long_min_otm <= rel <= cfg.long_max_otm:
+            out.append(k)
+    return out
+
+
 NAKED_FAMILIES = {"naked_defended_call", "cash_secured_put"}
+
+DEBIT_FAMILIES: frozenset = frozenset({
+    "long_call_spread", "long_put_spread", "long_call", "long_put",
+    "long_strangle", "backspread_call", "backspread_put",
+})
 
 # Maps decision_matrix structure codes → selector family name sets.
 # Used by live_feed_adapter.build_ticket() and decision_engine.decide()
@@ -432,7 +473,6 @@ STRUCTURE_TO_FAMILIES: dict[str, frozenset] = {
     "PCS": frozenset({"put_credit"}),
     "CCS": frozenset({"call_credit"}),
     "IF":  frozenset({"iron_fly"}),
-    # directional families (generators added in a future task)
     "LCS": frozenset({"long_call_spread"}),
     "LPS": frozenset({"long_put_spread"}),
     "LC":  frozenset({"long_call"}),
@@ -528,6 +568,79 @@ def _gen_broken_wing(chain, F, cfg):
     return out
 
 
+def _gen_long_call_spread(chain: ChainSnapshot, F: float, ctx: GammaContext,
+                          cfg: SelectorConfig) -> list:
+    """Buy call near ATM, sell call at K+w (bull debit spread)."""
+    ks = set(q.strike for q in chain.quotes)
+    out = []
+    for k_buy in _long_strikes(chain, F, "call", cfg):
+        for w in cfg.spread_widths:
+            k_sell = k_buy + w
+            if k_sell in ks:
+                out.append(("long_call_spread", (Leg(k_buy, "C", +1), Leg(k_sell, "C", -1))))
+    return out
+
+
+def _gen_long_put_spread(chain: ChainSnapshot, F: float, ctx: GammaContext,
+                         cfg: SelectorConfig) -> list:
+    """Buy put near ATM, sell put at K-w (bear debit spread)."""
+    ks = set(q.strike for q in chain.quotes)
+    out = []
+    for k_buy in _long_strikes(chain, F, "put", cfg):
+        for w in cfg.spread_widths:
+            k_sell = k_buy - w
+            if k_sell in ks:
+                out.append(("long_put_spread", (Leg(k_buy, "P", +1), Leg(k_sell, "P", -1))))
+    return out
+
+
+def _gen_long_call(chain: ChainSnapshot, F: float, cfg: SelectorConfig) -> list:
+    """Single long call near ATM (convex bull, unlimited upside)."""
+    return [("long_call", (Leg(k, "C", +1),)) for k in _long_strikes(chain, F, "call", cfg)]
+
+
+def _gen_long_put(chain: ChainSnapshot, F: float, cfg: SelectorConfig) -> list:
+    """Single long put near ATM (convex bear, unlimited downside capture)."""
+    return [("long_put", (Leg(k, "P", +1),)) for k in _long_strikes(chain, F, "put", cfg)]
+
+
+def _gen_long_strangle(chain: ChainSnapshot, F: float, cfg: SelectorConfig) -> list:
+    """Buy OTM call + OTM put (long vol, expects realized > implied)."""
+    call_strikes = _otm_strikes(chain, F, "call", cfg)
+    put_strikes = _otm_strikes(chain, F, "put", cfg)
+    out = []
+    for kc in call_strikes:
+        call_dist = (kc - F) / F
+        for kp in put_strikes:
+            put_dist = (F - kp) / F
+            # only roughly symmetric strangles (within 50% relative distance)
+            if call_dist > 0 and abs(call_dist - put_dist) / call_dist < 0.5:
+                out.append(("long_strangle", (Leg(kc, "C", +1), Leg(kp, "P", +1))))
+    return out
+
+
+def _gen_backspread_call(chain: ChainSnapshot, F: float, cfg: SelectorConfig) -> list:
+    """Sell 1 call near ATM, buy 2 calls OTM (net long gamma, benefits from up-breakout)."""
+    ks = set(q.strike for q in chain.quotes)
+    out = []
+    for k_sell in _long_strikes(chain, F, "call", cfg):
+        for k_buy in _otm_strikes(chain, F, "call", cfg):
+            if k_buy > k_sell and k_buy in ks:
+                out.append(("backspread_call", (Leg(k_sell, "C", -1), Leg(k_buy, "C", +2))))
+    return out
+
+
+def _gen_backspread_put(chain: ChainSnapshot, F: float, cfg: SelectorConfig) -> list:
+    """Sell 1 put near ATM, buy 2 puts OTM (net long gamma, benefits from down-breakout)."""
+    ks = set(q.strike for q in chain.quotes)
+    out = []
+    for k_sell in _long_strikes(chain, F, "put", cfg):
+        for k_buy in _otm_strikes(chain, F, "put", cfg):
+            if k_buy < k_sell and k_buy in ks:
+                out.append(("backspread_put", (Leg(k_sell, "P", -1), Leg(k_buy, "P", +2))))
+    return out
+
+
 def _is_pinned(F: float, ctx: GammaContext, cfg: SelectorConfig) -> bool:
     nearest_wall = min(abs(F - ctx.call_wall), abs(F - ctx.put_wall))
     return (nearest_wall / F <= cfg.pin_band) and ctx.net_gex > 0
@@ -572,7 +685,7 @@ def select_spreads(
         cfg.family_weight = dict(cfg.family_weight)
         cfg.family_weight["iron_fly"] = min(1.0, cfg.family_weight["iron_fly"] + cfg.iron_fly_pin_bonus)
 
-    gen = target_families  # None → all enabled families; frozenset → only those
+    gen = target_families  # None = generate all enabled families; frozenset = only those
 
     specs = []
     if gen is None or "put_credit" in gen:
@@ -585,11 +698,26 @@ def select_spreads(
         specs += _gen_iron_fly(chain, F, cfg)
     if gen is None or "broken_wing" in gen:
         specs += _gen_broken_wing(chain, F, cfg)
-    if cfg.enable_naked:
-        if gen is None or "cash_secured_put" in gen:
-            specs += _gen_cash_secured_put(chain, F, ctx, cfg)
-        if gen is None or "naked_defended_call" in gen:
-            specs += _gen_naked_defended_call(chain, F, ctx, cfg)
+    if cfg.enable_naked and (gen is None or "cash_secured_put" in gen):
+        specs += _gen_cash_secured_put(chain, F, ctx, cfg)
+    if cfg.enable_naked and (gen is None or "naked_defended_call" in gen):
+        specs += _gen_naked_defended_call(chain, F, ctx, cfg)
+    # directional / debit families: always when targeted; else only if enabled
+    if gen is not None or cfg.enable_directional:
+        if gen is None or "long_call_spread" in gen:
+            specs += _gen_long_call_spread(chain, F, ctx, cfg)
+        if gen is None or "long_put_spread" in gen:
+            specs += _gen_long_put_spread(chain, F, ctx, cfg)
+        if gen is None or "long_call" in gen:
+            specs += _gen_long_call(chain, F, cfg)
+        if gen is None or "long_put" in gen:
+            specs += _gen_long_put(chain, F, cfg)
+        if gen is None or "long_strangle" in gen:
+            specs += _gen_long_strangle(chain, F, cfg)
+        if gen is None or "backspread_call" in gen:
+            specs += _gen_backspread_call(chain, F, cfg)
+        if gen is None or "backspread_put" in gen:
+            specs += _gen_backspread_put(chain, F, cfg)
 
     vol_cache: dict = {}
     cands = []

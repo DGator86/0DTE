@@ -29,6 +29,7 @@ NOT financial advice.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import math
@@ -45,8 +46,9 @@ from decision_engine import decide, EngineConfig, TradeDecision
 from resample import RawBars, build_mtf_input
 from mtf_matrix import build_matrix, regime_rows
 from decision_matrix import decide_from_matrix, TradeIntent
-from regime_classifier import RegimeClassifier, RegimeState, ClassifierContext, ClassifierConfig
+from regime_classifier import RegimeClassifier, RegimeState, ClassifierContext, ClassifierConfig, ScaleBook
 from journal import Journal
+from risk_manager import RiskManager
 
 ET = ZoneInfo("America/New_York")
 
@@ -89,12 +91,14 @@ class UnifiedOrchestrator:
     engine_cfg: Optional[EngineConfig] = None
     classifier_cfg: Optional[ClassifierConfig] = None
     physical_pdf: Optional[Callable] = None     # callable(grid)->density for Track A
+    risk_manager: Optional[RiskManager] = None
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
             cfg=self.classifier_cfg or ClassifierConfig()
         )
         self._prev_std: Optional[dict] = None   # for information-gain computation
+        self._matrix_scale_book = ScaleBook()   # adaptive scales for MTF matrix variables
 
     def tick(self, now: dt.datetime) -> Optional[TickResult]:
         snap = self.feed.snapshot(now)
@@ -131,7 +135,7 @@ class UnifiedOrchestrator:
 
         # ---- Track B: matrix + decision routing ----
         mtf_in = build_mtf_input(snap.bars, snap_dict)
-        mat_rows = build_matrix(mtf_in)
+        mat_rows = build_matrix(mtf_in, self._matrix_scale_book)
         regimes = regime_rows(mat_rows)
         intent = decide_from_matrix(mat_rows, regimes, vetoes=regime_state.vetoes)
 
@@ -152,6 +156,20 @@ class UnifiedOrchestrator:
             decision = decide(snap.market, snap.chain, cfg,
                               physical_pdf=self.physical_pdf,
                               target_structure=intent.decision.structure)
+            # ---- Risk gate (optional, applied before journaling) ----
+            if (self.risk_manager is not None
+                    and decision.decision == "TRADE"
+                    and decision.candidate is not None):
+                session_date = now.astimezone(ET).date().isoformat()
+                rcheck = self.risk_manager.check(decision.candidate, session_date)
+                if not rcheck.approved:
+                    decision = dataclasses.replace(
+                        decision,
+                        decision="NO_TRADE",
+                        no_trade_reason="risk:" + ",".join(rcheck.vetoes),
+                    )
+                else:
+                    self.risk_manager.record_trade(decision.candidate, session_date)
             if self.journal:
                 self.journal.log(decision.as_row())
         else:

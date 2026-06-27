@@ -145,9 +145,9 @@ def decide(
         edge = compute_edge(rnd, chain, cfg.rnd, physical_pdf=physical_pdf)
         edge_rich = edge.richness_signal
         ctx = GammaContext.from_market_snapshot(market)
-        _target_fam = STRUCTURE_TO_FAMILIES.get(target_structure) if target_structure else None
-        sel = select_spreads(chain, rnd, edge, ctx, cfg.selector,
-                             physical_pdf=physical_pdf, target_families=_target_fam)
+        fams = STRUCTURE_TO_FAMILIES.get(target_structure) if target_structure else None
+        sel = select_spreads(chain, rnd, edge, ctx, cfg.selector, physical_pdf=physical_pdf,
+                             target_families=fams)
         candidate = sel.best
         if candidate is None:
             # keep the top-by-score would-be candidate for diagnostics if any exist
