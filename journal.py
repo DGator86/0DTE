@@ -36,6 +36,7 @@ COLUMNS = [
     "liquidity_score", "wall_safety", "gamma_safety", "touch_safety",
     "gate_pass", "gate_score", "gate_failed", "veto_reasons",
     "decision", "no_trade_reason", "was_traded", "candidate_present",
+    "regime_direction",     # Track B direction: "call"|"put"|"both"|"none"
 ]
 
 _SETTLE_COLUMNS = ["settle_price", "realized_pnl", "ev_error", "settled"]
@@ -44,7 +45,8 @@ _SETTLE_COLUMNS = ["settle_price", "realized_pnl", "ev_error", "settled"]
 def _coltype(col: str) -> str:
     if col in ("session_date", "ts", "gex_regime", "selected_family",
                "short_strikes", "long_strikes", "legs_json",
-               "gate_failed", "veto_reasons", "decision", "no_trade_reason"):
+               "gate_failed", "veto_reasons", "decision", "no_trade_reason",
+               "regime_direction"):
         return "TEXT"
     if col in ("gate_pass", "was_traded", "candidate_present"):
         return "INTEGER"

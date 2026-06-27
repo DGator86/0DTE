@@ -65,6 +65,7 @@ class TradeDecision:
     decision: str                 # "TRADE" | "NO_TRADE"
     no_trade_reason: str
     edge_richness: float
+    direction: str = ""           # Track B direction: call|put|both|none
 
     def as_row(self) -> dict:
         c = self.candidate
@@ -102,6 +103,7 @@ class TradeDecision:
             "no_trade_reason": self.no_trade_reason,
             "was_traded": 1 if self.decision == "TRADE" else 0,
             "candidate_present": 1 if c else 0,
+            "regime_direction": self.direction,
         }
 
 
@@ -118,6 +120,7 @@ def decide(
     cfg: Optional[EngineConfig] = None,
     physical_pdf: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     target_structure: Optional[str] = None,
+    direction: str = "",
 ) -> TradeDecision:
     cfg = cfg or EngineConfig()
     session_date = market.now.astimezone().date().isoformat()
@@ -177,4 +180,5 @@ def decide(
         candidate=candidate,
         gate_pass=gate_pass, gate_score=gate.score, gate_failed=gate.failed_gates,
         decision=decision, no_trade_reason=reason, edge_richness=edge_rich,
+        direction=direction,
     )
