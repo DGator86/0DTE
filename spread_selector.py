@@ -465,8 +465,10 @@ DEBIT_FAMILIES: frozenset = frozenset({
     "long_strangle", "backspread_call", "backspread_put",
 })
 
-# Maps decision_matrix structure codes -> selector family names
-STRUCTURE_TO_FAMILIES: dict = {
+# Maps decision_matrix structure codes → selector family name sets.
+# Used by live_feed_adapter.build_ticket() and decision_engine.decide()
+# to limit spread generation to the families implied by the regime decision.
+STRUCTURE_TO_FAMILIES: dict[str, frozenset] = {
     "IC":  frozenset({"iron_condor"}),
     "PCS": frozenset({"put_credit"}),
     "CCS": frozenset({"call_credit"}),
@@ -663,6 +665,10 @@ def select_spreads(
     physical_pdf: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     target_families: Optional[frozenset] = None,
 ) -> SelectionResult:
+    """
+    target_families — if given, only generate candidates from that family set.
+    Pass None (default) to generate every enabled family.
+    """
     cfg = cfg or SelectorConfig()
 
     # physical density on the rnd grid (same measure used by compute_edge)
@@ -679,7 +685,7 @@ def select_spreads(
         cfg.family_weight = dict(cfg.family_weight)
         cfg.family_weight["iron_fly"] = min(1.0, cfg.family_weight["iron_fly"] + cfg.iron_fly_pin_bonus)
 
-    gen = target_families  # None = generate all enabled; set = only those families
+    gen = target_families  # None = generate all enabled families; frozenset = only those
 
     specs = []
     if gen is None or "put_credit" in gen:
