@@ -424,6 +424,23 @@ def _otm_strikes(chain: ChainSnapshot, F: float, side: str, cfg: SelectorConfig)
 
 NAKED_FAMILIES = {"naked_defended_call", "cash_secured_put"}
 
+# Maps decision_matrix structure codes → selector family name sets.
+# Used by live_feed_adapter.build_ticket() and decision_engine.decide()
+# to limit spread generation to the families implied by the regime decision.
+STRUCTURE_TO_FAMILIES: dict[str, frozenset] = {
+    "IC":  frozenset({"iron_condor"}),
+    "PCS": frozenset({"put_credit"}),
+    "CCS": frozenset({"call_credit"}),
+    "IF":  frozenset({"iron_fly"}),
+    # directional families (generators added in a future task)
+    "LCS": frozenset({"long_call_spread"}),
+    "LPS": frozenset({"long_put_spread"}),
+    "LC":  frozenset({"long_call"}),
+    "LP":  frozenset({"long_put"}),
+    "STG": frozenset({"long_strangle"}),
+    "BKS": frozenset({"backspread_call", "backspread_put"}),
+}
+
 
 def _gen_cash_secured_put(chain, F, ctx, cfg):
     """Single short put, collateralized to zero. Defined risk = strike - credit."""
@@ -533,7 +550,12 @@ def select_spreads(
     ctx: GammaContext,
     cfg: Optional[SelectorConfig] = None,
     physical_pdf: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    target_families: Optional[frozenset] = None,
 ) -> SelectionResult:
+    """
+    target_families — if given, only generate candidates from that family set.
+    Pass None (default) to generate every enabled family.
+    """
     cfg = cfg or SelectorConfig()
 
     # physical density on the rnd grid (same measure used by compute_edge)
@@ -550,15 +572,24 @@ def select_spreads(
         cfg.family_weight = dict(cfg.family_weight)
         cfg.family_weight["iron_fly"] = min(1.0, cfg.family_weight["iron_fly"] + cfg.iron_fly_pin_bonus)
 
+    gen = target_families  # None → all enabled families; frozenset → only those
+
     specs = []
-    specs += _gen_verticals(chain, F, ctx, cfg, "P")
-    specs += _gen_verticals(chain, F, ctx, cfg, "C")
-    specs += _gen_condors(chain, F, ctx, cfg)
-    specs += _gen_iron_fly(chain, F, cfg)
-    specs += _gen_broken_wing(chain, F, cfg)
+    if gen is None or "put_credit" in gen:
+        specs += _gen_verticals(chain, F, ctx, cfg, "P")
+    if gen is None or "call_credit" in gen:
+        specs += _gen_verticals(chain, F, ctx, cfg, "C")
+    if gen is None or "iron_condor" in gen:
+        specs += _gen_condors(chain, F, ctx, cfg)
+    if gen is None or "iron_fly" in gen:
+        specs += _gen_iron_fly(chain, F, cfg)
+    if gen is None or "broken_wing" in gen:
+        specs += _gen_broken_wing(chain, F, cfg)
     if cfg.enable_naked:
-        specs += _gen_cash_secured_put(chain, F, ctx, cfg)
-        specs += _gen_naked_defended_call(chain, F, ctx, cfg)
+        if gen is None or "cash_secured_put" in gen:
+            specs += _gen_cash_secured_put(chain, F, ctx, cfg)
+        if gen is None or "naked_defended_call" in gen:
+            specs += _gen_naked_defended_call(chain, F, ctx, cfg)
 
     vol_cache: dict = {}
     cands = []

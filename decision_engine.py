@@ -34,6 +34,7 @@ from gate_scorer import MarketSnapshot, GateConfig, Decision, evaluate as gate_e
 from rnd_extractor import ChainSnapshot, RNDConfig, extract_rnd, compute_edge
 from spread_selector import (
     GammaContext, SelectorConfig, select_spreads, SpreadCandidate,
+    STRUCTURE_TO_FAMILIES,
 )
 
 
@@ -116,6 +117,7 @@ def decide(
     chain: ChainSnapshot,
     cfg: Optional[EngineConfig] = None,
     physical_pdf: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    target_structure: Optional[str] = None,
 ) -> TradeDecision:
     cfg = cfg or EngineConfig()
     session_date = market.now.astimezone().date().isoformat()
@@ -143,7 +145,9 @@ def decide(
         edge = compute_edge(rnd, chain, cfg.rnd, physical_pdf=physical_pdf)
         edge_rich = edge.richness_signal
         ctx = GammaContext.from_market_snapshot(market)
-        sel = select_spreads(chain, rnd, edge, ctx, cfg.selector, physical_pdf=physical_pdf)
+        _target_fam = STRUCTURE_TO_FAMILIES.get(target_structure) if target_structure else None
+        sel = select_spreads(chain, rnd, edge, ctx, cfg.selector,
+                             physical_pdf=physical_pdf, target_families=_target_fam)
         candidate = sel.best
         if candidate is None:
             # keep the top-by-score would-be candidate for diagnostics if any exist
