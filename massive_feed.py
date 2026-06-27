@@ -101,13 +101,39 @@ def _row_from_contract(c: dict) -> OptionRow | None:
 
 
 def _estimate_spot(rows: list[OptionRow]) -> float:
-    """If underlying_asset.price is missing, estimate spot from a deep-ITM call:
-    spot ~= strike + call_mid (intrinsic-dominated). Crude but bounded."""
-    deep = [r for r in rows if r.side == "call" and r.delta >= 0.9]
-    if not deep:
-        return 0.0
-    r = max(deep, key=lambda x: x.delta)
-    return round(r.strike + r.mid, 2)
+    """Estimate spot when underlying_asset.price is absent.
+
+    Primary method — put-call parity at the money:
+        C - P = S - K * e^(-rT)   ->   S ≈ (C_mid - P_mid) + K
+    For 0DTE the discount factor is ~1 (K*r*T is a few cents), so the strike
+    where |C_mid - P_mid| is smallest is the ATM crossing, and the parity
+    relation there recovers spot to within the bid/ask. We take the median of
+    the parity estimate over the few strikes nearest that crossing for
+    robustness against a single bad mark.
+
+    Fallbacks: the 0.5-delta call strike; else 0.0 (caller treats as no data).
+    This replaces the old deep-ITM-intrinsic estimate, which was biased high
+    (~1% on the live SPY chain: estimated 735 vs ATM 727-728)."""
+    calls: dict[float, OptionRow] = {}
+    puts: dict[float, OptionRow] = {}
+    for r in rows:
+        bucket = calls if r.side == "call" else puts
+        # prefer the tighter/real quote if a strike appears more than once
+        if r.strike not in bucket or r.spread_pct < bucket[r.strike].spread_pct:
+            bucket[r.strike] = r
+
+    paired = sorted(set(calls) & set(puts))
+    if paired:
+        atm = min(paired, key=lambda k: abs(calls[k].mid - puts[k].mid))
+        window = sorted(paired, key=lambda k: abs(k - atm))[:5]
+        est = sorted((calls[k].mid - puts[k].mid) + k for k in window)
+        return round(est[len(est) // 2], 2)   # median parity spot near ATM
+
+    # Fallback: strike of the call whose delta is closest to 0.5 (≈ ATM forward).
+    call_rows = [r for r in rows if r.side == "call" and r.delta > 0]
+    if call_rows:
+        return round(min(call_rows, key=lambda r: abs(r.delta - 0.5)).strike, 2)
+    return 0.0
 
 
 def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[OptionRow]]:
@@ -122,24 +148,17 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
     today = _today_et()
     rows: list[OptionRow] = []
     spot = 0.0
-    best_delta = 0.0    # tracks deepest-ITM call for spot estimation fallback
     pages = 0
 
     while url and pages < 25:           # safety cap on pagination
         data = _get(url, key)
         for c in data.get("results", []):
-            # underlying_asset.price confirmed absent in live Massive snapshot
+            # underlying_asset.price is the authoritative spot when present.
+            # It is confirmed ABSENT on the live Massive snapshot, so in practice
+            # spot is recovered post-loop via ATM put-call parity (_estimate_spot).
             ua = c.get("underlying_asset", {}) or {}
             if ua.get("price"):
                 spot = float(ua["price"])
-            elif not spot:
-                d = abs((c.get("greeks") or {}).get("delta") or 0)
-                close = (c.get("day") or {}).get("close") or 0
-                strike_k = (c.get("details") or {}).get("strike_price") or 0
-                if ((c.get("details") or {}).get("contract_type") == "call"
-                        and d > best_delta and d > 0.95 and close > 0):
-                    best_delta = d
-                    spot = float(strike_k) + float(close)
 
             if zero_dte_only and (c.get("details") or {}).get("expiration_date") != today:
                 continue
