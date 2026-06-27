@@ -147,7 +147,8 @@ class UnifiedOrchestrator:
                 vetoes=regime_state.vetoes,
             )
             if self.journal:
-                self.journal.log(_no_trade_row(snap.market, intent, regime_state))
+                self.journal.log(_no_trade_row(snap.market, intent, regime_state,
+                                               direction=intent.decision.direction))
             return result
 
         # ---- Track A: full engine (requires chain) ----
@@ -155,7 +156,8 @@ class UnifiedOrchestrator:
         if snap.chain is not None:
             decision = decide(snap.market, snap.chain, cfg,
                               physical_pdf=self.physical_pdf,
-                              target_structure=intent.decision.structure)
+                              target_structure=intent.decision.structure,
+                              direction=intent.decision.direction)
             # ---- Risk gate (optional, applied before journaling) ----
             if (self.risk_manager is not None
                     and decision.decision == "TRADE"
@@ -176,7 +178,8 @@ class UnifiedOrchestrator:
             # No chain yet — log intent as a no-trade stub for calibration
             if self.journal:
                 self.journal.log(_no_trade_row(snap.market, intent, regime_state,
-                                               reason="no_chain"))
+                                               reason="no_chain",
+                                               direction=intent.decision.direction))
 
         # size_mult from Track B scales the Track A position
         final_size = intent.size_mult if (decision is not None
@@ -222,7 +225,8 @@ class UnifiedOrchestrator:
 # Row builder for no-trade / no-chain ticks                                   #
 # --------------------------------------------------------------------------- #
 def _no_trade_row(market: MarketSnapshot, intent: TradeIntent,
-                  regime: RegimeState, reason: str = "") -> dict:
+                  regime: RegimeState, reason: str = "",
+                  direction: str = "") -> dict:
     now = market.now
     session_date = now.astimezone(ET).date().isoformat()
     gex_regime = "long" if market.net_gex > 0 else ("short" if market.net_gex < 0 else "flat")
@@ -257,6 +261,7 @@ def _no_trade_row(market: MarketSnapshot, intent: TradeIntent,
         "no_trade_reason": no_reason,
         "was_traded": 0,
         "candidate_present": 0,
+        "regime_direction": direction or intent.decision.direction,
     }
 
 
