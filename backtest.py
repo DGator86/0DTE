@@ -33,6 +33,7 @@ from journal import Journal
 from unified_loop import UnifiedOrchestrator, TickSnapshot
 from decision_engine import EngineConfig
 from regime_classifier import ClassifierConfig
+from risk_manager import RiskConfig, RiskManager
 
 ET = ZoneInfo("America/New_York")
 
@@ -191,19 +192,22 @@ def run_backtest(
     timestamps: list[dt.datetime],
     engine_cfg: Optional[EngineConfig] = None,
     classifier_cfg: Optional[ClassifierConfig] = None,
+    risk_cfg: Optional[RiskConfig] = None,
     journal: Optional[Journal] = None,
 ) -> TearSheet:
     """
     Replay `timestamps` through the full pipeline and return a TearSheet.
 
-    feed  — satisfies DataFeed protocol (snapshot + settlement_price)
-    journal — pass an external Journal to inspect it afterwards; defaults to :memory:
+    feed      — satisfies DataFeed protocol (snapshot + settlement_price)
+    risk_cfg  — optional intraday risk guards applied during replay
+    journal   — pass an external Journal to inspect it afterwards; defaults to :memory:
     """
     jrn = journal or Journal(":memory:")
     orch = UnifiedOrchestrator(
         feed=feed, journal=jrn,
         engine_cfg=engine_cfg,
         classifier_cfg=classifier_cfg,
+        risk_manager=RiskManager(risk_cfg) if risk_cfg else None,
     )
 
     # -- replay --
