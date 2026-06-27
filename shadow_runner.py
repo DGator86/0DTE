@@ -34,6 +34,7 @@ from massive_feed import MassiveDataFeed
 from journal import Journal
 from unified_loop import UnifiedOrchestrator
 from notifier import Notifier, Ticket
+from risk_manager import RiskConfig, RiskManager
 
 ET = ZoneInfo("America/New_York")
 
@@ -110,6 +111,7 @@ class ShadowRunner:
         vix3m: float = 17.0,
         vvix: float = 92.0,
         vvix_baseline: float = 95.0,
+        risk_cfg: Optional[RiskConfig] = None,
     ) -> None:
         self.symbol = symbol
         self.interval_s = interval_s
@@ -124,11 +126,20 @@ class ShadowRunner:
             vvix=vvix,
             vvix_baseline=vvix_baseline,
         )
-        self._orch = UnifiedOrchestrator(feed=self._feed, journal=self._jrn)
+        self._risk = RiskManager(risk_cfg) if risk_cfg else None
+        self._orch = UnifiedOrchestrator(
+            feed=self._feed, journal=self._jrn, risk_manager=self._risk
+        )
         self._notifier = Notifier()
         self._settled: set[str] = set()
 
         log.info("Initialized. DB=%s symbol=%s interval=%ds", db_path, symbol, interval_s)
+        if self._risk:
+            cfg = risk_cfg
+            log.info(
+                "Risk manager: max_loss=%.2f max_positions=%d max_gamma=%.4f",
+                cfg.daily_loss_limit, cfg.max_open_positions, cfg.max_portfolio_gamma,
+            )
         log.info("No orders will be placed — shadow mode only.")
 
     # -- public API ----------------------------------------------------------
@@ -189,6 +200,13 @@ class ShadowRunner:
 
         print("=" * 60)
 
+        if self._risk:
+            st = self._risk.status()
+            print(f"\n  Risk manager status:")
+            print(f"    Open positions:  {st['open_positions']}")
+            print(f"    Daily loss used: {st['daily_loss_committed']:.4f}")
+            print(f"    Net gamma:       {st['net_gamma']:.6f}")
+
         # unsettled sessions needing manual attention
         unsettled = self._jrn.unsettled_dates()
         if unsettled:
@@ -247,6 +265,8 @@ class ShadowRunner:
             return
         n = self._orch.settle(session_date)
         self._settled.add(session_date)
+        if self._risk:
+            self._risk.close_positions()
         if n > 0:
             log.info("Settled %s: %d rows updated with EOD price.", session_date, n)
         else:
@@ -275,11 +295,25 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Print calibration report from the journal DB and exit")
     p.add_argument("--settle",   metavar="YYYY-MM-DD",
                    help="Manually settle a specific session date and exit")
+    p.add_argument("--max-loss", dest="max_loss", type=float, default=0.0,
+                   help="Daily max_loss budget per contract (0 = disabled)")
+    p.add_argument("--max-positions", dest="max_positions", type=int, default=0,
+                   help="Max concurrent open positions (0 = unlimited)")
+    p.add_argument("--max-gamma", dest="max_gamma", type=float, default=0.0,
+                   help="Max portfolio net |gamma| (0 = disabled)")
     return p
 
 
 if __name__ == "__main__":
     args = _build_parser().parse_args()
+
+    risk_cfg = None
+    if args.max_loss > 0 or args.max_positions > 0 or args.max_gamma > 0:
+        risk_cfg = RiskConfig(
+            daily_loss_limit=args.max_loss or float("inf"),
+            max_open_positions=args.max_positions,
+            max_portfolio_gamma=args.max_gamma or float("inf"),
+        )
 
     runner = ShadowRunner(
         symbol=args.symbol,
@@ -291,6 +325,7 @@ if __name__ == "__main__":
         vix3m=args.vix3m,
         vvix=args.vvix,
         vvix_baseline=args.vvix_baseline,
+        risk_cfg=risk_cfg,
     )
 
     if args.report:
