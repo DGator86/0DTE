@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 from massive_feed import MassiveDataFeed
 from journal import Journal
 from unified_loop import UnifiedOrchestrator
+from notifier import Notifier, Ticket
 
 ET = ZoneInfo("America/New_York")
 
@@ -124,6 +125,7 @@ class ShadowRunner:
             vvix_baseline=vvix_baseline,
         )
         self._orch = UnifiedOrchestrator(feed=self._feed, journal=self._jrn)
+        self._notifier = Notifier()
         self._settled: set[str] = set()
 
         log.info("Initialized. DB=%s symbol=%s interval=%ds", db_path, symbol, interval_s)
@@ -230,6 +232,12 @@ class ShadowRunner:
             dec,
             mult,
         )
+
+        if (result.decision is not None
+                and result.decision.decision == "TRADE"
+                and result.decision.gate_pass):
+            ticket = Ticket.from_tick_result(result, self.symbol)
+            self._notifier.send(ticket)
 
     def _maybe_settle(self, now: dt.datetime) -> None:
         if not _settle_eligible(now):
