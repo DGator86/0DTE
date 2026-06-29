@@ -58,20 +58,16 @@ def _row_from_contract(c: dict) -> OptionRow | None:
     """Map one snapshot contract to an OptionRow. Returns None if data is incomplete."""
     details = c.get("details", {})              # CONFIRM: contract_type, strike_price
     greeks = c.get("greeks", {})                # CONFIRM: gamma, delta
-    quote = c.get("last_quote", {})             # CONFIRM: bid, ask
-    details = c.get("details", {})
-    greeks = c.get("greeks", {})
     side = details.get("contract_type")         # "call" | "put"
     strike = details.get("strike_price")
     gamma = greeks.get("gamma")
     delta = greeks.get("delta")
     oi = c.get("open_interest")
-    bid = quote.get("bid")
-    ask = quote.get("ask")
-    if None in (side, strike, gamma, delta, oi, bid, ask):
+    if None in (side, strike, gamma, delta, oi):
+        return None
 
-    # Prefer real-time last_quote; fall back to day.close (confirmed absent in API)
-    quote = c.get("last_quote", {})
+    # Prefer real-time last_quote; fall back to day.close
+    quote = c.get("last_quote", {})             # CONFIRM: bid, ask
     bid = quote.get("bid")
     ask = quote.get("ask")
     if bid is None or ask is None:
@@ -80,8 +76,6 @@ def _row_from_contract(c: dict) -> OptionRow | None:
             return None
         bid = ask = close  # spread_pct=0; mid=close
 
-    if None in (side, strike, gamma, delta, oi):
-        return None
     if bid <= 0 or ask <= 0:
         return None
     return OptionRow(side=side, strike=float(strike), oi=int(oi),
@@ -103,13 +97,6 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
     spot = 0.0
     pages = 0
 
-    while url and pages < 25:            # safety cap on pagination
-        data = _get(url, key)
-        for c in data.get("results", []):
-            # underlying price lives on each contract's snapshot
-            ua = c.get("underlying_asset", {})          # CONFIRM: underlying_asset.price
-            if ua.get("price"):
-                spot = float(ua["price"])
     best_delta = 0.0  # track deepest-ITM call for spot estimation
 
     while url and pages < 25:            # safety cap on pagination
@@ -119,24 +106,21 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
             ua = c.get("underlying_asset", {})
             if ua.get("price"):
                 spot = float(ua["price"])
-            elif not spot:
-                details = c.get("details", {})
-                greeks = c.get("greeks", {})
-                d = abs(greeks.get("delta") or 0)
-                close = c.get("day", {}).get("close") or 0
-                if (details.get("contract_type") == "call"
-                        and d > best_delta and d > 0.95 and close > 0):
-                    best_delta = d
-                    spot = float(details.get("strike_price", 0)) + float(close)
+            details = c.get("details", {})
+            greeks = c.get("greeks", {}) or {}
+            d = abs(greeks.get("delta") or 0)
+            close = c.get("day", {}).get("close") or 0
+            if (details.get("contract_type") == "call"
+                    and d > best_delta and d > 0.95 and close > 0):
+                best_delta = d
+                spot = float(details.get("strike_price", 0)) + float(close)
 
             if zero_dte_only and c.get("details", {}).get("expiration_date") != today:
                 continue
             row = _row_from_contract(c)
             if row:
                 rows.append(row)
-        nxt = data.get("next_url")
-        url = (nxt + (("&" if "?" in nxt else "?") )) if nxt else None
-        url = nxt if nxt else None
+        url = data.get("next_url")
         pages += 1
 
     return spot, rows
@@ -179,12 +163,15 @@ def diagnose(underlying: str) -> None:
         print("  ", p)
 
     print("\n--- mapping check (what the adapter extracts) ---")
-    row = _row_from_contract(results[0])
+    row = None
+    for c in results:
+        row = _row_from_contract(c)
+        if row:
+            break
     if row:
         print(f"  OK -> {row.side} {row.strike} OI={row.oi} gamma={row.gamma} delta={row.delta} {row.bid}/{row.ask}")
     else:
-        print("  MAPPING FAILED -> one of contract_type/strike_price/gamma/delta/"
-              "open_interest/last_quote is named differently. Paste the structure above.")
+        print("  MAPPING FAILED -> no contract on this page had complete greeks/OI/quotes.")
 
 
 if __name__ == "__main__":
@@ -204,3 +191,15 @@ if __name__ == "__main__":
         gm = eng.build_gamma_map(rows, spot)
         print(f"  -> netGEX ratio {gm.net_ratio} | flip {gm.gamma_flip} | "
               f"walls {gm.put_wall}/{gm.call_wall} | regime {gm.regime.upper()}")
+        d = eng.decide(gm, price_accepting=0)
+        print(f"DECISION: {d.action} — {d.reason}")
+        if d.action in ("CALL", "PUT"):
+            risk, _ = eng.scale_risk(n_trades=0, win_rate=0.0, avg_win=0, avg_loss=0)
+            order = eng.select_order(rows, d, equity=1000.0, risk_frac=risk)
+            if order:
+                print("ORDER:", order.thesis, f"| risk ${order.dollar_risk:.0f}")
+        elif d.action == "SELL_CONDOR":
+            risk, _ = eng.scale_risk(n_trades=0, win_rate=0.0, avg_win=0, avg_loss=0)
+            condor = eng.select_condor(rows, gm, equity=1000.0, risk_frac=risk)
+            if condor:
+                print("ORDER:", condor.thesis, f"| risk ${condor.dollar_risk:.0f}")
