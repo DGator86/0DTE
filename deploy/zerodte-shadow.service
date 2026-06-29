@@ -1,0 +1,43 @@
+[Unit]
+# 0DTE GEX shadow-mode pipeline — journals every tick, never places an order.
+# Decision-support only; a human executes the tickets it pushes. Not financial advice.
+Description=0DTE GEX shadow-mode pipeline (journal-only, no orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zerodte
+Group=zerodte
+WorkingDirectory=/opt/zerodte
+
+# Secrets live ONLY here (chmod 600, root:zerodte). Never in the repo or unit.
+EnvironmentFile=/etc/zerodte/zerodte.env
+
+# The journal DB persists under /var/lib/zerodte so it survives restarts and
+# code updates — it is the entire measurement thesis.
+ExecStart=/opt/zerodte/venv/bin/python /opt/zerodte/shadow_runner.py \
+    --db /var/lib/zerodte/shadow.db --interval 60
+
+# Auto-restart on crash; the loop self-handles market hours, so this only
+# fires on real faults (network, API, bug). RestartSec avoids hot-looping.
+Restart=on-failure
+RestartSec=10
+
+# --- Hardening: the box holds an API key, so lock the process down. ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+# Only the journal directory is writable; everything else is read-only.
+ReadWritePaths=/var/lib/zerodte
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-shadow
+
+[Install]
+WantedBy=multi-user.target
