@@ -30,11 +30,12 @@ import sys
 import time
 from zoneinfo import ZoneInfo
 
-from massive_feed import MassiveDataFeed
+from composite_feed import build_default_feed
 from journal import Journal
 from unified_loop import UnifiedOrchestrator
 from notifier import Notifier, Ticket
 from risk_manager import RiskConfig, RiskManager
+from typing import Optional
 
 ET = ZoneInfo("America/New_York")
 
@@ -117,8 +118,10 @@ class ShadowRunner:
         self.interval_s = interval_s
 
         self._jrn = Journal(db_path)
-        self._feed = MassiveDataFeed(
-            underlying=symbol,
+        # Auto-detect credentialed providers (Tradier -> Tastytrade -> Massive)
+        # and fail over between them per tick; Yahoo backstops settlement.
+        self._feed = build_default_feed(
+            symbol=symbol,
             lookback_minutes=lookback_minutes,
             vix9d=vix9d,
             vix=vix,
