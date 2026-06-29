@@ -144,8 +144,15 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
         raise RuntimeError("MASSIVE_API_KEY not set in environment")
     base = os.environ.get("MASSIVE_BASE_URL", "https://api.massive.com").rstrip("/")
 
-    url = f"{base}/v3/snapshot/options/{underlying}?limit=250"
     today = _today_et()
+    # Filter to today's expiry server-side when 0DTE: the snapshot is otherwise
+    # the entire multi-expiry chain (thousands of contracts, many pages) of which
+    # we discard all but one expiry. The exact-match expiration_date param cuts
+    # that to a single expiry's strikes — far fewer pages per tick. The
+    # client-side check below stays as a backstop in case the param is ignored.
+    url = f"{base}/v3/snapshot/options/{underlying}?limit=250"
+    if zero_dte_only:
+        url += f"&expiration_date={today}"
     rows: list[OptionRow] = []
     spot = 0.0
     pages = 0
@@ -407,6 +414,88 @@ def _bar_technicals(raw: RawBars) -> dict:
     }
 
 
+def get_iv_term_structure(underlying: str, spot: float,
+                          tenors_days: tuple[int, int, int] = (9, 30, 90)
+                          ) -> dict | None:
+    """ATM implied-vol term structure derived from the live option chain.
+
+    Replaces the hardcoded VIX / VIX9D / VIX3M defaults with a market-derived
+    proxy. For each target tenor we find the expiry whose days-to-expiry is
+    closest, take the ATM strike (nearest spot), and average the call & put
+    implied vol there. Returned in VIX-style points (IV * 100). None on
+    insufficient data (caller keeps its existing values).
+
+    NOTE: a SPY ATM-IV proxy is not the CBOE VIX (a variance-swap strip over
+    all strikes). But the gate only consumes the *ordering / slope* of the
+    three tenors — vix9d/vix ratio and vix vs vix3m (contango vs backwardation)
+    — which the ATM proxy tracks closely. The chain already carries
+    `implied_volatility` per contract, so this costs no extra entitlement.
+    """
+    key = os.environ.get("MASSIVE_API_KEY")
+    if not key:
+        return None
+    base = os.environ.get("MASSIVE_BASE_URL", "https://api.massive.com").rstrip("/")
+    today = datetime.now(ET).date()
+
+    # Filter server-side to a near-ATM strike band and a bounded expiry window so
+    # we fetch only the contracts the term structure needs (a few hundred, not
+    # the whole chain). Polygon/Massive support these query params natively.
+    lo, hi = round(spot * 0.97, 2), round(spot * 1.03, 2)
+    exp_hi = (today + dt.timedelta(days=max(tenors_days) + 20)).isoformat()
+    url = (f"{base}/v3/snapshot/options/{underlying}"
+           f"?strike_price.gte={lo}&strike_price.lte={hi}"
+           f"&expiration_date.gte={today.isoformat()}&expiration_date.lte={exp_hi}"
+           f"&limit=250")
+
+    # expiration_date -> { strike -> {"call": iv, "put": iv} }
+    by_exp: dict[str, dict[float, dict[str, float]]] = {}
+    pages = 0
+    while url and pages < 10:
+        data = _get(url, key)
+        for c in data.get("results", []):
+            det = c.get("details", {}) or {}
+            iv = c.get("implied_volatility")
+            exp = det.get("expiration_date")
+            strike = det.get("strike_price")
+            side = det.get("contract_type")
+            if not iv or iv <= 0 or not exp or strike is None or side not in ("call", "put"):
+                continue
+            by_exp.setdefault(exp, {}).setdefault(float(strike), {})[side] = float(iv)
+        url = data.get("next_url") or None
+        pages += 1
+
+    if not by_exp:
+        return None
+
+    atm: list[tuple[int, float]] = []   # (days_to_expiry, atm_iv)
+    for exp, strikes in by_exp.items():
+        try:
+            y, m, d = (int(x) for x in exp.split("-"))
+            dte = (dt.date(y, m, d) - today).days
+        except Exception:
+            continue
+        if dte < 0:
+            continue
+        atm_k = min(strikes, key=lambda k: abs(k - spot))
+        legs = strikes[atm_k]
+        ivs = [v for v in (legs.get("call"), legs.get("put")) if v]
+        if not ivs:
+            continue
+        atm.append((dte, sum(ivs) / len(ivs)))
+
+    if not atm:
+        return None
+    atm.sort()
+
+    def nearest(target: int) -> float:
+        _, iv = min(atm, key=lambda t: abs(t[0] - target))
+        return round(iv * 100.0, 2)
+
+    t9, t30, t90 = tenors_days
+    return {"vix9d": nearest(t9), "vix": nearest(t30), "vix3m": nearest(t90),
+            "n_expiries": len(atm)}
+
+
 class MassiveDataFeed:
     """
     Live DataFeed adapter for UnifiedOrchestrator backed by the Massive API.
@@ -415,10 +504,12 @@ class MassiveDataFeed:
         export MASSIVE_API_KEY=...
         export MASSIVE_BASE_URL=https://api.massive.com
 
-    VIX / VVIX are not available from the chain endpoint. Supply them from a
-    separate feed (e.g. CBOE data) or keep the configurable defaults until
-    that pipe is built. The system degrades gracefully: regime classifier uses
-    whatever values are present.
+    VIX / VIX9D / VIX3M are derived from the chain's own ATM implied-vol term
+    structure when use_chain_vix=True (the default), refreshed every
+    vix_refresh_seconds. Pass use_chain_vix=False to pin the constructor
+    defaults, or call set_vix() to override from a dedicated feed. VVIX is not
+    derivable from the equity chain (it needs VIX options) and keeps its
+    configurable default; the system degrades gracefully.
 
     GEX percentile rank is maintained as a rolling window across ticks; it
     starts at 0.5 until enough history accumulates.
@@ -435,6 +526,9 @@ class MassiveDataFeed:
         vix3m: float = 17.0,
         vvix: float = 92.0,
         vvix_baseline: float = 95.0,
+        # Derive VIX term structure from the chain's ATM IV (no extra entitlement)
+        use_chain_vix: bool = True,
+        vix_refresh_seconds: int = 600,
         # State: rolling GEX history for percentile rank
         gex_history_len: int = 100,
         has_catalyst: bool = False,
@@ -448,9 +542,28 @@ class MassiveDataFeed:
         self._vix3m = vix3m
         self._vvix = vvix
         self._vvix_baseline = vvix_baseline
+        self._use_chain_vix = use_chain_vix
+        self._vix_refresh_seconds = vix_refresh_seconds
+        self._vix_ts: datetime | None = None    # last term-structure refresh
         self._gex_history: deque[float] = deque(maxlen=gex_history_len)
         self.has_catalyst = has_catalyst
         self.catalyst_label = catalyst_label
+
+    def _maybe_refresh_vix(self, spot: float, now: dt.datetime) -> None:
+        """Refresh the ATM-IV term structure from the chain, at most once every
+        vix_refresh_seconds. Silently keeps prior values on any failure."""
+        if not self._use_chain_vix or spot <= 0:
+            return
+        if (self._vix_ts is not None
+                and (now - self._vix_ts).total_seconds() < self._vix_refresh_seconds):
+            return
+        try:
+            ts = get_iv_term_structure(self.underlying, spot)
+        except Exception:
+            ts = None
+        if ts and ts["vix"] > 0:
+            self._vix9d, self._vix, self._vix3m = ts["vix9d"], ts["vix"], ts["vix3m"]
+            self._vix_ts = now
 
     # -- vol overrides (wire live VIX feed here) --
     def set_vix(self, vix9d: float, vix: float, vix3m: float) -> None:
@@ -486,6 +599,9 @@ class MassiveDataFeed:
             return None
         if not rows or spot <= 0.0:
             return None
+
+        # VIX term structure from the chain's own ATM IV (cached refresh)
+        self._maybe_refresh_vix(spot, now)
 
         # GEX structure
         gm = build_gamma_map(rows, spot)
