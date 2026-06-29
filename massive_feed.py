@@ -144,8 +144,15 @@ def get_chain(underlying: str, zero_dte_only: bool = True) -> tuple[float, list[
         raise RuntimeError("MASSIVE_API_KEY not set in environment")
     base = os.environ.get("MASSIVE_BASE_URL", "https://api.massive.com").rstrip("/")
 
-    url = f"{base}/v3/snapshot/options/{underlying}?limit=250"
     today = _today_et()
+    # Filter to today's expiry server-side when 0DTE: the snapshot is otherwise
+    # the entire multi-expiry chain (thousands of contracts, many pages) of which
+    # we discard all but one expiry. The exact-match expiration_date param cuts
+    # that to a single expiry's strikes — far fewer pages per tick. The
+    # client-side check below stays as a backstop in case the param is ignored.
+    url = f"{base}/v3/snapshot/options/{underlying}?limit=250"
+    if zero_dte_only:
+        url += f"&expiration_date={today}"
     rows: list[OptionRow] = []
     spot = 0.0
     pages = 0
