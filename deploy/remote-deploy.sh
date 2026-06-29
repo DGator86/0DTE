@@ -70,9 +70,10 @@ install -m 644 "$APP_DIR/deploy/$SVC.service" "/etc/systemd/system/$SVC.service"
 systemctl daemon-reload
 
 if [ ! -f "$ENV_FILE" ]; then
+    # printf renders the color; a plain heredoc can't interpret \033 escapes
+    # and would print them literally — and this is the first-run message.
+    printf '\n\033[1;33m%s\033[0m\n' "Secrets file $ENV_FILE not found — service NOT started." >&2
     cat >&2 <<EOF
-
-\033[1;33mSecrets file $ENV_FILE not found — service NOT started.\033[0m
 Code is deployed, but the pipeline needs your API key first. One-time setup:
 
     sudo install -D -m 600 -o root -g $SVC_USER \\
