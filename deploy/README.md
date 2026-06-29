@@ -110,15 +110,76 @@ sudo systemctl stop zerodte-shadow
 
 ## Updating the code
 
+Manually, on the box:
+
 ```bash
 cd /opt/zerodte && sudo git pull
 sudo ./venv/bin/pip install -r requirements.txt   # if deps changed
 sudo systemctl restart zerodte-shadow
 ```
 
+…or let CI do it for you — see **Push-to-deploy** below.
+
 The journal in `/var/lib/zerodte` is untouched by updates. Avoid needless
 mid-session restarts: the GEX-percentile window and VIX cache are in-memory and
 re-warm after a restart (the journal itself persists).
+
+---
+
+## Push-to-deploy (GitHub Actions)
+
+`.github/workflows/deploy.yml` SSHes into the VPS on every push to `main` and
+runs [`deploy/remote-deploy.sh`](remote-deploy.sh), which fast-forwards the
+checkout under `/opt/zerodte` and restarts the service. The deploy script is
+**idempotent** — the first run also provisions the service user, venv, and
+systemd unit, so it covers steps 1–3 and 5 above automatically. The only manual
+step that remains is the **secrets file** (step 4): the script never writes it
+and refuses to start the service until it exists, so a deploy can never clobber
+your API key.
+
+### One-time setup
+
+**1. Generate a dedicated deploy key** (on your laptop — no passphrase, so CI can
+use it unattended):
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/zerodte_deploy -C "github-actions-deploy" -N ""
+```
+
+**2. Authorize the public key on the VPS:**
+
+```bash
+ssh-copy-id -i ~/.ssh/zerodte_deploy.pub root@YOUR_VPS_IP
+# or paste ~/.ssh/zerodte_deploy.pub into /root/.ssh/authorized_keys by hand
+```
+
+**3. Pin the host key** (so CI verifies the box instead of trust-on-first-use):
+
+```bash
+ssh-keyscan YOUR_VPS_IP
+```
+
+**4. Add repository secrets** — GitHub → repo **Settings → Secrets and variables
+→ Actions → New repository secret:**
+
+| Secret | Value | Required |
+|---|---|---|
+| `VPS_HOST` | the VPS IP / hostname | ✅ |
+| `VPS_SSH_KEY` | contents of `~/.ssh/zerodte_deploy` (the **private** key) | ✅ |
+| `VPS_USER` | SSH user, if not `root` | optional |
+| `VPS_SSH_PORT` | SSH port, if not `22` | optional |
+| `VPS_KNOWN_HOSTS` | the `ssh-keyscan` output from step 3 | recommended |
+
+**5. Seed the secrets file once** (the only thing CI won't do — see step 4 of the
+manual guide above), then trigger the first deploy by pushing to `main` or via
+**Actions → Deploy to VPS → Run workflow**. The first run provisions the box;
+every push after that is a one-click redeploy.
+
+> Least privilege: this is a deploy-only key for one box. To lock it down further
+> you can prefix the `authorized_keys` entry with
+> `command="...",no-port-forwarding`, or run the service as a non-root sudoer and
+> have the workflow `sudo` — but root-over-SSH matches Hostinger's default and
+> the rest of this guide.
 
 ## Real-time quotes (going to "maximal status")
 
