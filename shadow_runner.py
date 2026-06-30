@@ -36,6 +36,8 @@ from unified_loop import UnifiedOrchestrator
 from notifier import Notifier, Ticket
 from risk_manager import RiskConfig, RiskManager
 from paper_broker import PaperBroker, PaperConfig
+from market_calendar import is_market_open, next_market_open, market_status
+from dashboard.state import serialize_tick_result, write_live_state
 from typing import Optional
 
 ET = ZoneInfo("America/New_York")
@@ -50,30 +52,8 @@ log = logging.getLogger("shadow")
 
 
 # --------------------------------------------------------------------------- #
-# Market calendar helpers                                                      #
+# Settlement helper                                                            #
 # --------------------------------------------------------------------------- #
-def _market_open(now: dt.datetime) -> bool:
-    et = now.astimezone(ET)
-    if et.weekday() >= 5:          # Sat=5, Sun=6
-        return False
-    t = et.time()
-    return dt.time(9, 30) <= t < dt.time(16, 0)
-
-
-def _next_open(now: dt.datetime) -> dt.datetime:
-    """Return the next market open (9:30 ET on the next/same weekday)."""
-    et = now.astimezone(ET)
-    open_today = et.replace(hour=9, minute=30, second=0, microsecond=0)
-    if et < open_today and et.weekday() < 5:
-        return open_today
-    candidate = (et + dt.timedelta(days=1)).replace(
-        hour=9, minute=30, second=0, microsecond=0
-    )
-    while candidate.weekday() >= 5:
-        candidate += dt.timedelta(days=1)
-    return candidate
-
-
 def _settle_eligible(now: dt.datetime) -> bool:
     """4:15 PM ET or later on a weekday — settlement prices are available."""
     et = now.astimezone(ET)
@@ -116,9 +96,11 @@ class ShadowRunner:
         risk_cfg: Optional[RiskConfig] = None,
         paper_db: Optional[str] = None,
         paper_cfg: "Optional[PaperConfig]" = None,
+        live_state_path: str = "live_state.json",
     ) -> None:
         self.symbol = symbol
         self.interval_s = interval_s
+        self.live_state_path = live_state_path
 
         self._jrn = Journal(db_path)
         # Auto-detect credentialed providers (Tradier -> Tastytrade -> Massive)
@@ -167,12 +149,12 @@ class ShadowRunner:
                 now = dt.datetime.now(ET)
                 self._maybe_settle(now)
 
-                if _market_open(now):
+                if is_market_open(now):
                     self._tick(now)
                     time.sleep(self.interval_s)
                 else:
                     # off-hours: check every 5 min so we don't miss settle window
-                    nxt = _next_open(now)
+                    nxt = next_market_open(now)
                     secs_to_open = (nxt - now).total_seconds()
                     log.info(
                         "Market closed. Next open %s ET (%.1fh).",
@@ -281,6 +263,19 @@ class ShadowRunner:
         except Exception as exc:
             log.warning("paper broker error: %s", exc)
 
+        try:
+            write_live_state(
+                self.live_state_path,
+                serialize_tick_result(
+                    result,
+                    feed_source=getattr(self._feed, "last_source", None),
+                    paper_summary=self._paper.report(),
+                    market_status=market_status(now),
+                ),
+            )
+        except Exception as exc:
+            log.warning("live state write error: %s", exc)
+
     def _maybe_settle(self, now: dt.datetime) -> None:
         if not _settle_eligible(now):
             return
@@ -323,6 +318,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="SQLite path for paper trades (default: paper.sqlite)")
     p.add_argument("--paper-cash", dest="paper_cash", type=float, default=1000.0,
                    help="Starting virtual cash for paper trading (default: 1000)")
+    p.add_argument("--live-state", dest="live_state", default="live_state.json",
+                   help="Path for dashboard live_state.json (default: live_state.json)")
     p.add_argument("--settle",   metavar="YYYY-MM-DD",
                    help="Manually settle a specific session date and exit")
     p.add_argument("--max-loss", dest="max_loss", type=float, default=0.0,
@@ -358,6 +355,7 @@ if __name__ == "__main__":
         risk_cfg=risk_cfg,
         paper_db=args.paper_db,
         paper_cfg=PaperConfig(starting_cash=args.paper_cash),
+        live_state_path=args.live_state,
     )
 
     if args.report:

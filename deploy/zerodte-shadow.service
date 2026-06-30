@@ -21,6 +21,7 @@ EnvironmentFile=/etc/zerodte/zerodte.env
 ExecStart=/opt/zerodte/venv/bin/python /opt/zerodte/shadow_runner.py \
     --db /var/lib/zerodte/shadow.db \
     --paper-db /var/lib/zerodte/paper.sqlite \
+    --live-state /var/lib/zerodte/live_state.json \
     --interval 60
 
 # Auto-restart on crash; the loop self-handles market hours, so this only

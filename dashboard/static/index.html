@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>0DTE Pipeline</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="header">
+    <h1>0DTE Pipeline</h1>
+    <p class="subtitle">Read-only observability</p>
+  </header>
+
+  <div id="auth-gate" class="auth-gate hidden">
+    <label for="token-input">Dashboard token</label>
+    <input id="token-input" type="password" placeholder="Paste DASHBOARD_TOKEN" autocomplete="off">
+    <button id="token-save" type="button">Connect</button>
+  </div>
+
+  <div id="app" class="hidden">
+    <section id="market-banner" class="market-banner closed" aria-live="polite">
+      <div class="market-status-row">
+        <span class="market-dot" id="market-dot"></span>
+        <span id="market-label">Market is Closed</span>
+      </div>
+      <div id="market-countdown" class="market-countdown">—</div>
+      <div id="market-subtitle" class="market-subtitle">—</div>
+    </section>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="now" role="tab">Now</button>
+      <button class="tab" data-tab="inputs" role="tab">Inputs</button>
+      <button class="tab" data-tab="why" role="tab">Why</button>
+      <button class="tab" data-tab="history" role="tab">History</button>
+      <button class="tab" data-tab="stats" role="tab">Stats</button>
+    </nav>
+
+    <main>
+      <section id="panel-now" class="panel active" role="tabpanel"></section>
+      <section id="panel-inputs" class="panel" role="tabpanel"></section>
+      <section id="panel-why" class="panel" role="tabpanel"></section>
+      <section id="panel-history" class="panel" role="tabpanel"></section>
+      <section id="panel-stats" class="panel" role="tabpanel"></section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
