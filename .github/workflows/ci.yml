@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Unit tests
+        run: python -m pytest tests/ -v
+
+      - name: Engine smoke test (synthetic chain, no API key)
+        run: python spy0dte.py
+
+      - name: MC smoke test
+        run: python mc.py
+
+      - name: Journal smoke test
+        run: python journal.py
+
+      - name: Feed adapters import smoke (deployed entry points, no creds)
+        run: |
+          python -c "import shadow_runner, composite_feed, tradier_feed, tastytrade_feed, massive_feed, yahoo_feed; print('feed modules import OK')"
+          if env -u MASSIVE_API_KEY -u TRADIER_ACCESS_TOKEN -u TASTYTRADE_CLIENT_SECRET -u TASTYTRADE_REFRESH_TOKEN \
+               python -c "import composite_feed; composite_feed.build_default_feed()"; then
+            echo "ERROR: build_default_feed should raise with no creds"; exit 1
+          else
+            echo "build_default_feed raises cleanly with no creds"
+          fi
