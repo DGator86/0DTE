@@ -1,4 +1,8 @@
 __pycache__/
 *.pyc
 *.sqlite
+*.db
+tickets.jsonl
 .env
+# real secrets file — only the .example template is tracked
+zerodte.env
