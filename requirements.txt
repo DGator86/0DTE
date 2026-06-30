@@ -4,4 +4,7 @@ pandas
 # Optional: enables the Tastytrade chain fallback (composite_feed/tastytrade_feed).
 # Safe to keep — it is lazy-imported and only activates when TASTYTRADE_* creds
 # are set. Yahoo backstop + Tradier/Massive feeds need nothing beyond the above.
-tastytrade
+# Pinned to the 12.x line: the SDK has changed auth across majors (v9 password ->
+# v10+ OAuth2), so an unpinned bump could silently break the live feed. The
+# adapter is verified against this range; widen deliberately, not by accident.
+tastytrade>=12.4,<13
