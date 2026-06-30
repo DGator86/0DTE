@@ -30,7 +30,9 @@ echo "== zerodte ops: ${CMD} ${ARG:+(arg: $ARG)} =="
 
 case "$CMD" in
   status)
-    systemctl status "$SVC" --no-pager -l | head -60
+    # `systemctl status` exits 3 for an inactive unit — that's informational
+    # here, not a failure, so don't let it fail the job.
+    systemctl status "$SVC" --no-pager -l | head -60 || true
     ;;
 
   logs)
@@ -56,7 +58,7 @@ case "$CMD" in
   restart)
     systemctl restart "$SVC"
     sleep 2
-    systemctl status "$SVC" --no-pager | head -20
+    systemctl status "$SVC" --no-pager | head -20 || true
     ;;
 
   settle)
