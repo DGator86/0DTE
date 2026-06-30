@@ -26,13 +26,24 @@ ARG="${ARG:-}"
 # Run a command as the unprivileged service user (owns the journal DB).
 as_svc() { sudo -u "$RUN_USER" "$@"; }
 
+# Print the service status, tolerating ONLY the inactive-unit case. `systemctl
+# status` exits 0 when active and 3 when inactive/dead (both informational here);
+# any other code (e.g. 4 = no such unit) is a real error and must fail the job.
+show_status() {
+    local lines="${1:-60}" out rc=0
+    out="$(systemctl status "$SVC" --no-pager -l 2>&1)" || rc=$?
+    printf '%s\n' "$out" | head -n "$lines"
+    case "$rc" in
+        0|3) return 0 ;;
+        *) echo "systemctl status: unexpected exit $rc" >&2; return "$rc" ;;
+    esac
+}
+
 echo "== zerodte ops: ${CMD} ${ARG:+(arg: $ARG)} =="
 
 case "$CMD" in
   status)
-    # `systemctl status` exits 3 for an inactive unit — that's informational
-    # here, not a failure, so don't let it fail the job.
-    systemctl status "$SVC" --no-pager -l | head -60 || true
+    show_status 60
     ;;
 
   logs)
@@ -58,7 +69,7 @@ case "$CMD" in
   restart)
     systemctl restart "$SVC"
     sleep 2
-    systemctl status "$SVC" --no-pager | head -20 || true
+    show_status 20
     ;;
 
   settle)
