@@ -1,0 +1,84 @@
+name: VPS Ops
+
+# Operational access to the zerodte-shadow service on the VPS, run through
+# auditable GitHub Action runs. It reuses the same SSH secrets as the deploy
+# workflow (VPS_HOST / VPS_SSH_KEY / ...), so the key lives only in GitHub —
+# nobody needs it locally. Trigger from the Actions tab (or via API) and read
+# the result in the job log.
+#
+# Commands (see deploy/remote-ops.sh): status, logs, report,
+# diagnose-tradier, diagnose-tastytrade, restart, settle.
+# Everything is read/observe except `restart` and `settle`; nothing places an
+# order (the service is shadow-mode only).
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Operation to run on the VPS"
+        required: true
+        default: status
+        type: choice
+        options:
+          - status
+          - logs
+          - report
+          - diagnose-tradier
+          - diagnose-tastytrade
+          - restart
+          - settle
+      arg:
+        description: "Optional arg: log line count, a symbol for diagnose, or YYYY-MM-DD for settle"
+        required: false
+        default: ""
+
+concurrency:
+  group: vps-ops
+  cancel-in-progress: false
+
+jobs:
+  ops:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$VPS_HOST" ] || [ -z "$VPS_SSH_KEY" ]; then
+            echo "::error::VPS_HOST and VPS_SSH_KEY secrets must be set." >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          port="${VPS_SSH_PORT:-22}"
+          if [ -n "$VPS_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::VPS_KNOWN_HOSTS not set — scanning host key (trust-on-first-use)."
+            ssh-keyscan -p "$port" -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Run op over SSH
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
+          COMMAND: ${{ github.event.inputs.command }}
+          ARG: ${{ github.event.inputs.arg }}
+        run: |
+          user="${VPS_USER:-root}"
+          port="${VPS_SSH_PORT:-22}"
+          echo "Running '$COMMAND' on $user@$VPS_HOST:$port"
+          ssh -i ~/.ssh/id_deploy -p "$port" \
+              -o ConnectTimeout=20 -o ServerAliveInterval=15 \
+              "$user@$VPS_HOST" \
+              "COMMAND='$COMMAND' ARG='$ARG' bash -s" < deploy/remote-ops.sh
