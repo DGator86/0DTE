@@ -23,6 +23,7 @@ on:
           - status
           - logs
           - report
+          - paper-report
           - diagnose-tradier
           - diagnose-tastytrade
           - restart

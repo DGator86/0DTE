@@ -35,6 +35,7 @@ from journal import Journal
 from unified_loop import UnifiedOrchestrator
 from notifier import Notifier, Ticket
 from risk_manager import RiskConfig, RiskManager
+from paper_broker import PaperBroker, PaperConfig
 from typing import Optional
 
 ET = ZoneInfo("America/New_York")
@@ -113,6 +114,8 @@ class ShadowRunner:
         vvix: float = 92.0,
         vvix_baseline: float = 95.0,
         risk_cfg: Optional[RiskConfig] = None,
+        paper_db: Optional[str] = None,
+        paper_cfg: "Optional[PaperConfig]" = None,
     ) -> None:
         self.symbol = symbol
         self.interval_s = interval_s
@@ -136,7 +139,17 @@ class ShadowRunner:
         self._notifier = Notifier()
         self._settled: set[str] = set()
 
+        # In-house paper trading: auto-executes TRADE tickets on SIMULATED fills
+        # over the live chain, with stop-loss / target / trailing / EOD exits.
+        # No real orders are ever placed.
+        self._paper = PaperBroker(
+            db_path=paper_db or "paper.sqlite",
+            cfg=paper_cfg, notifier=self._notifier, symbol=symbol,
+        )
+
         log.info("Initialized. DB=%s symbol=%s interval=%ds", db_path, symbol, interval_s)
+        log.info("Paper account: $%.0f start (simulated fills, no real orders).",
+                 self._paper.cfg.starting_cash)
         if self._risk:
             cfg = risk_cfg
             log.info(
@@ -260,6 +273,14 @@ class ShadowRunner:
             ticket = Ticket.from_tick_result(result, self.symbol)
             self._notifier.send(ticket)
 
+        # Drive the paper broker: mark open positions and auto-execute exits/
+        # entries on simulated fills. Never raises into the tick loop.
+        try:
+            for ev in self._paper.on_tick(now, result):
+                log.info("  %s  (paper equity=$%.2f)", ev, self._paper.cash)
+        except Exception as exc:
+            log.warning("paper broker error: %s", exc)
+
     def _maybe_settle(self, now: dt.datetime) -> None:
         if not _settle_eligible(now):
             return
@@ -296,6 +317,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vvix-baseline", dest="vvix_baseline", type=float, default=95.0)
     p.add_argument("--report",   action="store_true",
                    help="Print calibration report from the journal DB and exit")
+    p.add_argument("--paper-report", dest="paper_report", action="store_true",
+                   help="Print the paper-trading report (P&L, win rate, exits) and exit")
+    p.add_argument("--paper-db", dest="paper_db", default="paper.sqlite",
+                   help="SQLite path for paper trades (default: paper.sqlite)")
+    p.add_argument("--paper-cash", dest="paper_cash", type=float, default=1000.0,
+                   help="Starting virtual cash for paper trading (default: 1000)")
     p.add_argument("--settle",   metavar="YYYY-MM-DD",
                    help="Manually settle a specific session date and exit")
     p.add_argument("--max-loss", dest="max_loss", type=float, default=0.0,
@@ -329,10 +356,14 @@ if __name__ == "__main__":
         vvix=args.vvix,
         vvix_baseline=args.vvix_baseline,
         risk_cfg=risk_cfg,
+        paper_db=args.paper_db,
+        paper_cfg=PaperConfig(starting_cash=args.paper_cash),
     )
 
     if args.report:
         runner.report()
+    elif args.paper_report:
+        runner._paper.print_report()
     elif args.settle:
         runner.settle_date(args.settle)
     else:
