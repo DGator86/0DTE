@@ -17,8 +17,9 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
-if [[ -z "${MASSIVE_API_KEY:-}" ]]; then
-  echo "[0DTE] MASSIVE_API_KEY not set — running synthetic demo"
+if [[ -z "${MASSIVE_API_KEY:-}" && -z "${MASSIVE_OAUTH_ACCESS_TOKEN:-}" \
+      && ( -z "${MASSIVE_OAUTH_CLIENT_ID:-}" || -z "${MASSIVE_OAUTH_CLIENT_SECRET:-}" ) ]]; then
+  echo "[0DTE] No Massive credentials set — running synthetic demo"
   "$PY" spy0dte.py
 else
   "$PY" massive_feed.py SPY
