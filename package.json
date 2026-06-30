@@ -1,0 +1,5 @@
+{
+  "name": "zerodte-dashboard",
+  "private": true,
+  "description": "Read-only 0DTE pipeline observability UI (Vercel frontend + VPS API proxy)"
+}

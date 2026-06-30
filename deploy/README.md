@@ -116,6 +116,17 @@ sudo systemctl status zerodte-dashboard
 sudo journalctl -u zerodte-dashboard -f
 ```
 
+### Host the UI on Vercel (VPS stays the data source)
+
+Serve the dashboard from **Vercel** while the API reads live data from your VPS.
+See [`deploy/VERCEL.md`](VERCEL.md):
+
+1. Expose the VPS dashboard API via Cloudflare Tunnel → set `VPS_API_URL` on Vercel
+2. Set `DASHBOARD_TOKEN` on Vercel (same value as `/etc/zerodte/zerodte.env`)
+3. Deploy the repo to Vercel — open `https://your-project.vercel.app` on phone/PC
+
+The token stays on Vercel server-side; visitors do not need to paste it.
+
 ---
 
 ## Operating it

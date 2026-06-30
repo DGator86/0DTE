@@ -354,7 +354,7 @@
     });
   }
 
-  function init() {
+  async function init() {
     setupTabs();
     document.getElementById("token-save").addEventListener("click", () => {
       const v = document.getElementById("token-input").value.trim();
@@ -363,6 +363,17 @@
         boot();
       }
     });
+
+    // Vercel proxy: /api/health works without a client token (token is server-side).
+    try {
+      const probe = await fetch("/api/health");
+      if (probe.ok) {
+        boot();
+        return;
+      }
+    } catch (_) {
+      /* offline or misconfigured */
+    }
 
     if (!getToken()) {
       showAuth();
