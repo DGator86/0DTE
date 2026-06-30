@@ -26,7 +26,7 @@ echo "=== python venv ==="
 cd "$TARGET"
 python3 -m venv venv
 venv/bin/pip install -q -r requirements.txt
-venv/bin/python -m py_compile spy0dte.py mc.py journal.py massive_feed.py tastytrade_auth.py
+venv/bin/python -m py_compile spy0dte.py mc.py journal.py massive_feed.py tastytrade_auth.py tradier_client.py tradier_feed.py
 
 echo "=== verify ==="
 git -C "$TARGET" remote -v

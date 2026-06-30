@@ -17,9 +17,13 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
-if [[ -z "${MASSIVE_API_KEY:-}" ]]; then
-  echo "[0DTE] MASSIVE_API_KEY not set — running synthetic demo"
-  "$PY" spy0dte.py
-else
+if [[ -n "${MASSIVE_API_KEY:-}" ]]; then
+  echo "[0DTE] Massive feed"
   "$PY" massive_feed.py SPY
+elif [[ -n "${TRADIER_API_TOKEN:-}" ]]; then
+  echo "[0DTE] Tradier feed"
+  "$PY" tradier_feed.py SPY
+else
+  echo "[0DTE] No market data credentials — running synthetic demo"
+  "$PY" spy0dte.py
 fi
