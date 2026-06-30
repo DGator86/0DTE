@@ -56,7 +56,13 @@ jobs:
           fi
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_deploy
+          # Accept the key either base64-encoded (a single copy-safe line — no
+          # multi-line paste to mangle) or as a raw PEM block.
+          if printf '%s' "$VPS_SSH_KEY" | base64 -d 2>/dev/null | grep -q 'PRIVATE KEY'; then
+            printf '%s' "$VPS_SSH_KEY" | base64 -d > ~/.ssh/id_deploy
+          else
+            printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_deploy
+          fi
           chmod 600 ~/.ssh/id_deploy
           port="${VPS_SSH_PORT:-22}"
           if [ -n "$VPS_KNOWN_HOSTS" ]; then
