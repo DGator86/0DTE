@@ -77,9 +77,35 @@ case "$CMD" in
     as_svc "$PY" "$APP/shadow_runner.py" --settle "$ARG" --db "$DB"
     ;;
 
+  test-notify)
+    # Send a test push through the SAME ntfy path real trade signals use, reading
+    # the topic from the 0600 env file (as root). The topic is never printed —
+    # only the HTTP result — so it stays private.
+    set -a; . "$ENVF"; set +a
+    [ -n "${NOTIFY_NTFY_TOPIC:-}" ] || { echo "NOTIFY_NTFY_TOPIC not set in $ENVF"; exit 2; }
+    NOTIFY_NTFY_TOPIC="$NOTIFY_NTFY_TOPIC" NOTIFY_NTFY_TOKEN="${NOTIFY_NTFY_TOKEN:-}" "$PY" - <<'PYEOF'
+import os, urllib.request
+topic = os.environ["NOTIFY_NTFY_TOPIC"]
+token = os.environ.get("NOTIFY_NTFY_TOKEN", "")
+req = urllib.request.Request(
+    f"https://ntfy.sh/{topic}",
+    data="If you can read this on your phone, your zerodte trade alerts are wired up correctly.".encode(),
+    headers={"Title": "zerodte test alert", "Priority": "high", "Tags": "white_check_mark"},
+)
+if token:
+    req.add_header("Authorization", f"Bearer {token}")
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        print(f"ntfy POST HTTP {r.status} — check your phone (topic hidden)")
+        raise SystemExit(0 if r.status == 200 else 1)
+except urllib.error.HTTPError as e:
+    print(f"ntfy POST failed: HTTP {e.code}"); raise SystemExit(1)
+PYEOF
+    ;;
+
   *)
     echo "Unknown command: $CMD" >&2
-    echo "Valid: status | logs | report | diagnose-tradier | diagnose-tastytrade | restart | settle" >&2
+    echo "Valid: status | logs | report | diagnose-tradier | diagnose-tastytrade | restart | settle | test-notify" >&2
     exit 2
     ;;
 esac

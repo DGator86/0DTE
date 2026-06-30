@@ -27,6 +27,7 @@ on:
           - diagnose-tastytrade
           - restart
           - settle
+          - test-notify
       arg:
         description: "Optional arg: log line count, a symbol for diagnose, or YYYY-MM-DD for settle"
         required: false
