@@ -16,8 +16,12 @@ EnvironmentFile=/etc/zerodte/zerodte.env
 
 # The journal DB persists under /var/lib/zerodte so it survives restarts and
 # code updates — it is the entire measurement thesis.
+# The paper DB lives under /var/lib/zerodte too — it is the only writable path
+# (ProtectSystem=strict makes /opt/zerodte read-only at runtime).
 ExecStart=/opt/zerodte/venv/bin/python /opt/zerodte/shadow_runner.py \
-    --db /var/lib/zerodte/shadow.db --interval 60
+    --db /var/lib/zerodte/shadow.db \
+    --paper-db /var/lib/zerodte/paper.sqlite \
+    --interval 60
 
 # Auto-restart on crash; the loop self-handles market hours, so this only
 # fires on real faults (network, API, bug). RestartSec avoids hot-looping.

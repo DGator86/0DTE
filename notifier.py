@@ -184,6 +184,29 @@ class Notifier:
         self._email(ticket, text)
         self._ntfy(ticket, text)
 
+    def send_text(self, title: str, body: str, tags: str = "bell") -> None:
+        """Push a plain-text notification (used for paper entries/exits). Goes to
+        stdout always and to ntfy when NOTIFY_NTFY_TOPIC is set."""
+        print(f"{title}: {body}", flush=True)
+        topic = os.environ.get("NOTIFY_NTFY_TOPIC", "")
+        if not topic:
+            return
+        token = os.environ.get("NOTIFY_NTFY_TOKEN", "")
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{topic}", data=body.encode("utf-8"), method="POST")
+        req.add_header("Title", title)
+        req.add_header("Priority", "default")
+        req.add_header("Tags", tags)
+        req.add_header("Content-Type", "text/plain")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+                if resp.status >= 400:
+                    log.warning("notifier: ntfy returned HTTP %d", resp.status)
+        except Exception as exc:
+            log.warning("notifier: ntfy text backend failed: %s", exc)
+
     # -- backends ------------------------------------------------------------
 
     @staticmethod

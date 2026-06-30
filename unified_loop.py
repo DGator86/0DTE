@@ -71,6 +71,7 @@ class TickResult:
     decision: Optional[TradeDecision]
     final_size_mult: float      # intent.size_mult, 0 if regime stand_down
     vetoes: list
+    snapshot: Optional[TickSnapshot] = None   # live market data for paper marking
 
 
 # --------------------------------------------------------------------------- #
@@ -144,7 +145,7 @@ class UnifiedOrchestrator:
             result = TickResult(
                 ts=now, regime=regime_state, intent=intent,
                 decision=None, final_size_mult=0.0,
-                vetoes=regime_state.vetoes,
+                vetoes=regime_state.vetoes, snapshot=snap,
             )
             if self.journal:
                 self.journal.log(_no_trade_row(snap.market, intent, regime_state,
@@ -189,7 +190,7 @@ class UnifiedOrchestrator:
             ts=now, regime=regime_state, intent=intent,
             decision=decision,
             final_size_mult=round(final_size, 2),
-            vetoes=regime_state.vetoes,
+            vetoes=regime_state.vetoes, snapshot=snap,
         )
 
     def run_replay(self, timestamps: Sequence[dt.datetime]) -> list[TickResult]:

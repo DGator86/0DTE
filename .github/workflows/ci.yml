@@ -34,7 +34,7 @@ jobs:
 
       - name: Feed adapters import smoke (deployed entry points, no creds)
         run: |
-          python -c "import shadow_runner, composite_feed, tradier_feed, tastytrade_feed, massive_feed, yahoo_feed; print('feed modules import OK')"
+          python -c "import shadow_runner, composite_feed, tradier_feed, tastytrade_feed, massive_feed, yahoo_feed, paper_broker; print('feed modules import OK')"
           if env -u MASSIVE_API_KEY -u TRADIER_ACCESS_TOKEN -u TASTYTRADE_CLIENT_SECRET -u TASTYTRADE_REFRESH_TOKEN \
                python -c "import composite_feed; composite_feed.build_default_feed()"; then
             echo "ERROR: build_default_feed should raise with no creds"; exit 1

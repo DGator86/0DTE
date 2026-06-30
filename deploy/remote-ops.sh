@@ -16,6 +16,7 @@ set -euo pipefail
 SVC=zerodte-shadow
 APP=/opt/zerodte
 DB=/var/lib/zerodte/shadow.db
+PAPER_DB=/var/lib/zerodte/paper.sqlite
 ENVF=/etc/zerodte/zerodte.env
 PY="$APP/venv/bin/python"
 RUN_USER=zerodte
@@ -54,6 +55,11 @@ case "$CMD" in
   report)
     # Calibration summary from the journal (gate effectiveness + correlations).
     as_svc "$PY" "$APP/shadow_runner.py" --report --db "$DB"
+    ;;
+
+  paper-report)
+    # Paper-trading P&L: equity, win rate, total P&L, exits breakdown.
+    as_svc "$PY" "$APP/shadow_runner.py" --paper-report --paper-db "$PAPER_DB"
     ;;
 
   diagnose-tradier)
@@ -105,7 +111,7 @@ PYEOF
 
   *)
     echo "Unknown command: $CMD" >&2
-    echo "Valid: status | logs | report | diagnose-tradier | diagnose-tastytrade | restart | settle | test-notify" >&2
+    echo "Valid: status | logs | report | paper-report | diagnose-tradier | diagnose-tastytrade | restart | settle | test-notify" >&2
     exit 2
     ;;
 esac
