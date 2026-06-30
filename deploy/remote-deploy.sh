@@ -90,4 +90,18 @@ systemctl enable "$SVC" >/dev/null 2>&1 || true
 systemctl restart "$SVC"
 sleep 2
 systemctl --no-pager --lines=0 status "$SVC" || true
+
+DASHBOARD_SVC=zerodte-dashboard
+if grep -q '^DASHBOARD_TOKEN=.' "$ENV_FILE" 2>/dev/null; then
+    log "Dashboard service (DASHBOARD_TOKEN set)"
+    install -m 644 "$APP_DIR/deploy/$DASHBOARD_SVC.service" "/etc/systemd/system/$DASHBOARD_SVC.service"
+    systemctl daemon-reload
+    systemctl enable "$DASHBOARD_SVC" >/dev/null 2>&1 || true
+    systemctl restart "$DASHBOARD_SVC"
+    sleep 1
+    systemctl --no-pager --lines=0 status "$DASHBOARD_SVC" || true
+else
+    log "Skipping dashboard (set DASHBOARD_TOKEN in $ENV_FILE to enable)"
+fi
+
 log "Deploy complete."

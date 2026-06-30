@@ -4,5 +4,6 @@ __pycache__/
 *.db
 tickets.jsonl
 .env
+public/
 # real secrets file — only the .example template is tracked
 zerodte.env

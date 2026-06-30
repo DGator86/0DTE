@@ -1,0 +1,35 @@
+[Unit]
+Description=0DTE observability dashboard (read-only)
+After=network-online.target zerodte-shadow.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zerodte
+Group=zerodte
+WorkingDirectory=/opt/zerodte
+EnvironmentFile=/etc/zerodte/zerodte.env
+
+ExecStart=/opt/zerodte/venv/bin/python -m dashboard.server \
+    --db /var/lib/zerodte/shadow.db \
+    --paper-db /var/lib/zerodte/paper.sqlite \
+    --live-state /var/lib/zerodte/live_state.json \
+    --host 127.0.0.1 \
+    --port 8765
+
+Restart=on-failure
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/zerodte
+ReadWritePaths=/var/lib/zerodte
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-dashboard
+
+[Install]
+WantedBy=multi-user.target

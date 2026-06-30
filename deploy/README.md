@@ -90,6 +90,43 @@ Install the **ntfy** app (iOS/Android), and subscribe to the exact string you
 set as `NOTIFY_NTFY_TOPIC`. Every `TRADE` signal arrives as a push with the
 structure, strikes, credit, and size — that's your cue to place the trade.
 
+## 7. Observability dashboard (read-only)
+
+A mobile-friendly web UI shows what the pipeline is doing, what market data it
+is evaluating, and why each decision was made. **It cannot place trades or
+change configuration.**
+
+1. Add a long random `DASHBOARD_TOKEN` to `/etc/zerodte/zerodte.env`
+2. Redeploy (or `sudo systemctl enable --now zerodte-dashboard`)
+3. Expose locally-bound port 8765 via **Cloudflare Tunnel** or Tailscale:
+
+```bash
+# Example: Cloudflare Tunnel (install cloudflared first)
+cloudflared tunnel --url http://127.0.0.1:8765
+```
+
+Open the tunnel URL on your phone or PC. On first visit, paste your
+`DASHBOARD_TOKEN` (or bookmark `https://<tunnel>/?token=<token>` once).
+
+The banner shows **Market Open** / **Market is Closed** with a live countdown
+to the next open or close, using the NYSE calendar (holidays and early closes).
+
+```bash
+sudo systemctl status zerodte-dashboard
+sudo journalctl -u zerodte-dashboard -f
+```
+
+### Host the UI on Vercel (VPS stays the data source)
+
+Serve the dashboard from **Vercel** while the API reads live data from your VPS.
+See [`deploy/VERCEL.md`](VERCEL.md):
+
+1. Expose the VPS dashboard API via Cloudflare Tunnel → set `VPS_API_URL` on Vercel
+2. Set `DASHBOARD_TOKEN` on Vercel (same value as `/etc/zerodte/zerodte.env`)
+3. Deploy the repo to Vercel — open `https://your-project.vercel.app` on phone/PC
+
+The token stays on Vercel server-side; visitors do not need to paste it.
+
 ---
 
 ## Operating it

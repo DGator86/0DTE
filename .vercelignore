@@ -1,0 +1,11 @@
+tests/
+deploy/
+*.py
+!api/
+__pycache__/
+venv/
+.git/
+*.sqlite
+*.db
+paper.sqlite
+shadow.db
