@@ -85,7 +85,19 @@ jobs:
           user="${VPS_USER:-root}"
           port="${VPS_SSH_PORT:-22}"
           echo "Running '$COMMAND' on $user@$VPS_HOST:$port"
-          ssh -i ~/.ssh/id_deploy -p "$port" \
-              -o ConnectTimeout=20 -o ServerAliveInterval=15 \
-              "$user@$VPS_HOST" \
-              "COMMAND='$COMMAND' ARG='$ARG' bash -s" < deploy/remote-ops.sh
+          # Retry only transient SSH connect failures (exit 255). Any other code
+          # is the remote command's own exit, passed through unretried — so a
+          # failed test-notify/diagnose isn't re-run.
+          n=0
+          while :; do
+            ssh -i ~/.ssh/id_deploy -p "$port" \
+                -o ConnectTimeout=20 -o ServerAliveInterval=15 \
+                "$user@$VPS_HOST" \
+                "COMMAND='$COMMAND' ARG='$ARG' bash -s" < deploy/remote-ops.sh && break
+            rc=$?
+            [ "$rc" -ne 255 ] && exit "$rc"
+            n=$((n + 1))
+            [ "$n" -ge 3 ] && { echo "::error::SSH connect failed after $n attempts"; exit 1; }
+            echo "::warning::SSH connect attempt $n failed (transient); retrying in $((n * 15))s"
+            sleep $((n * 15))
+          done

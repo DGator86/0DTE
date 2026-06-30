@@ -76,7 +76,19 @@ jobs:
           user="${VPS_USER:-root}"
           port="${VPS_SSH_PORT:-22}"
           echo "Deploying ref '$DEPLOY_REF' to $user@$VPS_HOST:$port"
-          ssh -i ~/.ssh/id_deploy -p "$port" \
-              -o ConnectTimeout=20 -o ServerAliveInterval=15 \
-              "$user@$VPS_HOST" \
-              "DEPLOY_REF='$DEPLOY_REF' bash -s" < deploy/remote-deploy.sh
+          # Retry only transient SSH connect failures (Hostinger rate-limits new
+          # SSH connections). ssh exits 255 for connection/auth errors; any other
+          # code is remote-deploy.sh's own exit and is passed through unretried.
+          n=0
+          while :; do
+            ssh -i ~/.ssh/id_deploy -p "$port" \
+                -o ConnectTimeout=20 -o ServerAliveInterval=15 \
+                "$user@$VPS_HOST" \
+                "DEPLOY_REF='$DEPLOY_REF' bash -s" < deploy/remote-deploy.sh && break
+            rc=$?
+            [ "$rc" -ne 255 ] && exit "$rc"
+            n=$((n + 1))
+            [ "$n" -ge 3 ] && { echo "::error::SSH connect failed after $n attempts"; exit 1; }
+            echo "::warning::SSH connect attempt $n failed (transient); retrying in $((n * 15))s"
+            sleep $((n * 15))
+          done
