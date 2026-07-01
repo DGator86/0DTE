@@ -279,7 +279,26 @@ class PaperBroker:
             pass
 
     # -- reporting ----------------------------------------------------------
-    def report(self) -> dict:
+    def _open_position_view(self, pos: PaperPosition, now: dt.datetime) -> dict:
+        unrealized_dollars = pos.last_pnl_ps * self.cfg.multiplier * pos.contracts
+        return {
+            "id": pos.id,
+            "family": pos.family,
+            "strikes": pos.strikes_str(),
+            "contracts": pos.contracts,
+            "opened_at": pos.opened_at.isoformat(),
+            "hold_min": round((now - pos.opened_at).total_seconds() / 60.0, 1),
+            "entry_credit": round(pos.entry_credit, 4),
+            "max_profit_ps": round(pos.max_profit_ps, 4),
+            "max_loss_ps": round(pos.max_loss_ps, 4),
+            "unrealized_pnl_ps": round(pos.last_pnl_ps, 4),
+            "unrealized_pnl_dollars": round(unrealized_dollars, 2),
+            "pct_of_max_profit": (round(pos.last_pnl_ps / pos.max_profit_ps, 4)
+                                   if pos.max_profit_ps else None),
+        }
+
+    def report(self, now: Optional[dt.datetime] = None) -> dict:
+        now = now or dt.datetime.now(ET)
         rows = list(self._db.execute(
             "SELECT pnl_dollars, exit_reason, equity_after FROM paper_trades ORDER BY closed_at"))
         n = len(rows)
@@ -303,10 +322,11 @@ class PaperBroker:
             "total_pnl": round(sum(pnls), 2),
             "avg_win": round(gross_win / len(wins), 2) if wins else 0.0,
             "avg_loss": round(-gross_loss / len(losses), 2) if losses else 0.0,
-            "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else float("inf"),
+            "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
             "max_drawdown": round(max_dd, 2),
             "equity": round(equity_curve[-1], 2),
             "open_positions": len(self.open_positions),
+            "open": [self._open_position_view(p, now) for p in self.open_positions],
             "by_exit_reason": by_reason,
         }
 

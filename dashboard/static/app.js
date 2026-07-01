@@ -365,6 +365,40 @@
     $("tech-metrics").innerHTML = cards.join("");
   }
 
+  /* ---------------- open position(s) ---------------- */
+  function renderOpenPositions(livePaper) {
+    const panel = $("open-positions-panel");
+    const open = (livePaper && livePaper.open) || [];
+    if (!open.length) {
+      panel.classList.add("hidden");
+      return;
+    }
+    panel.classList.remove("hidden");
+    $("open-positions-count").textContent = open.length > 1 ? `${open.length} open` : "1 open";
+    $("open-positions-list").innerHTML = open.map((p) => {
+      const pnl = num(p.unrealized_pnl_dollars);
+      const pnlCls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
+      const pctMax = p.pct_of_max_profit != null ? pct(p.pct_of_max_profit) : "—";
+      return `<div class="op-card">
+        <div class="op-head">
+          <div>
+            <div class="op-strikes">${esc(p.strikes)}</div>
+            <div class="op-family">${esc(p.family)} · x${esc(p.contracts)}</div>
+          </div>
+          <div class="op-pnl ${pnlCls}">${pnl >= 0 ? "+" : ""}${money(pnl, 2)}</div>
+        </div>
+        <div class="op-metrics">
+          <div><span class="k">Entry credit</span><span class="v">${fmt(p.entry_credit, 2)}</span></div>
+          <div><span class="k">Held</span><span class="v">${fmt(p.hold_min, 0)}m</span></div>
+          <div><span class="k">% of max profit</span><span class="v ${pnlCls}">${pctMax}</span></div>
+          <div><span class="k">Max profit</span><span class="v pos">${fmt(p.max_profit_ps, 2)}</span></div>
+          <div><span class="k">Max loss</span><span class="v neg">${fmt(p.max_loss_ps, 2)}</span></div>
+          <div><span class="k">Opened</span><span class="v">${etTime(p.opened_at)}</span></div>
+        </div>
+      </div>`;
+    }).join("");
+  }
+
   /* ---------------- paper account ---------------- */
   function renderPaper(paper) {
     if (!paper || paper.trades == null) { $("paper-metrics").innerHTML = '<div class="metric"><span class="k">status</span><span class="v sm">no data</span></div>'; return; }
@@ -710,6 +744,7 @@
       renderMarketPill(market);
       renderTopbar(live, market, ticks);
       renderSignal(live);
+      renderOpenPositions(live.paper);
       renderPlaybook(candidate, live);
       renderRegime(live);
       renderReason(live, candidate);
