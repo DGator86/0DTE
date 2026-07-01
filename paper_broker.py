@@ -96,11 +96,21 @@ class PaperBroker:
         self.cfg = cfg or PaperConfig()
         self.symbol = symbol
         self._notifier = notifier
-        self.cash = self.cfg.starting_cash          # realized equity (starting + closed P&L)
         self.open_positions: list[PaperPosition] = []
         self._db = sqlite3.connect(db_path)
         self._init_db()
+        # Realized equity (starting + closed P&L). Open positions are in-memory
+        # only and cannot survive a process restart -- but closed-trade history
+        # is already persisted, so resume from the last recorded equity instead
+        # of silently resetting the account to starting_cash on every restart.
+        self.cash = self._restore_equity()
         self._day_realized: dict[str, float] = {}   # ET date -> realized $ that day
+
+    def _restore_equity(self) -> float:
+        row = self._db.execute(
+            "SELECT equity_after FROM paper_trades ORDER BY closed_at DESC LIMIT 1"
+        ).fetchone()
+        return row[0] if row and row[0] is not None else self.cfg.starting_cash
 
     # -- persistence --------------------------------------------------------
     def _init_db(self) -> None:
