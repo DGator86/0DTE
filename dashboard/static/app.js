@@ -155,8 +155,13 @@
     const w = live.why || {};
     $("signal-time").textContent = live.ts ? etTime(live.ts) + " ET" : "—";
 
+    const feedDown = live.status === "feed_not_ready" || live.status === "feed_error";
+    const idle = !live.ts || (live.status && live.status !== "live");
     let cls = "wait", word = "WAIT", sub = "";
-    if (!live.ts) {
+    if (feedDown) {
+      cls = "stop"; word = "NO FEED";
+      sub = "feed not ready — check data source";
+    } else if (idle) {
       cls = "wait"; word = "STANDBY";
       sub = (live.market && live.market.is_open) ? "pipeline idle — awaiting tick" : "market closed — awaiting session";
     } else if (d.stand_down) {
@@ -248,8 +253,9 @@
   function renderReason(live, latest) {
     const d = live.doing || {}, w = live.why || {}, t = latest || {};
     let html = "";
-    if (!live.ts) {
-      $("reason").innerHTML = `<b>Standing by.</b> ${esc(live.note || "No live tick yet — the pipeline is idle.")}`;
+    if (!live.ts || (live.status && live.status !== "live")) {
+      const lead = (live.status === "feed_not_ready" || live.status === "feed_error") ? "No market feed." : "Standing by.";
+      $("reason").innerHTML = `<b>${lead}</b> ${esc(live.note || "No live tick yet — the pipeline is idle.")}`;
       return;
     }
     if (d.stand_down) {
@@ -621,11 +627,16 @@
     const host = $("signal-panel");
     let note = host.querySelector(".stale-note");
     let msg = "";
-    if (market && !market.is_open && live.ts) msg = "Market closed — last-tick snapshot.";
-    else if (live.ts) {
-      const age = (Date.now() - new Date(live.ts).getTime()) / 1000;
-      if (age > 180) msg = "Pipeline idle — last tick " + Math.floor(age / 60) + " min ago.";
-    } else if (live.note) msg = live.note;
+    const age = live.ts ? (Date.now() - new Date(live.ts).getTime()) / 1000 : Infinity;
+    if (age > 180) {
+      // No fresh heartbeat in >3 min — the pipeline process itself is likely down.
+      msg = live.ts
+        ? "Pipeline offline — no update in " + Math.floor(age / 60) + " min (check zerodte-shadow service)."
+        : "Pipeline offline — no data received yet (check zerodte-shadow service).";
+    } else if (live.status && live.status !== "live" && live.note) {
+      // Fresh heartbeat with a reason (feed down / market closed).
+      msg = live.note;
+    }
     if (msg) {
       if (!note) { note = document.createElement("div"); note.className = "stale-note"; host.insertBefore(note, host.firstChild.nextSibling); }
       note.textContent = msg;

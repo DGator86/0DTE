@@ -130,6 +130,8 @@ def serialize_tick_result(
 
     payload = {
         "ts": result.ts.isoformat(),
+        "status": "live",
+        "note": None,
         "market": market_status or {},
         "feed_source": feed_source,
         "chain_available": chain_available,
@@ -139,6 +141,35 @@ def serialize_tick_result(
         "paper": paper_summary or {},
     }
     return payload
+
+
+def heartbeat_state(
+    now,
+    *,
+    status: str,
+    note: str,
+    feed_source: Optional[str] = None,
+    paper_summary: Optional[dict] = None,
+    market_status: Optional[dict] = None,
+) -> dict:
+    """Build a live_state payload for a loop iteration that produced no tick.
+
+    Lets the dashboard tell "pipeline alive but idle/feed-down" (fresh ts +
+    status/note) apart from "pipeline crashed" (stale/absent file). Carries no
+    decision or market inputs — only liveness and the reason there is no data.
+    """
+    return {
+        "ts": now.isoformat(),
+        "status": status,          # "market_closed" | "feed_not_ready" | "feed_error"
+        "note": note,
+        "market": market_status or {},
+        "feed_source": feed_source,
+        "chain_available": False,
+        "doing": {},
+        "inputs": {},
+        "why": {},
+        "paper": paper_summary or {},
+    }
 
 
 def write_live_state(path: str, payload: dict) -> None:
