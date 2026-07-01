@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import tempfile
 from typing import Any, Optional
@@ -172,10 +173,30 @@ def heartbeat_state(
     }
 
 
+def _sanitize_non_finite(obj: Any) -> Any:
+    """Replace inf/-inf/nan floats with None.
+
+    json.dumps() writes these as bare Infinity/NaN tokens (not valid JSON) by
+    default, so a value like ev_per_risk from a division by a near-zero
+    max_loss can slip into live_state.json unnoticed on write. Starlette's
+    JSONResponse correctly rejects them on read (allow_nan=False), 500-ing
+    every /api/live request until the next tick happens to avoid the same
+    ratio. Scrub at the single point everything funnels through instead.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_non_finite(v) for v in obj]
+    return obj
+
+
 def write_live_state(path: str, payload: dict) -> None:
     """Atomically write live_state.json."""
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
+    payload = _sanitize_non_finite(payload)
     data = json.dumps(payload, indent=2, default=str)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".live_state_", suffix=".tmp")
     try:
