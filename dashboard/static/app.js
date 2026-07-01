@@ -646,7 +646,7 @@
   /* ---------------- refresh loop ---------------- */
   async function refresh() {
     try {
-      const [live, market, history, report, paper] = await Promise.all([
+      let [live, market, history, report, paper] = await Promise.all([
         api("/api/live"),
         api("/api/market-status"),
         api("/api/ticks?limit=200"),
@@ -673,6 +673,12 @@
       renderWhy(live);
       renderVol(live);
       renderTech(live);
+      // Before any trade has closed, /api/paper's equity is null (it's derived
+      // from the last CLOSED trade's balance in SQL); the live broker snapshot
+      // embedded in /api/live already has the correct starting/current equity.
+      if (paper.equity == null && live.paper && live.paper.equity != null) {
+        paper = { ...paper, equity: live.paper.equity };
+      }
       renderPaper(paper);
       renderEdge(report);
       renderTimeline(history);
