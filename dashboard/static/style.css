@@ -333,6 +333,53 @@ html, body {
   margin-bottom: 12px;
 }
 
+/* ---------------- Readiness checklist ---------------- */
+.readiness-badge {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+  letter-spacing: 0.06em;
+}
+.readiness-badge.ready { color: var(--green); background: rgba(46,199,133,0.12); border: 1px solid var(--green-dim); }
+.readiness-badge.not-ready { color: var(--amber); background: rgba(255,182,72,0.1); border: 1px solid var(--amber-dim); }
+
+.rc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.rc-row {
+  background: var(--panel);
+  padding: 10px 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.rc-icon {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 800;
+  margin-top: 1px;
+}
+.rc-icon.ok { background: rgba(46,199,133,0.16); color: var(--green); }
+.rc-icon.no { background: rgba(255,182,72,0.14); color: var(--amber); }
+.rc-body { min-width: 0; }
+.rc-label { font-size: 12px; font-weight: 600; color: var(--ink); }
+.rc-target { font-size: 10px; color: var(--muted); margin-top: 2px; }
+.rc-actual { font-family: var(--mono); font-size: 11px; color: var(--cyan); margin-top: 3px; word-break: break-word; }
+
 .foot { text-align: center; color: var(--muted-2); font-size: 11px; padding: 4px 0 24px; }
 
 /* scrollbars */

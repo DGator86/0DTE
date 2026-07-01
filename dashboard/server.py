@@ -23,6 +23,7 @@ from dashboard.queries import (
     journal_max_id,
     journal_row,
     paper_summary,
+    readiness_summary,
     report_summary,
 )
 from dashboard.state import read_live_state
@@ -111,6 +112,14 @@ async def api_report():
     if not os.path.isfile(db):
         return {"note": "journal database not found"}
     return report_summary(db)
+
+
+@app.get("/api/readiness")
+async def api_readiness():
+    db = _config.get("db", "shadow.db")
+    if not os.path.isfile(db):
+        return {"note": "journal database not found"}
+    return readiness_summary(db, _config.get("paper_db", "paper.sqlite"))
 
 
 @app.get("/api/stream")
