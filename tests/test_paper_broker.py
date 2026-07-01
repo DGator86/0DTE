@@ -135,3 +135,20 @@ def test_equity_accounting(tmp_path):
     b.on_tick(T1, _result(_chain(744, 0.50, 0.15), trade=False))   # target win
     assert b.cash > 1000.0
     assert b.report()["equity"] == pytest.approx(b.cash, abs=0.01)
+
+
+def test_equity_survives_restart(tmp_path):
+    """Open positions can't survive a process restart (in-memory only), but
+    realized equity must resume from the last closed trade instead of
+    silently resetting to starting_cash -- that history is already on disk."""
+    db_path = str(tmp_path / "paper.sqlite")
+    b1 = PaperBroker(db_path=db_path, cfg=PaperConfig())
+    b1.on_tick(T0, _result(_chain(742, 1.50, 0.50)))
+    b1.on_tick(T1, _result(_chain(744, 0.50, 0.15), trade=False))   # target win, closes
+    closed_equity = b1.cash
+    assert closed_equity > 1000.0
+
+    # Simulate a restart: a fresh PaperBroker instance against the same db_path.
+    b2 = PaperBroker(db_path=db_path, cfg=PaperConfig())
+    assert b2.cash == pytest.approx(closed_equity, abs=0.01)
+    assert b2.open_positions == []   # open positions are still lost -- expected
