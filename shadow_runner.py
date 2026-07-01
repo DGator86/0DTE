@@ -234,7 +234,7 @@ class ShadowRunner:
                     status=status,
                     note=note,
                     feed_source=getattr(self._feed, "last_source", None),
-                    paper_summary=self._paper.report(),
+                    paper_summary=self._paper.report(now),
                     market_status=market_status(now),
                 ),
             )
@@ -298,7 +298,7 @@ class ShadowRunner:
                 serialize_tick_result(
                     result,
                     feed_source=getattr(self._feed, "last_source", None),
-                    paper_summary=self._paper.report(),
+                    paper_summary=self._paper.report(now),
                     market_status=market_status(now),
                 ),
             )

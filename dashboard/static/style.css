@@ -333,6 +333,34 @@ html, body {
   margin-bottom: 12px;
 }
 
+/* ---------------- Open position ---------------- */
+.op-card {
+  border: 1px solid var(--border-2);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--panel-2);
+}
+.op-card + .op-card { margin-top: 8px; }
+.op-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.op-strikes { font-family: var(--mono); font-weight: 700; font-size: 13px; color: var(--ink); }
+.op-family { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.op-pnl { font-family: var(--mono); font-weight: 800; font-size: 16px; }
+.op-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  font-size: 11px;
+}
+.op-metrics div { display: flex; flex-direction: column; gap: 2px; }
+.op-metrics .k { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.op-metrics .v { font-family: var(--mono); color: var(--ink); }
+
 /* ---------------- Readiness checklist ---------------- */
 .readiness-badge {
   font-family: var(--mono);
