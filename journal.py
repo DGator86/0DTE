@@ -18,6 +18,7 @@ NOT financial advice.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -204,6 +205,57 @@ class Journal:
             if len(xs) == len(y):
                 out[c] = corr(xs, y)
         return out
+
+    def regime_diversity(self) -> dict:
+        """
+        Distribution of gex_regime across settled trades that were actually
+        taken. A track record concentrated in one regime hasn't been tested by
+        the conditions it will eventually meet live.
+        """
+        rows = [
+            r for r in self.fetch(settled_only=True)
+            if r["was_traded"] == 1 and r["realized_pnl"] is not None
+        ]
+        counts: dict[str, int] = {}
+        for r in rows:
+            key = r["gex_regime"] or "unknown"
+            counts[key] = counts.get(key, 0) + 1
+        return {"n": len(rows), "regimes": counts, "distinct": len(counts)}
+
+    def uptime_gaps(self, gap_threshold_sec: float = 300.0) -> dict:
+        """
+        Count intraday gaps between consecutive ticks (within the same
+        session_date only -- the expected overnight/weekend gap between one
+        session's last tick and the next session's first tick is excluded).
+        A large intraday gap means the pipeline stalled or crashed mid-session.
+        """
+        rows = self.fetch()
+        by_session: dict[str, list] = {}
+        for r in rows:
+            by_session.setdefault(r["session_date"], []).append(r["ts"])
+
+        gaps = 0
+        max_gap = 0.0
+        sessions_with_gaps = 0
+        for _, ts_list in by_session.items():
+            times = sorted(dt.datetime.fromisoformat(t) for t in ts_list if t)
+            session_had_gap = False
+            for a, b in zip(times, times[1:]):
+                delta = (b - a).total_seconds()
+                if delta > gap_threshold_sec:
+                    gaps += 1
+                    session_had_gap = True
+                    max_gap = max(max_gap, delta)
+            if session_had_gap:
+                sessions_with_gaps += 1
+
+        return {
+            "sessions": len(by_session),
+            "sessions_with_gaps": sessions_with_gaps,
+            "gap_count": gaps,
+            "max_gap_sec": round(max_gap, 1),
+            "gap_threshold_sec": gap_threshold_sec,
+        }
 
     def close(self):
         self.conn.close()

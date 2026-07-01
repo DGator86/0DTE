@@ -398,6 +398,48 @@
     ].join("");
   }
 
+  /* ---------------- live-readiness checklist ---------------- */
+  function fmtNum(x) {
+    return Number.isInteger(x) ? String(x) : fmt(x, 3);
+  }
+  function fmtActual(v, target) {
+    if (v == null) return "—";
+    if (typeof v === "number") {
+      // A fractional value whose target is stated in "%" (e.g. max_drawdown_pct)
+      // reads better as a percentage than a bare decimal.
+      if (target && /%/.test(target)) return (v * 100).toFixed(1) + "%";
+      return fmtNum(v);
+    }
+    if (typeof v === "object") {
+      return Object.entries(v)
+        .map(([k, x]) => `${k.replace(/_/g, " ")}: ${typeof x === "number" ? fmtNum(x) : esc(String(x))}`)
+        .join(" · ");
+    }
+    return esc(String(v));
+  }
+
+  function renderReadiness(data) {
+    const badge = $("readiness-badge");
+    if (!data || !data.checks) {
+      badge.textContent = "—";
+      badge.className = "";
+      $("readiness-checks").innerHTML = '<p class="empty">No readiness data yet</p>';
+      return;
+    }
+    badge.textContent = data.ready ? "READY" : "NOT READY";
+    badge.className = "readiness-badge " + (data.ready ? "ready" : "not-ready");
+
+    $("readiness-checks").innerHTML = `<div class="rc-grid">${data.checks.map((c) => `
+      <div class="rc-row">
+        <span class="rc-icon ${c.ok ? "ok" : "no"}">${c.ok ? "✓" : "✕"}</span>
+        <div class="rc-body">
+          <div class="rc-label">${esc(c.label)}</div>
+          <div class="rc-target">target: ${esc(c.target)}</div>
+          <div class="rc-actual">${fmtActual(c.actual, c.target)}</div>
+        </div>
+      </div>`).join("")}</div>`;
+  }
+
   /* ---------------- session log ---------------- */
   function renderTimeline(data) {
     $("log-date").textContent = data.session_date || "";
@@ -646,12 +688,13 @@
   /* ---------------- refresh loop ---------------- */
   async function refresh() {
     try {
-      let [live, market, history, report, paper] = await Promise.all([
+      let [live, market, history, report, paper, readiness] = await Promise.all([
         api("/api/live"),
         api("/api/market-status"),
         api("/api/ticks?limit=200"),
         api("/api/report").catch(() => ({})),
         api("/api/paper").catch(() => ({})),
+        api("/api/readiness").catch(() => ({})),
       ]);
       const ticks = history.ticks || [];
       const latest = ticks.length ? ticks[ticks.length - 1] : null;
@@ -681,6 +724,7 @@
       }
       renderPaper(paper);
       renderEdge(report);
+      renderReadiness(readiness);
       renderTimeline(history);
       staleNote(live, market);
 

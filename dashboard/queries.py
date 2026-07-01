@@ -113,6 +113,22 @@ def paper_summary(paper_db_path: str) -> dict:
     gross_loss = -sum(losses)
     equity = all_rows[-1][2] if all_rows else None
 
+    # Max drawdown over the full equity curve (all_rows is chronological by
+    # closed_at): largest peak-to-trough drop, in dollars and as a fraction
+    # of the peak at that point.
+    max_dd_dollars, max_dd_frac, peak = 0.0, 0.0, None
+    for r in all_rows:
+        e = r[2]
+        if e is None:
+            continue
+        if peak is None or e > peak:
+            peak = e
+        if peak:
+            dd_dollars = peak - e
+            dd_frac = dd_dollars / peak if peak else 0.0
+            max_dd_dollars = max(max_dd_dollars, dd_dollars)
+            max_dd_frac = max(max_dd_frac, dd_frac)
+
     by_reason: dict[str, int] = {}
     for r in all_rows:
         reason = r[1] or "unknown"
@@ -124,7 +140,84 @@ def paper_summary(paper_db_path: str) -> dict:
         "total_pnl": round(sum(pnls), 2) if pnls else 0.0,
         "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
         "equity": round(equity, 2) if equity is not None else None,
+        "max_drawdown": round(max_dd_dollars, 2),
+        "max_drawdown_pct": round(max_dd_frac, 4),
         "by_exit_reason": by_reason,
         "recent_trades": [dict(r) for r in rows],
         "simulated": True,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Live-readiness checklist -- objective, numbers-based criteria for whether   #
+# the paper/shadow track record has earned the right to touch real capital.  #
+# Every threshold below is a starting policy, not a guarantee; tune to taste. #
+# --------------------------------------------------------------------------- #
+READINESS_THRESHOLDS = {
+    "min_trades_taken": 30,       # sample size floor for trades_taken.n
+    "min_profit_factor": 1.3,     # gross win / gross loss, with margin for real slippage
+    "max_drawdown_pct": 0.20,     # largest peak-to-trough drop must stay under this
+    "min_distinct_regimes": 2,    # track record must span more than one gex_regime
+    "max_gap_sessions_frac": 0.05,  # share of sessions allowed an intraday pipeline gap
+}
+
+
+def readiness_summary(db_path: str, paper_db_path: str,
+                       thresholds: Optional[dict] = None) -> dict:
+    """Combine gate effectiveness, regime diversity, uptime, and paper P&L
+    into a single pass/fail checklist for graduating out of shadow/paper mode."""
+    cfg = {**READINESS_THRESHOLDS, **(thresholds or {})}
+
+    jrn = Journal(db_path)
+    try:
+        gate_eff = jrn.gate_effectiveness()
+        corr = jrn.component_correlations()
+        regime = jrn.regime_diversity()
+        uptime = jrn.uptime_gaps()
+    finally:
+        jrn.close()
+
+    paper = paper_summary(paper_db_path)
+
+    taken_n = gate_eff["trades_taken"]["n"]
+    taken_mean = gate_eff["trades_taken"]["mean"]
+    blocked_mean = gate_eff["blocked_by_gate"]["mean"]
+    profit_factor = paper.get("profit_factor")
+    max_dd_pct = paper.get("max_drawdown_pct")
+    distinct_regimes = regime["distinct"]
+    gap_frac = (uptime["sessions_with_gaps"] / uptime["sessions"]) if uptime["sessions"] else None
+
+    def check(label, ok, actual, target):
+        return {"label": label, "ok": bool(ok), "actual": actual, "target": target}
+
+    checks = [
+        check("Sample size", taken_n >= cfg["min_trades_taken"],
+              taken_n, f">= {cfg['min_trades_taken']} trades taken"),
+        check("Gate adds value",
+              taken_mean is not None and blocked_mean is not None and blocked_mean < taken_mean,
+              {"taken_mean": taken_mean, "blocked_mean": blocked_mean}, "blocked mean < taken mean"),
+        check("Profit factor", profit_factor is not None and profit_factor >= cfg["min_profit_factor"],
+              profit_factor, f">= {cfg['min_profit_factor']}"),
+        check("Drawdown survivable",
+              max_dd_pct is not None and max_dd_pct <= cfg["max_drawdown_pct"],
+              max_dd_pct, f"<= {cfg['max_drawdown_pct']:.0%}"),
+        check("Regime diversity", distinct_regimes >= cfg["min_distinct_regimes"],
+              distinct_regimes, f">= {cfg['min_distinct_regimes']} distinct regimes"),
+        check("Infrastructure held up",
+              gap_frac is not None and gap_frac <= cfg["max_gap_sessions_frac"],
+              uptime, f"<= {cfg['max_gap_sessions_frac']:.0%} of sessions with a gap"),
+    ]
+    ready = all(c["ok"] for c in checks)
+
+    return {
+        "ready": ready,
+        "checks": checks,
+        "thresholds": cfg,
+        "facts": {
+            "gate_effectiveness": gate_eff,
+            "component_correlations": corr,
+            "regime_diversity": regime,
+            "uptime": uptime,
+            "paper": paper,
+        },
     }
