@@ -37,7 +37,7 @@ from notifier import Notifier, Ticket
 from risk_manager import RiskConfig, RiskManager
 from paper_broker import PaperBroker, PaperConfig
 from market_calendar import is_market_open, next_market_open, market_status
-from dashboard.state import serialize_tick_result, write_live_state
+from dashboard.state import heartbeat_state, serialize_tick_result, write_live_state
 from typing import Optional
 
 ET = ZoneInfo("America/New_York")
@@ -161,6 +161,10 @@ class ShadowRunner:
                         nxt.strftime("%a %Y-%m-%d %H:%M"),
                         secs_to_open / 3600,
                     )
+                    self._heartbeat(
+                        now, "market_closed",
+                        f"Market closed — next open {nxt.strftime('%a %H:%M')} ET.",
+                    )
                     time.sleep(min(300, secs_to_open))
 
         except KeyboardInterrupt:
@@ -218,15 +222,40 @@ class ShadowRunner:
 
     # -- internals -----------------------------------------------------------
 
+    def _heartbeat(self, now: dt.datetime, status: str, note: str) -> None:
+        """Write a liveness-only live_state so the dashboard can show *why*
+        there is no tick (feed down / market closed) instead of blank dashes.
+        Never raises into the loop."""
+        try:
+            write_live_state(
+                self.live_state_path,
+                heartbeat_state(
+                    now,
+                    status=status,
+                    note=note,
+                    feed_source=getattr(self._feed, "last_source", None),
+                    paper_summary=self._paper.report(),
+                    market_status=market_status(now),
+                ),
+            )
+        except Exception as exc:
+            log.warning("heartbeat write error: %s", exc)
+
     def _tick(self, now: dt.datetime) -> None:
         try:
             result = self._orch.tick(now)
         except Exception as exc:
             log.warning("tick() error: %s", exc)
+            self._heartbeat(now, "feed_error", f"Feed error: {exc}")
             return
 
         if result is None:
             log.debug("tick() returned None (feed not ready)")
+            self._heartbeat(
+                now, "feed_not_ready",
+                "Feed not ready — no market data returned. Check the data feed "
+                "credentials/provider (e.g. TRADIER_ACCESS_TOKEN).",
+            )
             return
 
         regime = result.regime.dominant_regime
