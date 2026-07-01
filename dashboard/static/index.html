@@ -4,15 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <title>0DTE Pipeline</title>
+  <meta name="theme-color" content="#0a0e14">
+  <title>0DTE Command Center</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header class="header">
-    <h1>0DTE Pipeline</h1>
-    <p class="subtitle">Read-only observability</p>
-  </header>
 
+  <!-- Auth gate (only shown when a client token is required) -->
   <div id="auth-gate" class="auth-gate hidden">
     <label for="token-input">Dashboard token</label>
     <input id="token-input" type="password" placeholder="Paste DASHBOARD_TOKEN" autocomplete="off">
@@ -20,30 +18,133 @@
   </div>
 
   <div id="app" class="hidden">
-    <section id="market-banner" class="market-banner closed" aria-live="polite">
-      <div class="market-status-row">
-        <span class="market-dot" id="market-dot"></span>
-        <span id="market-label">Market is Closed</span>
+
+    <!-- ===================== TOP BAR ===================== -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">0DTE<b>·</b>CMD</span>
+        <span class="tag">Command Center</span>
       </div>
-      <div id="market-countdown" class="market-countdown">—</div>
-      <div id="market-subtitle" class="market-subtitle">—</div>
-    </section>
 
-    <nav class="tabs" role="tablist">
-      <button class="tab active" data-tab="now" role="tab">Now</button>
-      <button class="tab" data-tab="inputs" role="tab">Inputs</button>
-      <button class="tab" data-tab="why" role="tab">Why</button>
-      <button class="tab" data-tab="history" role="tab">History</button>
-      <button class="tab" data-tab="stats" role="tab">Stats</button>
-    </nav>
+      <div class="spot-hero">
+        <span class="sym">SPY</span>
+        <span class="px mono" id="spot-px">—</span>
+        <span class="chg mono" id="spot-chg"></span>
+      </div>
 
-    <main>
-      <section id="panel-now" class="panel active" role="tabpanel"></section>
-      <section id="panel-inputs" class="panel" role="tabpanel"></section>
-      <section id="panel-why" class="panel" role="tabpanel"></section>
-      <section id="panel-history" class="panel" role="tabpanel"></section>
-      <section id="panel-stats" class="panel" role="tabpanel"></section>
-    </main>
+      <div class="topbar-spacer"></div>
+
+      <span class="meta-chip">Feed <b id="meta-feed">—</b></span>
+      <span class="meta-chip">Chain <b id="meta-chain">—</b></span>
+      <span class="meta-chip" id="meta-fresh-wrap">Tick <b id="meta-fresh">—</b></span>
+      <span class="pill closed" id="market-pill">
+        <span class="dot"></span>
+        <span id="market-label">Market Closed</span>
+        <span id="market-countdown" class="mono"></span>
+      </span>
+    </header>
+
+    <!-- ===================== GRID ===================== -->
+    <div class="grid">
+
+      <!-- ---------- LEFT: the decision ---------- -->
+      <div class="col col-left">
+
+        <section class="panel accent" id="signal-panel">
+          <h2>Signal <span class="h2-right" id="signal-time">—</span></h2>
+          <div class="verdict wait" id="verdict">
+            <div class="word" id="verdict-word">—</div>
+            <div class="sub" id="verdict-sub">awaiting first tick</div>
+          </div>
+          <div class="dirline" id="dirline"></div>
+          <div class="gauge">
+            <div class="gauge-row"><span>Gate score</span><b id="gate-num">—</b></div>
+            <div class="bar blue"><span id="gate-bar" style="width:0%"></span></div>
+          </div>
+          <div class="gauge">
+            <div class="gauge-row"><span>Size multiplier</span><b id="size-num">—</b></div>
+            <div class="bar green"><span id="size-bar" style="width:0%"></span></div>
+          </div>
+        </section>
+
+        <section class="panel" id="playbook-panel">
+          <h2>Playbook <span class="h2-right" id="playbook-fam">—</span></h2>
+          <div class="metrics" id="playbook-metrics"></div>
+        </section>
+
+        <section class="panel" id="regime-panel">
+          <h2>Regime confidence</h2>
+          <div id="regime-bars"><p class="empty">No regime data</p></div>
+        </section>
+
+      </div>
+
+      <!-- ---------- MIDDLE: chart + why ---------- -->
+      <div class="col col-mid">
+
+        <section class="panel">
+          <h2>Price · levels · projection
+            <span class="h2-right" id="chart-sub">intraday</span>
+          </h2>
+          <div class="chart-wrap">
+            <canvas id="chart"></canvas>
+          </div>
+          <div class="chart-legend">
+            <span><i style="border-color:#e6edf7"></i>Spot</span>
+            <span><i class="dash" style="border-color:#4aa8ff"></i>VWAP</span>
+            <span><i style="border-color:#ff5470"></i>Call wall</span>
+            <span><i style="border-color:#2ec785"></i>Put wall</span>
+            <span><i class="dash" style="border-color:#ffb648"></i>Gamma flip</span>
+            <span><i class="dot" style="background:#9d7bff"></i>Projected range</span>
+            <span><i class="dot" style="background:#2ec785"></i>Trade signal</span>
+          </div>
+          <div class="reason" id="reason">Awaiting decision engine…</div>
+        </section>
+
+        <section class="panel" id="why-panel">
+          <h2>Decision rationale</h2>
+          <div class="metrics cols-1" id="why-metrics"></div>
+          <div style="margin-top:12px" class="chips" id="why-chips"></div>
+        </section>
+
+      </div>
+
+      <!-- ---------- RIGHT: technicals + risk ---------- -->
+      <div class="col col-right">
+
+        <section class="panel" id="vol-panel">
+          <h2>Volatility term structure</h2>
+          <div id="vol-rows"><p class="empty">No vol data</p></div>
+        </section>
+
+        <section class="panel" id="tech-panel">
+          <h2>Technicals &amp; dealer positioning</h2>
+          <div class="metrics" id="tech-metrics"></div>
+        </section>
+
+        <section class="panel" id="paper-panel">
+          <h2>Paper account <span class="h2-right">simulated</span></h2>
+          <div class="metrics" id="paper-metrics"></div>
+        </section>
+
+        <section class="panel" id="edge-panel">
+          <h2>System edge</h2>
+          <div class="metrics cols-1" id="edge-metrics"></div>
+        </section>
+
+      </div>
+
+      <!-- ---------- FULL WIDTH: session log ---------- -->
+      <div class="col" style="grid-column:1/-1">
+        <section class="panel">
+          <h2>Session log <span class="h2-right" id="log-date">—</span></h2>
+          <div class="tl" id="timeline"><p class="empty">No evaluations yet</p></div>
+        </section>
+      </div>
+
+    </div>
+
+    <div class="foot">Read-only observability · outputs only · auto-refreshing</div>
   </div>
 
   <script src="/static/app.js"></script>
