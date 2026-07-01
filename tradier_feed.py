@@ -66,7 +66,13 @@ def _get(path: str, params: dict[str, Any]) -> dict:
     token = os.environ.get("TRADIER_ACCESS_TOKEN")
     if not token:
         raise RuntimeError("TRADIER_ACCESS_TOKEN not set in environment")
-    base = os.environ.get("TRADIER_BASE_URL", "https://api.tradier.com/v1").rstrip("/")
+    base = os.environ.get("TRADIER_BASE_URL", "https://api.tradier.com/v1").strip().rstrip("/")
+    if any(c.isspace() or c == "#" for c in base):
+        raise RuntimeError(
+            f"TRADIER_BASE_URL is malformed: {base!r}. systemd's EnvironmentFile "
+            "does not strip inline '# ...' comments — put comments on their own "
+            "line in /etc/zerodte/zerodte.env, not after the value."
+        )
     url = f"{base}{path}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}",
