@@ -166,6 +166,7 @@ html, body {
 }
 @media (max-width: 760px) {
   .grid { grid-template-columns: 1fr; }
+  .col-mid { order: 0; } /* signal leads on phones; chart drops to natural position */
   .spot-hero .px { font-size: 24px; }
 }
 

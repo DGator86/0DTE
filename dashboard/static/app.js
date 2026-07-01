@@ -156,7 +156,10 @@
     $("signal-time").textContent = live.ts ? etTime(live.ts) + " ET" : "—";
 
     let cls = "wait", word = "WAIT", sub = "";
-    if (d.stand_down) {
+    if (!live.ts) {
+      cls = "wait"; word = "STANDBY";
+      sub = (live.market && live.market.is_open) ? "pipeline idle — awaiting tick" : "market closed — awaiting session";
+    } else if (d.stand_down) {
       cls = "stop"; word = "STAND DOWN";
       sub = (w.stand_down_reason || "regime veto").replace(/_/g, " ");
     } else if (d.decision === "TRADE" && d.gate_pass) {
@@ -245,6 +248,10 @@
   function renderReason(live, latest) {
     const d = live.doing || {}, w = live.why || {}, t = latest || {};
     let html = "";
+    if (!live.ts) {
+      $("reason").innerHTML = `<b>Standing by.</b> ${esc(live.note || "No live tick yet — the pipeline is idle.")}`;
+      return;
+    }
     if (d.stand_down) {
       html = `<b>Standing down.</b> ${esc((w.stand_down_reason || "regime veto").replace(/_/g, " "))}.`;
       if (arr(w.dealer_vetoes).length) html += ` Dealer flags: ${esc(arr(w.dealer_vetoes).join(", "))}.`;
