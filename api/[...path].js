@@ -21,19 +21,15 @@ export default async function handler(req, res) {
     });
   }
 
-  const pathParts = req.query.path;
-  const subpath = Array.isArray(pathParts) ? pathParts.join("/") : pathParts || "";
+  // Derive the subpath directly from the raw request URL rather than
+  // req.query.path — the dynamic-route query param is not reliably populated
+  // for this catch-all function (observed empty in production, which silently
+  // forwarded every call to "<vpsBase>/api/" with no subpath, hitting no route
+  // on the VPS and returning a generic 404 instead of real data).
+  const requestUrl = new URL(req.url, "http://localhost");
+  const subpath = requestUrl.pathname.replace(/^\/api\/?/, "");
 
-  const qs = new URLSearchParams();
-  for (const [key, value] of Object.entries(req.query)) {
-    if (key === "path") continue;
-    if (Array.isArray(value)) {
-      value.forEach((v) => qs.append(key, v));
-    } else if (value != null) {
-      qs.append(key, value);
-    }
-  }
-  const qsStr = qs.toString();
+  const qsStr = requestUrl.searchParams.toString();
   const target = `${vpsBase}/api/${subpath}${qsStr ? `?${qsStr}` : ""}`;
 
   try {
