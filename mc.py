@@ -34,32 +34,36 @@ class Projection:
     note: str
 
 
-# regime dynamics knobs — these are what you CALIBRATE against the journal
-TREND_DRIFT_K = 0.55     # momentum strength (fraction of sigma per step, directional)
-TREND_VOL_MULT = 1.25    # short-gamma vol is higher
-PIN_REVERT_K = 0.04      # OU pull per minute toward flip
-PIN_VOL_MULT = 0.70      # long-gamma vol is suppressed
+@dataclass
+class MCConfig:
+    """Regime dynamics knobs — these are what you CALIBRATE against the journal."""
+    trend_drift_k: float = 0.55   # momentum strength (fraction of sigma per step, directional)
+    trend_vol_mult: float = 1.25  # short-gamma vol is higher
+    pin_revert_k: float = 0.04    # OU pull per minute toward flip
+    pin_vol_mult: float = 0.70    # long-gamma vol is suppressed
 
 
 def project(spot: float, target: float, stop: float, flip: float,
             minutes_left: int, iv_annual: float, regime: str,
-            win_R: float, n_paths: int = 20000, seed: int | None = None) -> Projection:
+            win_R: float, n_paths: int = 20000, seed: int | None = None,
+            cfg: MCConfig | None = None) -> Projection:
     """
     First-passage simulation of the remaining session.
     target/stop are PRICE levels. win_R is the reward multiple if target is hit
     before stop (e.g. premium move to wall ≈ +2R) vs -1R if stopped.
     """
+    cfg = cfg or MCConfig()
     rng = np.random.default_rng(seed)
     steps = max(1, int(minutes_left))
     sigma_min = iv_annual / np.sqrt(MINUTES_PER_YEAR)   # per-minute vol (fraction)
 
     up = target > spot  # direction of the target
     if regime == "trend":
-        drift = TREND_DRIFT_K * sigma_min * (1.0 if up else -1.0)
-        vol = sigma_min * TREND_VOL_MULT
+        drift = cfg.trend_drift_k * sigma_min * (1.0 if up else -1.0)
+        vol = sigma_min * cfg.trend_vol_mult
     else:  # pin
         drift = 0.0                  # handled by mean-reversion term below
-        vol = sigma_min * PIN_VOL_MULT
+        vol = sigma_min * cfg.pin_vol_mult
 
     # simulate paths in price space (lognormal-ish via multiplicative steps)
     prices = np.full(n_paths, spot, dtype=float)
@@ -71,7 +75,7 @@ def project(spot: float, target: float, stop: float, flip: float,
         z = rng.standard_normal(n_paths)
         if regime == "pin":
             # Ornstein-Uhlenbeck pull toward flip
-            step = PIN_REVERT_K * (flip - prices) / prices + vol * z
+            step = cfg.pin_revert_k * (flip - prices) / prices + vol * z
         else:
             step = drift + vol * z
         prices = prices * (1.0 + step)
@@ -108,7 +112,8 @@ def p_to_kelly_inputs(proj: Projection, win_R: float) -> tuple[float, float, flo
 
 def project_range(spot: float, lower_short: float, upper_short: float, flip: float,
                   minutes_left: int, iv_annual: float, regime: str,
-                  win_R: float, n_paths: int = 20000, seed: int | None = None) -> Projection:
+                  win_R: float, n_paths: int = 20000, seed: int | None = None,
+                  cfg: MCConfig | None = None) -> Projection:
     """
     Condor survival: P(price NEVER touches either short strike before close).
     This is the correct question for a premium seller — not 'target before stop'
@@ -117,17 +122,18 @@ def project_range(spot: float, lower_short: float, upper_short: float, flip: flo
     win_R here is the credit/max-loss ratio (small), so EV stays honest about the
     seller's ugly payoff geometry.
     """
+    cfg = cfg or MCConfig()
     rng = np.random.default_rng(seed)
     steps = max(1, int(minutes_left))
     sigma_min = iv_annual / np.sqrt(MINUTES_PER_YEAR)
-    vol = sigma_min * (PIN_VOL_MULT if regime == "pin" else TREND_VOL_MULT)
+    vol = sigma_min * (cfg.pin_vol_mult if regime == "pin" else cfg.trend_vol_mult)
 
     prices = np.full(n_paths, spot, dtype=float)
     breached = np.zeros(n_paths, dtype=bool)
     for _ in range(steps):
         z = rng.standard_normal(n_paths)
         if regime == "pin":
-            step = PIN_REVERT_K * (flip - prices) / prices + vol * z
+            step = cfg.pin_revert_k * (flip - prices) / prices + vol * z
         else:
             step = vol * z
         prices = prices * (1.0 + step)

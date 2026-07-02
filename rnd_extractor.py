@@ -88,8 +88,15 @@ class RNDConfig:
     max_rel_spread: float = 0.60   # ignore quotes whose spread > this fraction of mid
     parity_atm_window: int = 8     # # of near-ATM strikes used in the F/DF regression
     spline_lam: Optional[float] = None  # smoothing spline penalty; None = auto (GCV-like)
-    vol_risk_premium: float = 0.18 # default physical haircut: var_phys = (1-vrp)*var_RN
+    vol_risk_premium: float = 0.18 # LAST-RESORT physical haircut: var_phys = (1-vrp)*var_RN
     touch_cap: float = 1.0
+    # Realized-vol physical density (preferred over the static VRP haircut when
+    # 1-min bars are available; see ewma_realized_vol / physical_pdf_from_realized_vol).
+    rv_halflife_min: float = 120.0  # EWMA halflife (minutes) for 1-min return variance
+    rv_min_returns: int = 60        # min usable 1-min returns before trusting the estimate
+    rv_max_gap_min: float = 3.0     # drop returns spanning gaps longer than this (overnight)
+    rv_scale_min: float = 0.5       # squeeze floor: phys_std never below 0.5*rn_std
+    rv_scale_max: float = 1.5       # squeeze cap: phys_std never above 1.5*rn_std
 
 
 # --------------------------------------------------------------------------- #
@@ -330,21 +337,103 @@ class EdgeReport:
     best_put_strike: Optional[float]
 
 
-def _physical_pdf_from_rnd(rnd: RiskNeutralDensity, vrp: float) -> np.ndarray:
+def _squeeze_rnd(rnd: RiskNeutralDensity, scale: float) -> np.ndarray:
     """
-    Default physical density when the caller supplies none: squeeze the RND
-    toward its mean so that var_phys = (1-vrp)*var_RN. Encodes the empirical
-    vol-risk-premium (implied usually > realized) without inventing a shape.
+    Rescale the RND about its forward: physical Y = F + scale*(X-F), so
+    std_Y = scale*std_X while skew/kurtosis shape is preserved.
+    Evaluating p_Y on the grid requires the inverse map (multiply by scale here);
+    renormalization below absorbs the Jacobian.
     """
     F = rnd.forward
-    scale = np.sqrt(max(1.0 - vrp, 1e-6))
-    # Narrow the RND toward F: physical Y = F + scale*(X-F), var_Y=(1-vrp)var_X.
-    # Evaluating p_Y on the grid requires the inverse map (multiply by scale here);
-    # renormalization below absorbs the Jacobian.
     src_x = F + (rnd.grid - F) * scale
     phys = np.interp(rnd.grid, src_x, rnd.pdf, left=0.0, right=0.0)
     area = np.sum(phys) * (rnd.grid[1] - rnd.grid[0])
     return phys / area if area > 0 else phys
+
+
+def _physical_pdf_from_rnd(rnd: RiskNeutralDensity, vrp: float) -> np.ndarray:
+    """
+    Last-resort physical density when the caller supplies none and no bar
+    history is available: squeeze the RND toward its mean so that
+    var_phys = (1-vrp)*var_RN. Encodes the empirical vol-risk-premium
+    (implied usually > realized) without inventing a shape.
+
+    WARNING: because the haircut is a constant, the variance ratio it implies
+    is 1/(1-vrp) BY CONSTRUCTION — the richness signal degenerates to a
+    constant. Prefer physical_pdf_from_realized_vol, which sets the physical
+    variance from data the RND doesn't already contain.
+    """
+    return _squeeze_rnd(rnd, np.sqrt(max(1.0 - vrp, 1e-6)))
+
+
+MINUTES_PER_YEAR = 252 * 390   # trading minutes (matches mc.py convention)
+
+
+def ewma_realized_vol(
+    ts: np.ndarray,
+    close: np.ndarray,
+    cfg: Optional[RNDConfig] = None,
+) -> Optional[float]:
+    """
+    Annualized realized vol from 1-min close-to-close log returns, EWMA-weighted
+    (recent minutes dominate, halflife cfg.rv_halflife_min). Returns spanning
+    time gaps longer than cfg.rv_max_gap_min minutes (overnight, halts) are
+    dropped so a single gap doesn't masquerade as intraday variance.
+    Returns None when fewer than cfg.rv_min_returns usable returns exist —
+    the caller should fall back rather than trust a thin estimate.
+    """
+    cfg = cfg or RNDConfig()
+    close = np.asarray(close, dtype=float)
+    if close.size < 2:
+        return None
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.diff(np.log(close))
+    gap_min = np.diff(np.asarray(ts, dtype="datetime64[ns]")) / np.timedelta64(60, "s")
+    keep = np.isfinite(r) & (gap_min.astype(float) <= cfg.rv_max_gap_min)
+    r = r[keep]
+    if r.size < cfg.rv_min_returns:
+        return None
+    alpha = 1.0 - 0.5 ** (1.0 / max(cfg.rv_halflife_min, 1.0))
+    w = (1.0 - alpha) ** np.arange(r.size - 1, -1, -1, dtype=float)
+    var_per_min = float(np.sum(w * r * r) / np.sum(w))
+    return float(np.sqrt(var_per_min * MINUTES_PER_YEAR))
+
+
+def physical_pdf_from_realized_vol(
+    rnd: RiskNeutralDensity,
+    sigma_annual: float,
+    cfg: Optional[RNDConfig] = None,
+) -> Optional[Callable[[np.ndarray], np.ndarray]]:
+    """
+    Build the physical density from a realized-vol forecast: keep the RND's
+    shape (skew, tails) but rescale its dispersion so std_phys matches the
+    forecast move over the remaining life, F * sigma_annual * sqrt(T).
+
+    This is the measurement the VRP haircut fakes: the RN/physical variance
+    ratio — hence the richness signal — now moves with the gap between what
+    the chain implies and what the tape is actually doing. The squeeze factor
+    is clipped to [rv_scale_min, rv_scale_max] so a bad vol print can't push
+    the physical density somewhere absurd.
+
+    Returns a callable(grid)->density (interpolates onto any grid; callers
+    renormalize), or None on degenerate inputs so callers can fall back.
+    """
+    cfg = cfg or RNDConfig()
+    if not np.isfinite(sigma_annual) or sigma_annual <= 0:
+        return None
+    rn_std = rnd.std()
+    target_std = rnd.forward * sigma_annual * np.sqrt(max(rnd.t_years, 0.0))
+    if rn_std <= 0 or target_std <= 0:
+        return None
+    scale = float(np.clip(target_std / rn_std, cfg.rv_scale_min, cfg.rv_scale_max))
+    dens = _squeeze_rnd(rnd, scale)
+    grid0, dens0 = rnd.grid.copy(), dens
+
+    def pdf(grid: np.ndarray) -> np.ndarray:
+        return np.interp(np.asarray(grid, dtype=float), grid0, dens0,
+                         left=0.0, right=0.0)
+
+    return pdf
 
 
 def compute_edge(

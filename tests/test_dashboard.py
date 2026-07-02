@@ -112,6 +112,17 @@ def test_api_requires_auth(client):
     assert r.status_code == 401
 
 
+def test_api_rejects_query_param_token(client):
+    # tokens in query strings end up in access logs — header only
+    r = client.get("/api/live?token=test-secret-token")
+    assert r.status_code == 401
+
+
+def test_api_rejects_wrong_bearer(client):
+    r = client.get("/api/live", headers={"Authorization": "Bearer wrong"})
+    assert r.status_code == 401
+
+
 def test_api_live_with_auth(client):
     r = client.get("/api/live", headers={"Authorization": "Bearer test-secret-token"})
     assert r.status_code == 200

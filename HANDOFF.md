@@ -34,8 +34,12 @@ for m in rnd_extractor gate_scorer spread_selector decision_engine journal \
 ## 2. The two tracks (read this first)
 
 The system is **two partially-overlapping subsystems** that share `rnd_extractor`
-and `spread_selector` but currently have **separate snapshot types and separate
-orchestrators**. Unifying them is the main outstanding integration work (§6).
+and `spread_selector`. They were originally separate loops; **`unified_loop.py`
+(`UnifiedOrchestrator`) now combines them into one tick** — Track A RND feeds the
+matrix, Track B routes the structure, Track A fills the strikes, and everything
+lands in one journal. `shadow_runner.py` drives that loop live against
+`composite_feed.build_default_feed`. The per-track orchestrators below remain as
+standalone harnesses for testing each track in isolation.
 
 ### Track A — Premium engine + measurement (the original spine)
 ```
@@ -84,7 +88,10 @@ structures, call `spread_selector.select_spreads` with a chain and return the re
 | `mtf_matrix.py` | Multi-timeframe standardized feature matrix (native vs snapshot vars) + per-TF regime rows. | `build_matrix`, `regime_rows`, `MTFInput` | Validated |
 | `decision_matrix.py` | 27-cell (exec × context × direction) -> structure/conviction/size; dealer vetoes override. | `decide_from_matrix`, `DECISION_TABLE`, `TradeIntent` | Validated (hardened, see §5) |
 | `resample.py` | Raw bars -> per-timeframe indicators (ADX/RSI/EMA/BB/RV/CVD/...) -> `MTFInput.native`. | `build_mtf_input`, `RawBars` | Validated |
-| `live_feed_adapter.py` | Vendor-agnostic feed adapter; drives Track B; `route_ticket`. `CSVBarFeed` + `SyntheticFeed`. | `PipelineOrchestrator`, `MarketSnapshot`, `DataFeed`, `CSVBarFeed` | Works; routing is a stub (§6) |
+| `live_feed_adapter.py` | Vendor-agnostic feed adapter; drives Track B standalone; `route_ticket`. `CSVBarFeed` + `SyntheticFeed`. | `PipelineOrchestrator`, `MarketSnapshot`, `DataFeed`, `CSVBarFeed` | Legacy harness; live path is `unified_loop` |
+| `unified_loop.py` | **The** live tick loop: Track A RND + realized-vol physical pdf -> matrix -> Track B routing -> Track A fill -> risk -> journal. | `UnifiedOrchestrator`, `TickSnapshot`, `TickResult` | Validated (seam tests) |
+| `shadow_runner.py` | Drives `UnifiedOrchestrator` live in no-order mode; auto-settle 4:15 ET; paper broker + dashboard state. | `ShadowRunner`, `--report` | Works |
+| `composite_feed.py` | Live `DataFeed` with provider failover (Tradier -> Tastytrade -> Massive); Yahoo backstops bars/settlement only. | `build_default_feed` | Works |
 
 ### Dependency graph
 ```
@@ -113,9 +120,14 @@ regime_classifier  (standalone; same idea as decision_matrix's regime layer)
 - **Hard gates are multiplicative, scores are additive.** A veto (short gamma,
   catalyst, below flip) zeroes a structure regardless of how good its score is.
   Keep that separation; do not let a confidence score outvote a regime fact.
-- **`physical_pdf` is one object.** When wiring the Monte-Carlo close distribution,
-  pass the *same* callable to `compute_edge` and `select_spreads`. It's the single
-  source of truth for the edge measure.
+- **`physical_pdf` is one object.** Pass the *same* callable to `compute_edge`
+  and `select_spreads` — it's the single source of truth for the edge measure.
+  `UnifiedOrchestrator.tick` builds it per tick from **EWMA realized vol of the
+  1-min bars** (`rnd_extractor.ewma_realized_vol` +
+  `physical_pdf_from_realized_vol`: the RND's shape, rescaled to the realized-vol
+  forecast). The static `vol_risk_premium` haircut inside `compute_edge` is a
+  last-resort fallback only — with it, the variance ratio (and thus `richness`)
+  is a constant by construction, so never rely on it in a live path.
 - **Adaptive scales (TODO, important).** Most `*_scale` constants in `mtf_matrix.py`
   and `decision_matrix`/`resample` are fixed priors. They should be sourced from
   `regime_classifier.ScaleBook` (trailing distributions) so a feature reads ~50 at
@@ -138,16 +150,25 @@ regime_classifier  (standalone; same idea as decision_matrix's regime layer)
 - Full stack imports clean; both tracks run end to end (verified this handoff).
 
 **Known issues / honest gaps:**
-1. **`route_ticket` is a router, not a filler** (Track B). It names the engine but
-   doesn't call `spread_selector`, because `FeedSnapshot` carries no option chain.
-   This is the #1 next task (§6).
-2. **Two `MarketSnapshot` types.** `gate_scorer.MarketSnapshot` (rich, Track A) and
-   `live_feed_adapter.MarketSnapshot` (lighter, Track B) overlap but differ. Unify
-   or adapter-map them.
-3. **Two orchestrators.** `orchestrator.Orchestrator` (journaling) and
-   `live_feed_adapter.PipelineOrchestrator` (regime routing) are separate. The
-   target is one loop: regime-route -> select -> gate -> journal.
+1. ~~`route_ticket` is a router, not a filler~~ **Superseded by `unified_loop.py`:**
+   the unified tick passes Track B's structure/direction into
+   `decision_engine.decide`, which fills concrete strikes via `spread_selector`.
+   `live_feed_adapter.route_ticket` remains a stub but is not on the live path.
+2. **Two `MarketSnapshot` types** still exist (`gate_scorer` vs
+   `live_feed_adapter`), but only `gate_scorer.MarketSnapshot` is on the live
+   path (`unified_loop.TickSnapshot`). The adapter's type is legacy/test-only.
+3. ~~Two orchestrators~~ **Resolved:** `unified_loop.UnifiedOrchestrator` is the
+   one loop (regime-route -> select -> gate -> risk -> journal), driven live by
+   `shadow_runner.py`. `orchestrator.py` / `live_feed_adapter.PipelineOrchestrator`
+   are per-track harnesses.
 4. **Fixed scales** (see §4) — not yet adaptive.
+4b. **OI-based GEX is stale intraday.** The gamma map weights by open interest,
+   which updates overnight; most 0DTE volume opens and closes intraday without
+   printing to OI, and the customer-long-puts sign convention is most contested
+   precisely for 0DTE flow. Flip/walls/regime and the dealer vetoes all sit on
+   this map. Mitigations to evaluate via the journal (not by fiat): include
+   front weekly expiries, and/or a parallel intraday volume-weighted gamma
+   proxy, then let `gate_effectiveness()` arbitrate which flip/walls predict.
 5. **CVD proxy** in `resample.py` returns 0 when closes sit mid-bar (only bites the
    synthetic generator; real bars are fine). Prefer a real signed-volume feed.
 6. **`tick_two_sided` needs a real $TICK feed**; absent it the cell is `None` (by
@@ -164,27 +185,21 @@ when a basket is undefined. (This is the version in this handoff.)
 
 ## 6. Next tasks (prioritized)
 
-1. **Close the Track B → Track A seam (highest value).**
-   - Add a `chain: ChainSnapshot` field to `live_feed_adapter.FeedSnapshot`, sourced
-     from the options feed.
-   - In `PipelineOrchestrator.route_ticket`, when the decision is a premium family,
-     build the `GammaContext` from the snapshot, run `extract_rnd` + `compute_edge`
-     + `select_spreads`, and return the winning `SpreadCandidate` (concrete strikes,
-     credit, max_loss, Kelly size × `size_mult`). That turns a *named* trade into a
-     *fillable* one.
-2. **Unify the snapshot + orchestrator.** One `MarketSnapshot` (or a clean adapter),
-   one tick loop that does regime-route -> select -> gate -> journal, so Track B's
-   no-trades and would-be tickets land in the same SQLite journal as Track A.
-3. **Wire the live `DataFeed`.** Implement `snapshot()` against the real vendor
-   (Massive REST + S3 flat files per the existing infra): populate `RawBars`, the
-   dealer/vol snapshot (from the GEX + RND modules), and the option chain.
-4. **Adaptive scales.** Route `mtf_matrix`/`decision_matrix`/`resample` standardizer
-   scales through `regime_classifier.ScaleBook`.
-5. **Run shadow mode, then calibrate.** Journal every tick (no execution) for a few
-   weeks, then regress realized P&L on the score components (`journal`
-   `component_correlations` / `gate_effectiveness`) to set the weights and the
-   `naked_gap_multiplier` from data instead of priors.
-6. **Build the directional selector** (debit spreads / convex longs / strangles) so
+Done since this handoff was written: the Track B → Track A seam, the unified
+orchestrator (`unified_loop.py`), and the live `DataFeed`
+(`composite_feed.build_default_feed`: Tradier → Tastytrade → Massive failover,
+Yahoo quarantined to bars/settlement). Remaining, in order:
+
+1. **Run shadow mode, then calibrate.** Journal every tick (no execution) for a
+   few weeks, then regress realized P&L on the score components (`journal`
+   `component_correlations` / `gate_effectiveness`) to set the weights, the
+   `naked_gap_multiplier`, and the `mc.MCConfig` knobs from data instead of
+   priors. Don't build new modules before this loop closes.
+2. **Arbitrate the GEX measurement** (§5 item 4b) with the shadow journal:
+   OI-only vs front-weeklies-included vs intraday volume-weighted proxy.
+3. **Adaptive scales.** Route `mtf_matrix`/`decision_matrix`/`resample`
+   standardizer scales through `regime_classifier.ScaleBook`.
+4. **Build the directional selector** (debit spreads / convex longs / strangles) so
    the LCS/LC/LP/STG/BKS cells become fillable, mirroring `spread_selector`'s
    structure (leg-based payoff, EV vs physical density, defined risk).
 
