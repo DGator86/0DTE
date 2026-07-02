@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll GitHub every 2 minutes for new commits and self-deploy
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target

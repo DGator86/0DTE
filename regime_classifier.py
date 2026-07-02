@@ -84,6 +84,18 @@ class ScaleBook:
             return 0.4
         return 0.4 + 0.6 * min(1.0, s[0] / self.n_min)
 
+    # -- persistence: the whole point of adaptive scales is a memory of the
+    #    market's recent distribution, which must survive restarts/deploys ----
+    def to_dict(self) -> dict:
+        return {name: list(s) for name, s in self._stats.items()}
+
+    def load_dict(self, data: dict) -> None:
+        try:
+            self._stats = {str(k): [int(v[0]), float(v[1]), float(v[2])]
+                           for k, v in data.items()}
+        except Exception:
+            self._stats = {}             # corrupt state: re-warm, don't crash
+
 
 # --------------------------------------------------------------------------- #
 # Classifier input bundle                                                      #

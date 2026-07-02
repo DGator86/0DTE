@@ -24,8 +24,9 @@ import gzip
 import urllib.request
 import urllib.error
 import datetime as dt
-from collections import deque
 from datetime import datetime
+
+from gex_window import GexRankWindow
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -530,9 +531,10 @@ class MassiveDataFeed:
         use_chain_vix: bool = True,
         vix_refresh_seconds: int = 600,
         # State: rolling GEX history for percentile rank
-        gex_history_len: int = 100,
+        gex_history_len: int = 100,        # retained for API compat; window is time-based now
         has_catalyst: bool = False,
         catalyst_label: str | None = None,
+        gex_history_path: str | None = None,      # persist |GEX| rank window across restarts
     ) -> None:
         self.underlying = underlying
         self.lookback_minutes = lookback_minutes
@@ -545,7 +547,7 @@ class MassiveDataFeed:
         self._use_chain_vix = use_chain_vix
         self._vix_refresh_seconds = vix_refresh_seconds
         self._vix_ts: datetime | None = None    # last term-structure refresh
-        self._gex_history: deque[float] = deque(maxlen=gex_history_len)
+        self._gex_window = GexRankWindow(path=gex_history_path)
         self.has_catalyst = has_catalyst
         self.catalyst_label = catalyst_label
 
@@ -573,9 +575,7 @@ class MassiveDataFeed:
         self._vvix, self._vvix_baseline = vvix, vvix_baseline
 
     def _gex_pct_rank(self, net_gex: float) -> float:
-        self._gex_history.append(net_gex)
-        h = list(self._gex_history)
-        return float(sum(1 for x in h if x < net_gex) / len(h)) if len(h) > 1 else 0.5
+        return self._gex_window.rank(net_gex)
 
     def _t_years(self, now: dt.datetime) -> float:
         """Minutes remaining to 4 pm ET expiry, expressed as a fraction of a year."""

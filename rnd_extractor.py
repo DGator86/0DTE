@@ -97,6 +97,12 @@ class RNDConfig:
     rv_max_gap_min: float = 3.0     # drop returns spanning gaps longer than this (overnight)
     rv_scale_min: float = 0.5       # squeeze floor: phys_std never below 0.5*rn_std
     rv_scale_max: float = 1.5       # squeeze cap: phys_std never above 1.5*rn_std
+    # Directional drift tilt (used ONLY when the regime router emits a resolved
+    # direction). A debit structure is a bet on drift; a drift-less physical
+    # density prices every debit at EV<=0 by construction, so the momentum
+    # belief must be explicit — and journal-calibrated — not implicit.
+    # Shift = dir_drift_frac * conviction_size_mult * phys_std, signed.
+    dir_drift_frac: float = 0.30
 
 
 # --------------------------------------------------------------------------- #
@@ -403,6 +409,7 @@ def physical_pdf_from_realized_vol(
     rnd: RiskNeutralDensity,
     sigma_annual: float,
     cfg: Optional[RNDConfig] = None,
+    drift_std_frac: float = 0.0,
 ) -> Optional[Callable[[np.ndarray], np.ndarray]]:
     """
     Build the physical density from a realized-vol forecast: keep the RND's
@@ -414,6 +421,12 @@ def physical_pdf_from_realized_vol(
     the chain implies and what the tape is actually doing. The squeeze factor
     is clipped to [rv_scale_min, rv_scale_max] so a bad vol print can't push
     the physical density somewhere absurd.
+
+    drift_std_frac shifts the density's center by that fraction of the
+    physical std (signed; + = up). Zero (default) keeps the drift-less density
+    used for the richness measurement. The directional engine passes the tilt
+    from its resolved bias — a debit trade IS a drift belief, and this is
+    where that belief becomes an explicit, journal-calibratable number.
 
     Returns a callable(grid)->density (interpolates onto any grid; callers
     renormalize), or None on degenerate inputs so callers can fall back.
@@ -427,7 +440,8 @@ def physical_pdf_from_realized_vol(
         return None
     scale = float(np.clip(target_std / rn_std, cfg.rv_scale_min, cfg.rv_scale_max))
     dens = _squeeze_rnd(rnd, scale)
-    grid0, dens0 = rnd.grid.copy(), dens
+    shift = float(drift_std_frac) * scale * rn_std      # phys_std = scale * rn_std
+    grid0, dens0 = rnd.grid.copy() + shift, dens
 
     def pdf(grid: np.ndarray) -> np.ndarray:
         return np.interp(np.asarray(grid, dtype=float), grid0, dens0,

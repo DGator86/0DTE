@@ -40,6 +40,7 @@ from spy0dte import OptionRow, build_gamma_map
 from gate_scorer import MarketSnapshot
 from unified_loop import TickSnapshot
 from yahoo_feed import YahooBackstop
+from gex_window import GexRankWindow
 # Reuse the chain/technical helpers already proven against the Massive feed.
 from massive_feed import (
     _option_rows_to_chain_snapshot, _bar_technicals,
@@ -222,12 +223,12 @@ class TastytradeDataFeed:
         vvix_baseline: float = 95.0,
         use_live_vix: bool = True,
         vix_refresh_seconds: int = 600,
-        gex_history_len: int = 100,
+        gex_history_len: int = 100,        # retained for API compat; window is time-based now
         has_catalyst: bool = False,
         catalyst_label: Optional[str] = None,
         stream_budget_s: float = 8.0,
+        gex_history_path: Optional[str] = None,   # persist |GEX| rank window across restarts
     ) -> None:
-        from collections import deque
         self.underlying = underlying
         self.lookback_minutes = lookback_minutes
         self.r = r
@@ -236,7 +237,7 @@ class TastytradeDataFeed:
         self._use_live_vix = use_live_vix
         self._vix_refresh_seconds = vix_refresh_seconds
         self._vix_ts: Optional[datetime] = None
-        self._gex_history: "deque[float]" = deque(maxlen=gex_history_len)
+        self._gex_window = GexRankWindow(path=gex_history_path)
         self.has_catalyst = has_catalyst
         self.catalyst_label = catalyst_label
         self.stream_budget_s = stream_budget_s
@@ -250,9 +251,7 @@ class TastytradeDataFeed:
         return self._session
 
     def _gex_pct_rank(self, net_gex: float) -> float:
-        self._gex_history.append(net_gex)
-        h = list(self._gex_history)
-        return float(sum(1 for x in h if x < net_gex) / len(h)) if len(h) > 1 else 0.5
+        return self._gex_window.rank(net_gex)
 
     def _t_years(self, now: dt.datetime) -> float:
         today = now.astimezone(ET)

@@ -96,6 +96,7 @@ class UnifiedOrchestrator:
     classifier_cfg: Optional[ClassifierConfig] = None
     physical_pdf: Optional[Callable] = None     # callable(grid)->density for Track A
     risk_manager: Optional[RiskManager] = None
+    state_path: Optional[str] = None            # persist adaptive scales across restarts
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
@@ -103,6 +104,43 @@ class UnifiedOrchestrator:
         )
         self._prev_std: Optional[dict] = None   # for information-gain computation
         self._matrix_scale_book = ScaleBook()   # adaptive scales for MTF matrix variables
+        self._ticks_since_save = 0
+        self._load_state()
+
+    # -- adaptive-state persistence -------------------------------------------
+    # The ScaleBooks ARE the system's memory of what "normal" looks like; if
+    # they die with the process, every restart re-runs the cold start where
+    # slope/flow variables read ~50 and the direction bias washes out to
+    # neutral. Best-effort JSON: corrupt or missing state just re-warms.
+    def _load_state(self) -> None:
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path, encoding="utf-8") as f:
+                data = json.load(f)
+            self._matrix_scale_book.load_dict(data.get("matrix_scales", {}))
+            self._classifier.scales.load_dict(data.get("classifier_scales", {}))
+        except Exception:
+            pass
+
+    def _save_state(self) -> None:
+        if not self.state_path:
+            return
+        try:
+            import os
+            import tempfile
+            payload = {
+                "matrix_scales": self._matrix_scale_book.to_dict(),
+                "classifier_scales": self._classifier.scales.to_dict(),
+            }
+            directory = os.path.dirname(self.state_path) or "."
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix=".adaptive_", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, self.state_path)
+        except Exception:
+            pass                                 # never let persistence break a tick
 
     def tick(self, now: dt.datetime) -> Optional[TickResult]:
         snap = self.feed.snapshot(now)
@@ -118,12 +156,15 @@ class UnifiedOrchestrator:
         # inside compute_edge. Without the realized-vol step the variance
         # ratio — and thus `richness` — is a constant by construction.
         rnd = edge = None
+        sigma_rv = None
         phys_pdf = self.physical_pdf
         if snap.chain is not None:
             try:
                 rnd = extract_rnd(snap.chain, cfg.rnd)
                 if phys_pdf is None:
-                    phys_pdf = _realized_vol_pdf(rnd, snap.bars, cfg.rnd)
+                    sigma_rv = _safe_realized_sigma(snap.bars, cfg.rnd)
+                    if sigma_rv is not None:
+                        phys_pdf = physical_pdf_from_realized_vol(rnd, sigma_rv, cfg.rnd)
                 edge = compute_edge(rnd, snap.chain, cfg.rnd,
                                     physical_pdf=phys_pdf)
             except Exception:
@@ -145,6 +186,12 @@ class UnifiedOrchestrator:
         regime_state = self._classifier.classify(clf_ctx, self._prev_std)
         self._prev_std = regime_state.standardized
 
+        # periodic flush of adaptive scales (cheap; ~every 10 minutes at 60s ticks)
+        self._ticks_since_save += 1
+        if self._ticks_since_save >= 10:
+            self._save_state()
+            self._ticks_since_save = 0
+
         # ---- Track B: matrix + decision routing ----
         mtf_in = build_mtf_input(snap.bars, snap_dict)
         mat_rows = build_matrix(mtf_in, self._matrix_scale_book)
@@ -164,10 +211,24 @@ class UnifiedOrchestrator:
             return result
 
         # ---- Track A: full engine (requires chain) ----
+        # A resolved directional intent carries a drift belief. Encode it as a
+        # tilt of the same realized-vol density (fraction of phys std, scaled
+        # by conviction) so debit structures aren't priced against a density
+        # that says the market goes nowhere. The tick-level edge/richness above
+        # stays drift-less — variance, not direction, is that measurement.
         decision = None
         if snap.chain is not None:
+            decide_pdf = phys_pdf
+            if (self.physical_pdf is None and rnd is not None and sigma_rv is not None
+                    and intent.decision.structure in DIRECTIONAL_TILT_STRUCTURES):
+                sign = 1.0 if intent.decision.direction == "call" else -1.0
+                tilt = sign * cfg.rnd.dir_drift_frac * intent.size_mult
+                tilted = physical_pdf_from_realized_vol(rnd, sigma_rv, cfg.rnd,
+                                                        drift_std_frac=tilt)
+                if tilted is not None:
+                    decide_pdf = tilted
             decision = decide(snap.market, snap.chain, cfg,
-                              physical_pdf=phys_pdf,
+                              physical_pdf=decide_pdf,
                               target_structure=intent.decision.structure,
                               direction=intent.decision.direction)
             # ---- Risk gate (optional, applied before journaling) ----
@@ -225,6 +286,7 @@ class UnifiedOrchestrator:
         return out
 
     def settle(self, session_date: str) -> int:
+        self._save_state()                       # end-of-day flush of adaptive scales
         if self.journal is None:
             return 0
         price = self.feed.settlement_price(session_date)
@@ -236,16 +298,30 @@ class UnifiedOrchestrator:
 # --------------------------------------------------------------------------- #
 # Default physical density: realized vol from the tick's own bars             #
 # --------------------------------------------------------------------------- #
+# Debit structures whose fill should be priced against the drift-tilted
+# density (the resolved bias IS the drift belief). STG is direction-"both"
+# long vol — it gets the drift-less density like everything else.
+DIRECTIONAL_TILT_STRUCTURES = frozenset({"LCS", "LPS", "LC", "LP", "BKS"})
+
+
+def _safe_realized_sigma(bars: Optional[RawBars], cfg: RNDConfig) -> Optional[float]:
+    """EWMA realized vol from 1-min bars; None (never raises) when too thin."""
+    try:
+        return ewma_realized_vol(bars.ts, bars.close, cfg)
+    except Exception:
+        return None
+
+
 def _realized_vol_pdf(rnd, bars: RawBars, cfg: RNDConfig):
     """
     EWMA realized vol from the 1-min bars, imposed on the RND's shape.
     Returns None (never raises) when the bar history is too thin or degenerate,
     letting compute_edge fall back to the static VRP haircut.
     """
+    sigma = _safe_realized_sigma(bars, cfg)
+    if sigma is None:
+        return None
     try:
-        sigma = ewma_realized_vol(bars.ts, bars.close, cfg)
-        if sigma is None:
-            return None
         return physical_pdf_from_realized_vol(rnd, sigma, cfg)
     except Exception:
         return None

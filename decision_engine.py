@@ -34,7 +34,7 @@ from gate_scorer import MarketSnapshot, GateConfig, Decision, evaluate as gate_e
 from rnd_extractor import ChainSnapshot, RNDConfig, extract_rnd, compute_edge
 from spread_selector import (
     GammaContext, SelectorConfig, select_spreads, SpreadCandidate,
-    STRUCTURE_TO_FAMILIES,
+    STRUCTURE_TO_FAMILIES, DEBIT_FAMILIES,
 )
 
 
@@ -136,7 +136,17 @@ def decide(
     )
 
     # --- gate (independent of selector) ---
-    gate = gate_evaluate(market, cfg.gate)
+    # The routed structure decides WHICH gate applies: premium credit families
+    # face the full premium-selling gate; debit families face only the
+    # universal stops plus the trend-quality score. Without this split, the
+    # premium gate (no trend, above flip, strong long gamma) vetoes every
+    # directional ticket the regime router emits — the exact tape a debit
+    # trade wants is the tape the premium gate forbids.
+    fams = STRUCTURE_TO_FAMILIES.get(target_structure) if target_structure else None
+    structure_class = ("directional" if fams is not None and fams <= DEBIT_FAMILIES
+                       else "premium")
+    gate = gate_evaluate(market, cfg.gate, structure_class=structure_class,
+                         direction=direction)
     gate_pass = gate.decision is Decision.GO
 
     # --- selector: needs a usable chain ---
@@ -148,7 +158,6 @@ def decide(
         edge = compute_edge(rnd, chain, cfg.rnd, physical_pdf=physical_pdf)
         edge_rich = edge.richness_signal
         ctx = GammaContext.from_market_snapshot(market)
-        fams = STRUCTURE_TO_FAMILIES.get(target_structure) if target_structure else None
         sel = select_spreads(chain, rnd, edge, ctx, cfg.selector, physical_pdf=physical_pdf,
                              target_families=fams)
         candidate = sel.best

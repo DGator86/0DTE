@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import os
 import sys
 import time
 from zoneinfo import ZoneInfo
@@ -103,6 +104,9 @@ class ShadowRunner:
         self.live_state_path = live_state_path
 
         self._jrn = Journal(db_path)
+        # Adaptive state (GEX percentile window, scale books) lives next to the
+        # journal DB so restarts and deploys don't cold-start the gates.
+        state_dir = os.path.dirname(os.path.abspath(db_path))
         # Auto-detect credentialed providers (Tradier -> Tastytrade -> Massive)
         # and fail over between them per tick; Yahoo backstops settlement.
         self._feed = build_default_feed(
@@ -113,10 +117,12 @@ class ShadowRunner:
             vix3m=vix3m,
             vvix=vvix,
             vvix_baseline=vvix_baseline,
+            gex_history_path=os.path.join(state_dir, "gex_history.json"),
         )
         self._risk = RiskManager(risk_cfg) if risk_cfg else None
         self._orch = UnifiedOrchestrator(
-            feed=self._feed, journal=self._jrn, risk_manager=self._risk
+            feed=self._feed, journal=self._jrn, risk_manager=self._risk,
+            state_path=os.path.join(state_dir, "adaptive_state.json"),
         )
         self._notifier = Notifier()
         self._settled: set[str] = set()
