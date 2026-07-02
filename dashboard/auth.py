@@ -5,6 +5,7 @@ Bearer-token auth for the read-only dashboard.
 """
 from __future__ import annotations
 
+import hmac
 import os
 from typing import Optional
 
@@ -22,12 +23,11 @@ def check_token(request: Request) -> None:
     if not expected:
         raise HTTPException(status_code=503, detail="DASHBOARD_TOKEN not configured")
 
+    # Header only — a ?token= query param would end up in access logs and
+    # browser history. (The UI's ?token= bookmark never reaches /api/*: app.js
+    # moves it into sessionStorage and sends the Authorization header.)
     auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer ") and auth[7:] == expected:
-        return
-
-    query_token = request.query_params.get("token")
-    if query_token == expected:
+    if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], expected):
         return
 
     raise HTTPException(status_code=401, detail="Unauthorized")
