@@ -41,7 +41,10 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from gate_scorer import MarketSnapshot
-from rnd_extractor import ChainSnapshot, extract_rnd, compute_edge, RNDConfig
+from rnd_extractor import (
+    ChainSnapshot, extract_rnd, compute_edge, RNDConfig,
+    ewma_realized_vol, physical_pdf_from_realized_vol,
+)
 from decision_engine import decide, EngineConfig, TradeDecision
 from resample import RawBars, build_mtf_input
 from mtf_matrix import build_matrix, regime_rows
@@ -109,12 +112,20 @@ class UnifiedOrchestrator:
         cfg = self.engine_cfg or EngineConfig()
 
         # ---- Track A RND (feeds both regime and selector) ----
+        # One physical density per tick, shared by compute_edge and decide()
+        # (single source of truth). Priority: injected callable > realized-vol
+        # squeeze of the RND (from the tick's own bars) > static VRP haircut
+        # inside compute_edge. Without the realized-vol step the variance
+        # ratio — and thus `richness` — is a constant by construction.
         rnd = edge = None
+        phys_pdf = self.physical_pdf
         if snap.chain is not None:
             try:
                 rnd = extract_rnd(snap.chain, cfg.rnd)
+                if phys_pdf is None:
+                    phys_pdf = _realized_vol_pdf(rnd, snap.bars, cfg.rnd)
                 edge = compute_edge(rnd, snap.chain, cfg.rnd,
-                                    physical_pdf=self.physical_pdf)
+                                    physical_pdf=phys_pdf)
             except Exception:
                 pass
 
@@ -156,7 +167,7 @@ class UnifiedOrchestrator:
         decision = None
         if snap.chain is not None:
             decision = decide(snap.market, snap.chain, cfg,
-                              physical_pdf=self.physical_pdf,
+                              physical_pdf=phys_pdf,
                               target_structure=intent.decision.structure,
                               direction=intent.decision.direction)
             # ---- Risk gate (optional, applied before journaling) ----
@@ -220,6 +231,24 @@ class UnifiedOrchestrator:
         if price is None:
             return 0
         return self.journal.settle_session(session_date, price)
+
+
+# --------------------------------------------------------------------------- #
+# Default physical density: realized vol from the tick's own bars             #
+# --------------------------------------------------------------------------- #
+def _realized_vol_pdf(rnd, bars: RawBars, cfg: RNDConfig):
+    """
+    EWMA realized vol from the 1-min bars, imposed on the RND's shape.
+    Returns None (never raises) when the bar history is too thin or degenerate,
+    letting compute_edge fall back to the static VRP haircut.
+    """
+    try:
+        sigma = ewma_realized_vol(bars.ts, bars.close, cfg)
+        if sigma is None:
+            return None
+        return physical_pdf_from_realized_vol(rnd, sigma, cfg)
+    except Exception:
+        return None
 
 
 # --------------------------------------------------------------------------- #
