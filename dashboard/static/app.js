@@ -213,6 +213,13 @@
     const inp = live.inputs || {};
     $("playbook-fam").textContent = t.selected_family || (live.doing && live.doing.structure) || "—";
 
+    // The candidate journaled on a NO_TRADE tick is the measurement loop's
+    // would-be pick (kept so settlement can score its hypothetical P&L).
+    // It can be a degenerate penny structure — flag it so it never reads
+    // as a trade recommendation.
+    const isDiagnostic = !!t.selected_family && t.decision !== "TRADE" && !num(t.was_traded);
+    $("playbook-diag").hidden = !isDiagnostic;
+
     const evCls = num(t.ev) > 0 ? "pos" : num(t.ev) < 0 ? "neg" : "";
     const cards = [
       metricCard("Short", strikes(t.short_strikes)),

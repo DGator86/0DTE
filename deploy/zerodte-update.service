@@ -1,0 +1,14 @@
+[Unit]
+# Pull-based deploy: checks GitHub for a new commit on main and, when one
+# lands, runs deploy/remote-deploy.sh. Requires only OUTBOUND https — deploys
+# keep working when inbound SSH to the box is blocked or rate-limited.
+Description=0DTE self-update (pull-based deploy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash /opt/zerodte/deploy/self-update.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-update

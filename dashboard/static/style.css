@@ -373,6 +373,21 @@ html, body {
 .readiness-badge.ready { color: var(--green); background: rgba(46,199,133,0.12); border: 1px solid var(--green-dim); }
 .readiness-badge.not-ready { color: var(--amber); background: rgba(255,182,72,0.1); border: 1px solid var(--amber-dim); }
 
+/* Playbook diagnostic badge: the journaled would-be candidate on a no-trade
+   tick is a measurement artifact, not a recommendation — say so loudly. */
+.diag-badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  margin-left: 8px;
+  border-radius: 999px;
+  letter-spacing: 0.05em;
+  color: var(--amber);
+  background: rgba(255,182,72,0.1);
+  border: 1px solid var(--amber-dim);
+}
+
 .rc-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));

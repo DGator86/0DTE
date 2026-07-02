@@ -137,6 +137,17 @@ DECISION_TABLE: dict[tuple, Decision] = {
 
 PREMIUM_STRUCTURES = {"PCS", "CCS", "IC", "IF"}
 
+# Veto names that forbid premium selling. Both naming conventions are accepted:
+# gate_scorer.dealer_vetoes emits "short_gamma"/"below_flip" while
+# regime_classifier._vetoes (the one wired into the live loop) emits
+# "short_gamma_regime"/"below_gamma_flip". Matching only one set silently
+# disabled the credit->debit flip below for the live path.
+NO_PREMIUM_VETOES = {
+    "short_gamma", "short_gamma_regime",
+    "below_flip", "below_gamma_flip",
+    "term_backwardation",
+}
+
 
 # --------------------------------------------------------------------------- #
 # Collapse the matrix into the three axes                                      #
@@ -224,7 +235,7 @@ def decide_from_matrix(rows: list, regimes: dict,
 
     # dealer-state vetoes override premium-selling cells
     hard_stop = any(v.startswith("catalyst") for v in vetoes)
-    no_premium = any(v in ("short_gamma", "below_flip", "term_backwardation") for v in vetoes)
+    no_premium = any(v in NO_PREMIUM_VETOES for v in vetoes)
 
     if hard_stop:
         decision = DECISION_TABLE[("trend", "trend", "neutral")]  # the NT cell

@@ -173,13 +173,39 @@ regime_classifier  (standalone; same idea as decision_matrix's regime layer)
    synthetic generator; real bars are fine). Prefer a real signed-volume feed.
 6. **`tick_two_sided` needs a real $TICK feed**; absent it the cell is `None` (by
    design, drops out).
-7. **Directional engine not built.** Track B emits LCS/LC/LP/STG/BKS tickets, but
-   only the premium families have a selector. `spread_selector` is credit-only.
+7. ~~Directional engine not built~~ **Wrong — and now actually unblocked.**
+   `spread_selector` has had the debit families (`long_call_spread`,
+   `long_put_spread`, `long_call`, `long_put`, `long_strangle`, backspreads)
+   all along; what kept the directional engine dead in the live loop was:
+   - `decision_engine.decide` ANDed the **premium-selling** gate (no trend,
+     above flip, strong long gamma) against every structure — the exact tape
+     a debit trade wants is the tape that gate forbids. Fixed:
+     `gate_scorer.evaluate(structure_class="directional")` applies only the
+     universal stops (catalyst, late lockout) and scores trend quality
+     (`score_directional`: ADX presence, sign-aligned flow, dealer
+     amplification, vol value, timing — weights in `GateConfig`, journal-
+     calibratable).
+   - `regime_classifier` veto names (`short_gamma_regime`/`below_gamma_flip`)
+     never matched `decision_matrix`'s premium-veto set (`short_gamma`/
+     `below_flip`), so the intended credit→debit flip was dead code. Fixed
+     with `NO_PREMIUM_VETOES` accepting both conventions.
+   - A drift-less physical density prices every debit at EV≤0 by
+     construction. A resolved directional intent now tilts the realized-vol
+     density (`dir_drift_frac` × conviction × phys std, in `RNDConfig`) for
+     the fill only; the richness measurement stays drift-less.
 
 **Bug fixed this session:** `decision_matrix._dominant` crashed (`None > float`) on
 short history / session open when a timeframe basket had no computable regime.
 Now guarded: ignores `None` regimes, and `decide_from_matrix` stands down cleanly
 when a basket is undefined. (This is the version in this handoff.)
+
+**Adaptive state now persists.** The |GEX| percentile window
+(`gex_window.GexRankWindow`: abs-magnitude, multi-day horizon, neutral 0.5
+until 30 samples, shared by all three feeds) and both ScaleBooks (matrix +
+classifier, via `UnifiedOrchestrator(state_path=...)`) survive restarts as
+JSON next to the journal DB. Before this, every deploy cold-started the gate
+(`gex_pct_rank` pinned at an extreme) and washed the direction bias out to
+neutral.
 
 ---
 
@@ -197,11 +223,14 @@ Yahoo quarantined to bars/settlement). Remaining, in order:
    priors. Don't build new modules before this loop closes.
 2. **Arbitrate the GEX measurement** (§5 item 4b) with the shadow journal:
    OI-only vs front-weeklies-included vs intraday volume-weighted proxy.
-3. **Adaptive scales.** Route `mtf_matrix`/`decision_matrix`/`resample`
-   standardizer scales through `regime_classifier.ScaleBook`.
-4. **Build the directional selector** (debit spreads / convex longs / strangles) so
-   the LCS/LC/LP/STG/BKS cells become fillable, mirroring `spread_selector`'s
-   structure (leg-based payoff, EV vs physical density, defined risk).
+3. **Adaptive scales — partially done.** `build_matrix` already routes through
+   `ScaleBook` in the live loop and the books now persist across restarts;
+   `decision_matrix`/`resample` fixed priors remain for their residual
+   constants.
+4. **Calibrate the directional priors.** The directional path is now live end
+   to end (see §5 item 7): `GateConfig.w_dir_*`, `dir_adx_floor/full`, and
+   `RNDConfig.dir_drift_frac` are structured guesses. The journal settles
+   every directional would-be candidate — regress and adjust from data.
 
 ---
 

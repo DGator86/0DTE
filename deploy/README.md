@@ -163,11 +163,44 @@ re-warm after a restart (the journal itself persists).
 
 ---
 
+## Pull-based self-update (survives SSH outages)
+
+The box updates **itself**: `zerodte-update.timer` runs
+[`deploy/self-update.sh`](self-update.sh) every 2 minutes, which checks
+GitHub for a new commit on `main` and — only when one landed — runs the
+repo's own `remote-deploy.sh` (reset checkout, deps if changed, restart
+services). This needs only **outbound** HTTPS, so deploys keep flowing when
+inbound SSH is blocked by a firewall change, an IP rotation, or fail2ban
+banning GitHub's runners (which is exactly how a release got stranded once).
+
+`remote-deploy.sh` installs and enables the timer, so any successful deploy
+turns it on. **If the box is currently unreachable over SSH**, bootstrap it
+once from the Hostinger hPanel browser terminal (no SSH involved):
+
+```bash
+sudo git -C /opt/zerodte fetch origin main
+sudo git -C /opt/zerodte show origin/main:deploy/remote-deploy.sh | sudo DEPLOY_REF=main bash -s
+```
+
+That runs the *latest* deploy script straight from the fetched ref: it
+updates the code, installs the timer, and restarts the services. From then
+on every push to `main` is live on the box within ~2 minutes, SSH or no SSH.
+
+Check it:
+
+```bash
+systemctl list-timers zerodte-update.timer
+journalctl -u zerodte-update -n 20      # silent when up to date; logs on deploy
+```
+
 ## Push-to-deploy (GitHub Actions)
 
 `.github/workflows/deploy.yml` SSHes into the VPS on every push to `main` and
 runs [`deploy/remote-deploy.sh`](remote-deploy.sh), which fast-forwards the
-checkout under `/opt/zerodte` and restarts the service. The deploy script is
+checkout under `/opt/zerodte` and restarts the service. It is now the
+*secondary* path — the self-update timer above delivers the same deploy
+without inbound SSH — but stays useful for instant deploys and manual
+`workflow_dispatch` runs of a specific ref. The deploy script is
 **idempotent** — the first run also provisions the service user, venv, and
 systemd unit, so it covers steps 1–3 and 5 above automatically. The only manual
 step that remains is the **secrets file** (step 4): the script never writes it

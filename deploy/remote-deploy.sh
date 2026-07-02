@@ -69,6 +69,12 @@ log "systemd unit"
 install -m 644 "$APP_DIR/deploy/$SVC.service" "/etc/systemd/system/$SVC.service"
 systemctl daemon-reload
 
+log "Self-update timer (pull-based deploys; inbound SSH not required)"
+install -m 644 "$APP_DIR/deploy/zerodte-update.service" /etc/systemd/system/zerodte-update.service
+install -m 644 "$APP_DIR/deploy/zerodte-update.timer" /etc/systemd/system/zerodte-update.timer
+systemctl daemon-reload
+systemctl enable --now zerodte-update.timer >/dev/null 2>&1 || true
+
 if [ ! -f "$ENV_FILE" ]; then
     # printf renders the color; a plain heredoc can't interpret \033 escapes
     # and would print them literally — and this is the first-run message.

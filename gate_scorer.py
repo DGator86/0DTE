@@ -147,6 +147,20 @@ class GateConfig:
     kelly_frac_min: float = 0.15
     kelly_frac_max: float = 1.00
 
+    # --- directional (debit) scoring weights (sum to 100) ---
+    # The hard gates above are premium-selling FACTS (no trend, above flip,
+    # strong long gamma). A debit structure wants the opposite tape, so when the
+    # routed structure is directional only the universal stops apply (catalyst,
+    # late lockout) and the score measures trend quality instead. These weights
+    # are priors for the journal to calibrate, like everything else here.
+    w_dir_trend: float = 30.0          # ADX presence (trend actually underway)
+    w_dir_flow: float = 25.0           # aggressor persistence, sign-aligned with direction
+    w_dir_amplify: float = 20.0        # dealer amplification (short gamma / below flip)
+    w_dir_vol_value: float = 15.0      # debit buys premium; cheap straddle = good entry
+    w_dir_timing: float = 10.0
+    dir_adx_floor: float = 20.0        # ADX ramp start ("trend present")
+    dir_adx_full: float = 35.0         # ADX at which the trend component maxes
+
 
 class Decision(Enum):
     GO = "GO"
@@ -237,6 +251,25 @@ def evaluate_gates(s: MarketSnapshot, cfg: GateConfig) -> list[str]:
     return failed
 
 
+def evaluate_directional_gates(s: MarketSnapshot, cfg: GateConfig) -> list[str]:
+    """Hard gates for DEBIT structures: only the universal stops.
+
+    GEX_SHORT / BELOW_FLIP / TRENDING / TERM_INVERTED are reasons premium
+    selling dies — they are the tape a directional debit trade *wants* — so
+    they must not veto it. Catalyst and the late-day lockout stop everything.
+    """
+    failed: list[str] = []
+    if cfg.require_no_catalyst and s.has_catalyst:
+        label = s.catalyst_label or "scheduled event"
+        failed.append(f"CATALYST: {label} in window (range-breaking)")
+    if s.et_time() >= cfg.late_lockout_time:
+        failed.append(
+            f"LATE: {s.et_time():%H:%M} ET past lockout {cfg.late_lockout_time:%H:%M} "
+            "(close-gamma too hot to initiate)"
+        )
+    return failed
+
+
 # --------------------------------------------------------------------------- #
 # Weighted score                                                               #
 # --------------------------------------------------------------------------- #
@@ -297,6 +330,51 @@ def score_setup(s: MarketSnapshot, cfg: GateConfig) -> dict[str, float]:
     return sub
 
 
+def score_directional(s: MarketSnapshot, cfg: GateConfig, direction: str = "") -> dict[str, float]:
+    """Per-component scores for a debit/directional setup (already weighted).
+
+    direction: "call" | "put" | "both" | "" — used only to require that order
+    flow agrees with the trade's direction; "both"/"" skips the sign check.
+    """
+    sub: dict[str, float] = {}
+
+    # Trend presence: the mirror of adx_depth — a debit trade needs the move
+    sub["dir_trend"] = cfg.w_dir_trend * _scale(s.adx, cfg.dir_adx_floor, cfg.dir_adx_full)
+
+    # Flow persistence, sign-aligned: a persistent aggressor in your direction
+    flow_q = _clip01(abs(s.cvd_slope))
+    if direction == "call" and s.cvd_slope < 0:
+        flow_q = 0.0
+    elif direction == "put" and s.cvd_slope > 0:
+        flow_q = 0.0
+    sub["dir_flow"] = cfg.w_dir_flow * flow_q
+
+    # Dealer amplification: short gamma (or spot under the flip) means hedging
+    # chases price — the regime where moves extend instead of mean-revert.
+    if s.net_gex <= 0:
+        amp_q = 1.0
+    else:
+        amp_q = _scale((s.gamma_flip - s.spot) / s.spot, 0.0, 0.005)
+    sub["dir_amplify"] = cfg.w_dir_amplify * amp_q
+
+    # Vol value: a debit buys premium, so the cheaper the straddle vs expected
+    # realized, the better the entry (inverse of the seller's straddle_rich).
+    rich = (s.straddle_breakeven / s.expected_range) if s.expected_range else 1.0
+    sub["dir_vol_value"] = cfg.w_dir_vol_value * (1.0 - _scale(rich, 1.00, 1.40))
+
+    # Timing: same window shape as premium (post-discovery, pre-close-gamma)
+    t = s.et_time()
+    if t < cfg.morning_resolve_time:
+        timing_q = 0.3
+    elif t < dt.time(14, 0):
+        timing_q = 1.0
+    else:
+        timing_q = 0.7
+    sub["dir_timing"] = cfg.w_dir_timing * timing_q
+
+    return sub
+
+
 def pick_side(s: MarketSnapshot, cfg: GateConfig) -> tuple[Side, str, float]:
     d_call = abs(s.call_wall - s.spot) / s.spot
     d_put = abs(s.spot - s.put_wall) / s.spot
@@ -319,9 +397,17 @@ def score_to_kelly(score: float, cfg: GateConfig) -> float:
 # --------------------------------------------------------------------------- #
 # Top-level entry point                                                        #
 # --------------------------------------------------------------------------- #
-def evaluate(s: MarketSnapshot, cfg: Optional[GateConfig] = None) -> GateResult:
+def evaluate(s: MarketSnapshot, cfg: Optional[GateConfig] = None,
+             structure_class: str = "premium", direction: str = "") -> GateResult:
+    """
+    structure_class: "premium" (default — the original credit-selling gate) or
+    "directional" (debit structures: universal stops only + trend-quality score).
+    """
     cfg = cfg or GateConfig()
-    failed = evaluate_gates(s, cfg)
+    if structure_class == "directional":
+        failed = evaluate_directional_gates(s, cfg)
+    else:
+        failed = evaluate_gates(s, cfg)
 
     side, nearer_wall, wall_dist = pick_side(s, cfg)
 
@@ -336,6 +422,23 @@ def evaluate(s: MarketSnapshot, cfg: Optional[GateConfig] = None) -> GateResult:
             wall_distance_frac=wall_dist,
             kelly_fraction=0.0,
             rationale="NO-GO. " + " | ".join(failed),
+        )
+
+    if structure_class == "directional":
+        sub = score_directional(s, cfg, direction)
+        total = round(sum(sub.values()), 1)
+        kelly = round(score_to_kelly(total, cfg), 3)
+        return GateResult(
+            decision=Decision.GO,
+            score=total,
+            failed_gates=[],
+            subscores={k: round(v, 1) for k, v in sub.items()},
+            side=Side.WAIT_FOR_EDGE,       # wall-side picking is a seller's concept
+            nearer_wall=nearer_wall,
+            wall_distance_frac=wall_dist,
+            kelly_fraction=kelly,
+            rationale=(f"GO directional (score {total}). Trend/flow-quality score; "
+                       f"structure and strikes come from the selector."),
         )
 
     sub = score_setup(s, cfg)

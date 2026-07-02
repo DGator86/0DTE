@@ -114,6 +114,12 @@ class SelectorConfig:
     min_liquidity: float = 0.25
     max_touch_short: float = 0.55                    # reject if short too likely to be tagged
     veto_short_below_flip: bool = True               # the "491P under the 490 flip" rule
+    # Degenerate-structure floor: a $0.01 credit condor or a fraction-of-a-cent
+    # debit spread is unfillable noise, but epsilon-EV / epsilon-risk ratios
+    # rank absurdly high and pollute both ranking and the journaled would-be
+    # candidate. Require real premium on either side.
+    min_credit: float = 0.05                         # $ per share collected (credit families)
+    min_debit: float = 0.05                          # $ per share paid (debit families)
 
     # safety shaping (sigmoid scales, in $)
     wall_scale: float = 1.5
@@ -380,6 +386,11 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
     reasons = []
     if ev <= cfg.min_ev:
         reasons.append(f"EV<={cfg.min_ev:g}")
+    if is_debit:
+        if -credit < cfg.min_debit:
+            reasons.append(f"debit {-credit:.2f}<{cfg.min_debit:.2f}")
+    elif credit < cfg.min_credit:
+        reasons.append(f"credit {credit:.2f}<{cfg.min_credit:.2f}")
     if not naked and max_loss > cfg.max_loss_cap:
         reasons.append(f"max_loss {max_loss:.2f}>cap")
     if liquidity_score < cfg.min_liquidity:
