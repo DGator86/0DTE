@@ -9,6 +9,7 @@ import json
 import sqlite3
 from typing import Optional
 
+from dashboard.state import read_live_state
 from journal import Journal
 
 
@@ -83,6 +84,44 @@ def report_summary(db_path: str) -> dict:
         }
     finally:
         jrn.close()
+
+
+def paper_trades_journal(paper_db_path: str, live_state_path: str = "",
+                          limit: int = 200) -> dict:
+    """Trade journal: open positions (from live_state, marked every tick) plus
+    closed paper trades with entry context (why) and exit reason (how it ended)."""
+    open_positions: list = []
+    if live_state_path:
+        try:
+            state = read_live_state(live_state_path) or {}
+            open_positions = (state.get("paper") or {}).get("open") or []
+        except Exception:
+            open_positions = []
+
+    closed: list = []
+    try:
+        conn = sqlite3.connect(f"file:{paper_db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return {"open": open_positions, "closed": [], "note": "paper database unavailable"}
+    try:
+        rows = conn.execute(
+            "SELECT * FROM paper_trades ORDER BY closed_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    except sqlite3.Error:
+        return {"open": open_positions, "closed": [], "note": "paper_trades table not found"}
+    finally:
+        conn.close()
+
+    for r in rows:
+        d = dict(r)
+        if d.get("entry_ctx"):
+            try:
+                d["entry_ctx"] = json.loads(d["entry_ctx"])
+            except (json.JSONDecodeError, TypeError):
+                d["entry_ctx"] = None
+        closed.append(d)
+    return {"open": open_positions, "closed": closed}
 
 
 def paper_summary(paper_db_path: str) -> dict:

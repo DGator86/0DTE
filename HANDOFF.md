@@ -233,8 +233,9 @@ Yahoo quarantined to bars/settlement). Remaining, in order:
    distinction before sizing up.
    **Real-data walk-forward is now buildable:** `shadow_runner` records every
    tick via `chain_store.ChainRecorder` (default `<db_dir>/ticks`, ~1 MB/day);
-   after a few weeks, `RecordedFeed(dir)` + `run_walk_forward` is an
-   out-of-sample test on actual markets. `optimizer.OptimizerConfig
+   once >= 3 sessions have accumulated, run it with one command —
+   `python3 walk_forward.py --recorded /var/lib/zerodte/ticks` — which prints
+   per-fold tearsheets plus the calibration panels. `optimizer.OptimizerConfig
    (holdout_frac=0.2)` keeps a final untouched window the search never sees.
 2. **Arbitrate the GEX measurement** (§5 item 4b) with the shadow journal:
    OI-only vs front-weeklies-included vs intraday volume-weighted proxy.

@@ -726,8 +726,173 @@
     } else if (note) { note.remove(); }
   }
 
+  /* ---------------- predictive power (calibration readouts) ---------------- */
+  function renderPredict(report) {
+    const cal = (report && report.calibration) || {};
+    const d = (cal.directional && cal.directional.overall) || {};
+    const pp = cal.prob_profit || {};
+    const ev = cal.ev || {};
+    const cards = [];
+    if (d.n) {
+      const hitCls = num(d.hit_rate) >= 0.52 ? "pos" : num(d.hit_rate) < 0.5 ? "neg" : "warn";
+      cards.push(metricCard("Dir. hit rate", `${pct(d.hit_rate)} (n=${d.n})`, hitCls));
+      cards.push(metricCard("Signed move", fmt(d.avg_fwd_move_pct, 3) + "%",
+                            num(d.avg_fwd_move_pct) > 0 ? "pos" : "neg"));
+    } else {
+      cards.push(metricCard("Dir. hit rate", "no sample"));
+    }
+    if (pp.n) {
+      cards.push(metricCard("Brier skill", `${fmt(pp.brier_skill, 2)} (n=${pp.n})`,
+                            num(pp.brier_skill) > 0 ? "pos" : "neg"));
+      cards.push(metricCard("Base rate", pct(pp.base_rate)));
+    }
+    if (ev.n) {
+      const bias = num(ev.mean_ev_error);
+      cards.push(metricCard("EV bias", (bias >= 0 ? "+" : "") + fmt(bias, 3),
+                            Math.abs(bias) <= 0.10 ? "pos" : "warn"));
+      cards.push(metricCard("EV MAE", fmt(ev.mae_ev_error, 3)));
+    }
+    $("predict-metrics").innerHTML = cards.length
+      ? cards.join("")
+      : '<p class="empty">No settled data yet — prediction is scored at settlement</p>';
+  }
+
+  /* ---------------- trade journal tab ---------------- */
+  let activeTab = "command";
+
+  function switchTab(tab) {
+    activeTab = tab;
+    $("tab-command").classList.toggle("active", tab === "command");
+    $("tab-journal").classList.toggle("active", tab === "journal");
+    $("view-command").classList.toggle("hidden", tab !== "command");
+    $("view-journal").classList.toggle("hidden", tab !== "journal");
+    if (tab === "journal") refreshJournal();
+  }
+
+  function entryLogicLine(ctx) {
+    if (!ctx) return "—";
+    const parts = [];
+    if (ctx.cell) parts.push(esc(ctx.cell.join(" × ")));
+    if (ctx.conviction && ctx.conviction !== "NONE") parts.push(esc(ctx.conviction));
+    if (ctx.capture) parts.push(esc(ctx.capture));
+    const nums = [];
+    if (num(ctx.gate_score) != null) nums.push("gate " + fmt(ctx.gate_score, 1));
+    if (num(ctx.ev) != null) nums.push("EV $" + fmt(ctx.ev, 2));
+    if (num(ctx.ev_per_risk) != null) nums.push(fmt(ctx.ev_per_risk, 2) + "/risk");
+    if (num(ctx.prob_profit) != null) nums.push("PoP " + pct(ctx.prob_profit));
+    if (num(ctx.size_mult) != null) nums.push("×" + fmt(ctx.size_mult, 2));
+    if (num(ctx.equity_at_entry) != null) nums.push("eq $" + fmt(ctx.equity_at_entry, 0));
+    return `<span class="tj-why">${parts.join(" · ")}</span>` +
+           (nums.length ? `<span class="tj-nums">${nums.join(" · ")}</span>` : "");
+  }
+
+  function exitLogicLine(t) {
+    const map = {
+      stop:   "stop-loss: loss reached its fraction of max loss",
+      target: "profit target: captured its fraction of max profit",
+      trail:  "trailing stop: gave back too much of peak profit",
+      eod:    "end of day: forced flat before the close",
+    };
+    return map[t.exit_reason] || esc(t.exit_reason || "—");
+  }
+
+  function renderJournal(data) {
+    const open = data.open || [];
+    $("tj-open-count").textContent = String(open.length);
+    if (!open.length) {
+      $("tj-open").innerHTML = '<p class="empty">No open positions</p>';
+    } else {
+      $("tj-open").innerHTML = open.map((p) => {
+        const pnl = num(p.unrealized_pnl_dollars);
+        const cls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
+        return `<div class="tj-open-row">
+          <div class="tj-head">
+            <b>${esc(p.family)}</b> <span class="mono">${esc(p.strikes)}</span>
+            <span>×${p.contracts}</span>
+            <span class="mono ${cls}">${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : "—"}</span>
+            <span class="tj-dim">${fmt(p.hold_min, 0)}m held</span>
+          </div>
+          <div class="tj-sub">${entryLogicLine(p.entry_ctx)}</div>
+        </div>`;
+      }).join("");
+    }
+
+    const closed = data.closed || [];
+    $("tj-closed-count").textContent = String(closed.length);
+    $("tj-empty").classList.toggle("hidden", closed.length > 0);
+    $("tj-table").classList.toggle("hidden", closed.length === 0);
+    $("tj-body").innerHTML = closed.map((t) => {
+      const pnl = num(t.pnl_dollars);
+      const cls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
+      const opened = (t.opened_at || "").slice(11, 16);
+      const reasonCls = t.exit_reason === "target" || t.exit_reason === "trail" ? "good"
+                      : t.exit_reason === "stop" ? "bad" : "";
+      return `<tr>
+        <td class="mono">${esc((t.opened_at || "").slice(0, 10))} ${opened}</td>
+        <td><b>${esc(t.family)}</b> <span class="mono tj-dim">${esc(t.strikes)}</span>
+            <div class="tj-sub">${entryLogicLine(t.entry_ctx)}</div></td>
+        <td class="mono">×${t.contracts}</td>
+        <td class="mono">${fmt(t.entry_credit, 2)}</td>
+        <td class="mono">${fmt(t.exit_value, 2)}</td>
+        <td class="mono">${fmt(t.hold_min, 0)}m</td>
+        <td class="mono ${cls}">${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : "—"}</td>
+        <td><span class="tj-reason ${reasonCls}">${esc(t.exit_reason || "—")}</span>
+            <div class="tj-sub">${exitLogicLine(t)}</div></td>
+        <td class="mono">$${fmt(t.equity_after, 2)}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  function drawEquityCurve(closed) {
+    const panel = $("tj-equity-panel");
+    const eq = closed.slice().reverse()
+      .map((t) => num(t.equity_after)).filter((v) => v != null);
+    if (eq.length < 2) { panel.classList.add("hidden"); return; }
+    panel.classList.remove("hidden");
+    $("tj-equity-now").textContent = "$" + eq[eq.length - 1].toFixed(2);
+
+    const canvas = $("tj-equity");
+    const wrap = canvas.parentElement;
+    const dpr = window.devicePixelRatio || 1;
+    const W = wrap.clientWidth || 600, H = wrap.clientHeight || 160;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const lo = Math.min(...eq), hi = Math.max(...eq);
+    const pad = 12, span = (hi - lo) || 1;
+    const x = (i) => pad + (W - 2 * pad) * (eq.length === 1 ? 0 : i / (eq.length - 1));
+    const y = (v) => H - pad - (H - 2 * pad) * ((v - lo) / span);
+
+    ctx.strokeStyle = "rgba(230,237,247,0.15)";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(pad, y(eq[0])); ctx.lineTo(W - pad, y(eq[0])); ctx.stroke();
+    ctx.setLineDash([]);
+
+    const up = eq[eq.length - 1] >= eq[0];
+    ctx.strokeStyle = up ? "#2ec785" : "#ff5470";
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    eq.forEach((v, i) => (i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v))));
+    ctx.stroke();
+  }
+
+  async function refreshJournal() {
+    try {
+      const data = await api("/api/trades?limit=200");
+      renderJournal(data);
+      drawEquityCurve(data.closed || []);
+    } catch (e) {
+      if (e.message !== "Unauthorized") console.warn("journal", e);
+    }
+  }
+
   /* ---------------- refresh loop ---------------- */
   async function refresh() {
+    if (activeTab === "journal") refreshJournal();
     try {
       let [live, market, history, report, paper, readiness] = await Promise.all([
         api("/api/live"),
@@ -766,6 +931,7 @@
       }
       renderPaper(paper);
       renderEdge(report);
+      renderPredict(report);
       renderReadiness(readiness);
       renderTimeline(history);
       staleNote(live, market);
@@ -780,6 +946,8 @@
   /* ---------------- boot ---------------- */
   function boot() {
     showApp();
+    $("tab-command").addEventListener("click", () => switchTab("command"));
+    $("tab-journal").addEventListener("click", () => switchTab("journal"));
     loadMarketStatus();
     refresh();
     countdownTimer = setInterval(tickCountdown, 1000);

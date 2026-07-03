@@ -229,6 +229,34 @@ def test_coupled_world_pipeline_produces_scoreable_predictions():
     assert any(r["realized_pnl"] > 0 for r in rows)
 
 
+def test_walk_forward_runs_on_recordings(tmp_path):
+    """The real-data loop: record sessions -> replay -> walk-forward folds."""
+    from chain_store import ChainRecorder, RecordedFeed
+    from synthetic_world import CoupledSyntheticFeed, WorldConfig
+    from walk_forward import run_walk_forward, WalkForwardConfig
+
+    src = CoupledSyntheticFeed(WorldConfig(days=3, seed=3, tick_stride=30))
+    rec = ChainRecorder(str(tmp_path))
+    for t in src.timestamps():
+        snap = src.snapshot(t)
+        if snap:
+            rec.record(t, snap)
+    for date, px in src.day_close.items():
+        rec.record_settlement(date, px)
+
+    ticks = RecordedFeed(str(tmp_path)).timestamps()
+    result = run_walk_forward(
+        feed_factory=lambda: RecordedFeed(str(tmp_path)),
+        timestamps=ticks,
+        wf_cfg=WalkForwardConfig(mode="expanding", n_folds=2, train_frac=0.5),
+    )
+    assert len(result.folds) == 2
+    assert all(f.tearsheet.total_ticks > 0 for f in result.folds)
+    # test folds must cover only recorded timestamps, in order
+    assert result.folds[0].test_start < result.folds[1].test_start
+    assert result.folds[-1].test_end == ticks[-1]
+
+
 # --------------------------------------------------------------------------- #
 # optimizer holdout                                                            #
 # --------------------------------------------------------------------------- #

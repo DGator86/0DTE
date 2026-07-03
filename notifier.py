@@ -80,7 +80,7 @@ class Ticket:
 
         short_calls, long_calls, short_puts, long_puts = [], [], [], []
         for leg in c.legs:
-            if leg.kind == "call":
+            if leg.kind in ("C", "call"):
                 (short_calls if leg.qty < 0 else long_calls).append(leg.strike)
             else:
                 (short_puts if leg.qty < 0 else long_puts).append(leg.strike)
@@ -173,10 +173,42 @@ class Notifier:
 
     All backend configuration is read from environment variables at send() time
     so the process can pick up changes without restarting.
+
+    Dedup: a persistent regime re-emits the same TRADE ticket every tick, which
+    used to mean one phone push per minute for hours. A ticket is now sent only
+    when its SIGNATURE (family + legs + direction) differs from the last one
+    sent, or when the resend cooldown has elapsed (a still-valid signal
+    re-pings occasionally rather than never). Override the cooldown with
+    NOTIFY_COOLDOWN_MIN; 0 restores the old fire-every-tick behavior.
     """
+
+    def __init__(self) -> None:
+        self._last_sig: Optional[tuple] = None
+        self._last_sent_ts: Optional[float] = None
+
+    @staticmethod
+    def _signature(t: Ticket) -> tuple:
+        return (t.family, t.direction, tuple(t.short_calls), tuple(t.long_calls),
+                tuple(t.short_puts), tuple(t.long_puts))
+
+    def _should_send(self, ticket: Ticket) -> bool:
+        cooldown_min = float(os.environ.get("NOTIFY_COOLDOWN_MIN", "15"))
+        if cooldown_min <= 0:
+            return True
+        sig = self._signature(ticket)
+        import time as _time
+        now = _time.monotonic()
+        if sig != self._last_sig or self._last_sent_ts is None \
+                or (now - self._last_sent_ts) >= cooldown_min * 60.0:
+            self._last_sig = sig
+            self._last_sent_ts = now
+            return True
+        return False
 
     def send(self, ticket: Optional[Ticket]) -> None:
         if ticket is None:
+            return
+        if not self._should_send(ticket):
             return
         text = format_ticket(ticket)
         self._stdout(text)
