@@ -98,10 +98,16 @@
 
         <section class="panel">
           <h2>Price · levels · projection
+            <span class="chart-zoom">
+              <button id="zoom-out" type="button" title="Zoom out">−</button>
+              <button id="zoom-in" type="button" title="Zoom in">+</button>
+              <button id="zoom-reset" type="button" title="Reset zoom">⟲</button>
+            </span>
             <span class="h2-right" id="chart-sub">intraday</span>
           </h2>
           <div class="chart-wrap">
             <canvas id="chart"></canvas>
+            <div class="chart-tip hidden" id="chart-tip"></div>
           </div>
           <div class="chart-legend">
             <span><i style="border-color:#e6edf7"></i>Spot</span>
@@ -110,7 +116,9 @@
             <span><i style="border-color:#2ec785"></i>Put wall</span>
             <span><i class="dash" style="border-color:#ffb648"></i>Gamma flip</span>
             <span><i class="dot" style="background:#9d7bff"></i>Projected range</span>
-            <span><i class="dot" style="background:#2ec785"></i>Trade signal</span>
+            <span><i class="dot" style="background:#2ec785"></i>Signal ▲call ▼put</span>
+            <span><i class="dot" style="background:#34d5e0"></i>Paper entry</span>
+            <span><i class="dot" style="background:#ffb648"></i>Paper exit</span>
           </div>
           <div class="reason" id="reason">Awaiting decision engine…</div>
         </section>
