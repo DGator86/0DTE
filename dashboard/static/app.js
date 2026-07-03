@@ -726,8 +726,103 @@
     } else if (note) { note.remove(); }
   }
 
+  /* ---------------- trade journal tab ---------------- */
+  let activeTab = "command";
+
+  function switchTab(tab) {
+    activeTab = tab;
+    $("tab-command").classList.toggle("active", tab === "command");
+    $("tab-journal").classList.toggle("active", tab === "journal");
+    $("view-command").classList.toggle("hidden", tab !== "command");
+    $("view-journal").classList.toggle("hidden", tab !== "journal");
+    if (tab === "journal") refreshJournal();
+  }
+
+  function entryLogicLine(ctx) {
+    if (!ctx) return "—";
+    const parts = [];
+    if (ctx.cell) parts.push(esc(ctx.cell.join(" × ")));
+    if (ctx.conviction && ctx.conviction !== "NONE") parts.push(esc(ctx.conviction));
+    if (ctx.capture) parts.push(esc(ctx.capture));
+    const nums = [];
+    if (num(ctx.gate_score) != null) nums.push("gate " + fmt(ctx.gate_score, 1));
+    if (num(ctx.ev) != null) nums.push("EV $" + fmt(ctx.ev, 2));
+    if (num(ctx.ev_per_risk) != null) nums.push(fmt(ctx.ev_per_risk, 2) + "/risk");
+    if (num(ctx.prob_profit) != null) nums.push("PoP " + pct(ctx.prob_profit));
+    if (num(ctx.size_mult) != null) nums.push("×" + fmt(ctx.size_mult, 2));
+    if (num(ctx.equity_at_entry) != null) nums.push("eq $" + fmt(ctx.equity_at_entry, 0));
+    return `<span class="tj-why">${parts.join(" · ")}</span>` +
+           (nums.length ? `<span class="tj-nums">${nums.join(" · ")}</span>` : "");
+  }
+
+  function exitLogicLine(t) {
+    const map = {
+      stop:   "stop-loss: loss reached its fraction of max loss",
+      target: "profit target: captured its fraction of max profit",
+      trail:  "trailing stop: gave back too much of peak profit",
+      eod:    "end of day: forced flat before the close",
+    };
+    return map[t.exit_reason] || esc(t.exit_reason || "—");
+  }
+
+  function renderJournal(data) {
+    const open = data.open || [];
+    $("tj-open-count").textContent = String(open.length);
+    if (!open.length) {
+      $("tj-open").innerHTML = '<p class="empty">No open positions</p>';
+    } else {
+      $("tj-open").innerHTML = open.map((p) => {
+        const pnl = num(p.unrealized_pnl_dollars);
+        const cls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
+        return `<div class="tj-open-row">
+          <div class="tj-head">
+            <b>${esc(p.family)}</b> <span class="mono">${esc(p.strikes)}</span>
+            <span>×${p.contracts}</span>
+            <span class="mono ${cls}">${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : "—"}</span>
+            <span class="tj-dim">${fmt(p.hold_min, 0)}m held</span>
+          </div>
+          <div class="tj-sub">${entryLogicLine(p.entry_ctx)}</div>
+        </div>`;
+      }).join("");
+    }
+
+    const closed = data.closed || [];
+    $("tj-closed-count").textContent = String(closed.length);
+    $("tj-empty").classList.toggle("hidden", closed.length > 0);
+    $("tj-table").classList.toggle("hidden", closed.length === 0);
+    $("tj-body").innerHTML = closed.map((t) => {
+      const pnl = num(t.pnl_dollars);
+      const cls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
+      const opened = (t.opened_at || "").slice(11, 16);
+      const reasonCls = t.exit_reason === "target" || t.exit_reason === "trail" ? "good"
+                      : t.exit_reason === "stop" ? "bad" : "";
+      return `<tr>
+        <td class="mono">${esc((t.opened_at || "").slice(0, 10))} ${opened}</td>
+        <td><b>${esc(t.family)}</b> <span class="mono tj-dim">${esc(t.strikes)}</span>
+            <div class="tj-sub">${entryLogicLine(t.entry_ctx)}</div></td>
+        <td class="mono">×${t.contracts}</td>
+        <td class="mono">${fmt(t.entry_credit, 2)}</td>
+        <td class="mono">${fmt(t.exit_value, 2)}</td>
+        <td class="mono">${fmt(t.hold_min, 0)}m</td>
+        <td class="mono ${cls}">${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : "—"}</td>
+        <td><span class="tj-reason ${reasonCls}">${esc(t.exit_reason || "—")}</span>
+            <div class="tj-sub">${exitLogicLine(t)}</div></td>
+        <td class="mono">$${fmt(t.equity_after, 2)}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  async function refreshJournal() {
+    try {
+      renderJournal(await api("/api/trades?limit=200"));
+    } catch (e) {
+      if (e.message !== "Unauthorized") console.warn("journal", e);
+    }
+  }
+
   /* ---------------- refresh loop ---------------- */
   async function refresh() {
+    if (activeTab === "journal") refreshJournal();
     try {
       let [live, market, history, report, paper, readiness] = await Promise.all([
         api("/api/live"),
@@ -780,6 +875,8 @@
   /* ---------------- boot ---------------- */
   function boot() {
     showApp();
+    $("tab-command").addEventListener("click", () => switchTab("command"));
+    $("tab-journal").addEventListener("click", () => switchTab("journal"));
     loadMarketStatus();
     refresh();
     countdownTimer = setInterval(tickCountdown, 1000);

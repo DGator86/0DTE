@@ -23,6 +23,7 @@ from dashboard.queries import (
     journal_max_id,
     journal_row,
     paper_summary,
+    paper_trades_journal,
     readiness_summary,
     report_summary,
 )
@@ -104,6 +105,15 @@ async def api_tick_row(row_id: int):
 @app.get("/api/paper")
 async def api_paper():
     return paper_summary(_config.get("paper_db", "paper.sqlite"))
+
+
+@app.get("/api/trades")
+async def api_trades(limit: int = 200):
+    return paper_trades_journal(
+        _config.get("paper_db", "paper.sqlite"),
+        _config.get("live_state", "live_state.json"),
+        limit=max(1, min(limit, 500)),
+    )
 
 
 @app.get("/api/report")

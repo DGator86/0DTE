@@ -48,8 +48,20 @@ class PaperConfig:
     starting_cash: float = 1000.0
     multiplier: int = 100                 # option contract multiplier
     max_open_positions: int = 1           # 0DTE: one structure at a time by default
-    risk_per_trade_frac: float = 0.50     # max fraction of starting cash risked (max-loss) per trade
-    daily_loss_limit_frac: float = 0.50   # stop opening new trades once down this fraction on the day
+    # Risk fractions apply to CURRENT equity, not starting cash: the budget
+    # compounds as the account grows and shrinks in a drawdown. Anchoring to
+    # starting_cash both caps the upside path and keeps betting $500 when the
+    # account is down to $600.
+    risk_per_trade_frac: float = 0.50     # max fraction of equity risked (max-loss) per trade
+    daily_loss_limit_frac: float = 0.50   # stop opening once down this fraction of day-start equity
+
+    # --- signal-churn guards: one position per regime, not fifty ---
+    # A persistent regime re-emits the same TRADE ticket every tick; without a
+    # cooldown the broker exits on target/stop and re-enters the same structure
+    # sixty seconds later, all day.
+    reentry_cooldown_min: float = 15.0    # no new entry within this of ANY exit
+    stop_cooldown_min: float = 30.0       # ... doubled cool-off after a stop-loss exit
+    max_trades_per_day: int = 10          # hard cap on entries per session
 
     # --- exits (fractions of the trade's own max profit / max loss) ---
     stop_loss_frac: float = 0.60          # exit when loss >= this * defined max loss
@@ -79,6 +91,7 @@ class PaperPosition:
     peak_pnl_ps: float = 0.0     # best (highest) per-share P&L seen
     trailing_armed: bool = False
     last_pnl_ps: float = 0.0
+    entry_ctx: dict = field(default_factory=dict)   # why we entered (regime/gate/EV)
 
     def strikes_str(self) -> str:
         s = "/".join(f"{lg.strike:g}{lg.kind}{'+' if lg.qty > 0 else '-'}" for lg in self.legs)
@@ -105,6 +118,10 @@ class PaperBroker:
         # of silently resetting the account to starting_cash on every restart.
         self.cash = self._restore_equity()
         self._day_realized: dict[str, float] = {}   # ET date -> realized $ that day
+        self._day_start_cash: dict[str, float] = {} # ET date -> equity at first tick
+        self._day_entries: dict[str, int] = {}      # ET date -> entries opened
+        self._last_exit_at: Optional[dt.datetime] = None
+        self._last_exit_reason: str = ""
 
     def _restore_equity(self) -> float:
         row = self._db.execute(
@@ -124,19 +141,27 @@ class PaperBroker:
                 pnl_ps REAL, pnl_dollars REAL, exit_reason TEXT,
                 equity_after REAL
             )""")
+        # migration: entry_ctx (why the trade was taken) for the journal view
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(paper_trades)")}
+        if "entry_ctx" not in cols:
+            self._db.execute("ALTER TABLE paper_trades ADD COLUMN entry_ctx TEXT")
         self._db.commit()
 
     def _record(self, pos: PaperPosition, now: dt.datetime, credit_now: float,
                 pnl_ps: float, pnl_dollars: float, reason: str) -> None:
         hold_min = (now - pos.opened_at).total_seconds() / 60.0
         self._db.execute(
-            "INSERT OR REPLACE INTO paper_trades VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO paper_trades "
+            "(id, symbol, family, strikes, contracts, opened_at, closed_at, "
+            " hold_min, entry_credit, exit_value, max_profit_ps, max_loss_ps, "
+            " pnl_ps, pnl_dollars, exit_reason, equity_after, entry_ctx) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pos.id, self.symbol, pos.family, pos.strikes_str(), pos.contracts,
              pos.opened_at.isoformat(), now.isoformat(), round(hold_min, 1),
              round(pos.entry_credit, 4), round(credit_now, 4),
              round(pos.max_profit_ps, 4), round(pos.max_loss_ps, 4),
-             round(pnl_ps, 4), round(pnl_dollars, 2), reason, round(self.cash, 2)),
+             round(pnl_ps, 4), round(pnl_dollars, 2), reason, round(self.cash, 2),
+             json.dumps(pos.entry_ctx) if pos.entry_ctx else None),
         )
         self._db.commit()
 
@@ -184,8 +209,20 @@ class PaperBroker:
             return None
 
         date = now.astimezone(ET).date().isoformat()
-        if self._day_realized.get(date, 0.0) <= -self.cfg.daily_loss_limit_frac * self.cfg.starting_cash:
+        day_start = self._day_start_cash.setdefault(date, self.cash)
+        if self._day_realized.get(date, 0.0) <= -self.cfg.daily_loss_limit_frac * day_start:
             return None                                     # daily loss limit hit; stand down
+        if self._day_entries.get(date, 0) >= self.cfg.max_trades_per_day:
+            return None                                     # enough for one session
+
+        # Re-entry cooldown: a regime that persists re-emits the same ticket
+        # every tick; one position per regime, not one per minute.
+        if self._last_exit_at is not None:
+            cool = (self.cfg.stop_cooldown_min if self._last_exit_reason == "stop"
+                    else self.cfg.reentry_cooldown_min)
+            since = (now - self._last_exit_at).total_seconds() / 60.0
+            if since < cool:
+                return None
 
         legs = tuple(cand.legs)
         slip_entry = self._slippage_ps(legs, spr)
@@ -195,9 +232,9 @@ class PaperBroker:
         if ml <= 0:
             return None                                     # degenerate / no defined risk
 
-        # size against the risk budget and regime size multiplier
+        # size against CURRENT equity and the regime size multiplier
         size_mult = float(getattr(result, "final_size_mult", 1.0)) or 1.0
-        risk_budget = self.cfg.starting_cash * self.cfg.risk_per_trade_frac
+        risk_budget = self.cash * self.cfg.risk_per_trade_frac
         per_contract_risk = ml * self.cfg.multiplier
         contracts = int(np.floor((risk_budget * size_mult) / per_contract_risk))
         # never risk more than the cash on hand
@@ -205,12 +242,35 @@ class PaperBroker:
         if contracts < 1:
             return None                                     # can't afford even one lot
 
+        intent = getattr(result, "intent", None)
+        regime = getattr(result, "regime", None)
+        entry_ctx = {
+            "regime": getattr(regime, "dominant_regime", None),
+            "engine": getattr(regime, "permitted_engine", None),
+            "cell": ([intent.exec_regime, intent.context_regime, intent.direction_bias]
+                     if intent is not None else None),
+            "direction": (intent.decision.direction if intent is not None else None),
+            "conviction": (intent.decision.conviction if intent is not None else None),
+            "capture": (intent.decision.capture if intent is not None else None),
+            "gate_score": getattr(dec, "gate_score", None),
+            "ev": getattr(cand, "ev", None),
+            "ev_per_risk": getattr(cand, "ev_per_risk", None),
+            "prob_profit": getattr(cand, "prob_profit", None),
+            "credit_mid": getattr(cand, "credit", None),
+            "size_mult": size_mult,
+            "spot": getattr(chain, "spot", None),
+            "risk_budget": round(risk_budget, 2),
+            "equity_at_entry": round(self.cash, 2),
+        }
+
         pos = PaperPosition(
             id=uuid.uuid4().hex[:12], opened_at=now, family=cand.family, legs=legs,
             contracts=contracts, entry_credit=entry_credit, max_profit_ps=mp, max_loss_ps=ml,
             short_strikes=tuple(cand.short_strikes), long_strikes=tuple(cand.long_strikes),
+            entry_ctx=entry_ctx,
         )
         self.open_positions.append(pos)
+        self._day_entries[date] = self._day_entries.get(date, 0) + 1
         self._notify("PAPER ENTRY",
                      f"{pos.family} {pos.strikes_str()} x{contracts} "
                      f"entry={entry_credit:+.2f} maxP={mp:.2f} maxL={ml:.2f}")
@@ -240,6 +300,8 @@ class PaperBroker:
         self._day_realized[date] = self._day_realized.get(date, 0.0) + pnl_dollars
 
         self.open_positions.remove(pos)
+        self._last_exit_at = now
+        self._last_exit_reason = reason
         self._record(pos, now, credit_now, net_ps, pnl_dollars, reason)
         self._notify("PAPER EXIT",
                      f"{pos.family} {pos.strikes_str()} {reason} "
@@ -305,6 +367,7 @@ class PaperBroker:
             "unrealized_pnl_dollars": round(unrealized_dollars, 2),
             "pct_of_max_profit": (round(pos.last_pnl_ps / pos.max_profit_ps, 4)
                                    if pos.max_profit_ps else None),
+            "entry_ctx": pos.entry_ctx or None,
         }
 
     def report(self, now: Optional[dt.datetime] = None) -> dict:

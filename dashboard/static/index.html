@@ -44,8 +44,14 @@
       </span>
     </header>
 
+    <!-- ===================== TABS ===================== -->
+    <nav class="tabbar">
+      <button class="tab active" id="tab-command" type="button">Command Center</button>
+      <button class="tab" id="tab-journal" type="button">Trade Journal</button>
+    </nav>
+
     <!-- ===================== GRID ===================== -->
-    <div class="grid">
+    <div class="grid" id="view-command">
 
       <!-- ---------- LEFT: the decision ---------- -->
       <div class="col col-left">
@@ -158,6 +164,29 @@
         </section>
       </div>
 
+    </div>
+
+    <!-- ===================== TRADE JOURNAL VIEW ===================== -->
+    <div class="journal-view hidden" id="view-journal">
+      <section class="panel">
+        <h2>Open positions <span class="h2-right" id="tj-open-count">—</span></h2>
+        <div id="tj-open"><p class="empty">No open positions</p></div>
+      </section>
+      <section class="panel">
+        <h2>Closed trades <span class="h2-right" id="tj-closed-count">—</span></h2>
+        <div class="tj-scroll">
+          <table class="tj-table" id="tj-table">
+            <thead>
+              <tr>
+                <th>Opened</th><th>Structure</th><th>Qty</th><th>Entry</th>
+                <th>Exit</th><th>Hold</th><th>P&amp;L</th><th>Exit logic</th><th>Equity</th>
+              </tr>
+            </thead>
+            <tbody id="tj-body"></tbody>
+          </table>
+        </div>
+        <p class="empty hidden" id="tj-empty">No closed trades yet</p>
+      </section>
     </div>
 
     <div class="foot">Read-only observability · outputs only · auto-refreshing</div>
