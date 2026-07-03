@@ -11,7 +11,34 @@
   let marketAnchor = null;
   let countdownTimer = null;
   let refreshTimer = null;
-  let lastChartData = null; // {ticks, live, market} kept for resize redraws
+  let lastChartData = null; // {ticks, live, market, trades} kept for resize redraws
+
+  // Chart time-axis zoom/pan (screen-space transform over the base layout).
+  // z=1 pan=0 is the classic full-session view; wheel/pinch/buttons zoom,
+  // drag pans. Marker hit-boxes are rebuilt on every draw for the tooltip.
+  const chartView = { z: 1, pan: 0 };
+  const CH_PADL = 8, CH_PADR = 62;
+  let chartHits = [];               // [{x, y, label}] in CSS px, current draw
+
+  function chartPlotW() {
+    const cv = $("chart");
+    return cv ? cv.clientWidth - CH_PADL - CH_PADR : 0;
+  }
+
+  function clampChartView() {
+    chartView.z = Math.max(1, Math.min(40, chartView.z));
+    const maxPan = chartPlotW() * (chartView.z - 1);
+    chartView.pan = Math.max(0, Math.min(maxPan, chartView.pan));
+  }
+
+  function chartZoomAt(xCss, factor) {
+    const anchor = (xCss - CH_PADL + chartView.pan) / chartView.z;
+    chartView.z *= factor;
+    chartView.z = Math.max(1, Math.min(40, chartView.z));
+    chartView.pan = anchor * chartView.z - (xCss - CH_PADL);
+    clampChartView();
+    drawChart();
+  }
 
   /* ---------------- auth / fetch ---------------- */
   function getToken() {
@@ -555,16 +582,29 @@
       if (nc > tLast) tEnd = nc;
     }
     if (tEnd <= tLast) tEnd = tLast + Math.max((tLast - t0) * 0.25, 20 * 60 * 1000);
-    const projFrac = 0.72; // where "now" sits horizontally
-    // map: historical [t0..tLast] -> [padL .. padL+plotW*projFrac], projection -> remainder
-    const xNow = padL + plotW * projFrac;
-    const X = (ts) => {
+    const projFrac = 0.72; // where "now" sits horizontally (at zoom 1)
+    // base map: historical [t0..tLast] -> [padL .. padL+plotW*projFrac],
+    // projection -> remainder; then the zoom/pan screen-space transform.
+    const xNowBase = padL + plotW * projFrac;
+    const Xb = (ts) => {
       if (ts <= tLast) {
         const f = tLast > t0 ? (ts - t0) / (tLast - t0) : 1;
-        return padL + f * (xNow - padL);
+        return padL + f * (xNowBase - padL);
       }
       const f = tEnd > tLast ? (ts - tLast) / (tEnd - tLast) : 0;
-      return xNow + f * (padL + plotW - xNow);
+      return xNowBase + f * (padL + plotW - xNowBase);
+    };
+    clampChartView();
+    const zv = chartView.z, panv = chartView.pan;
+    const X = (ts) => padL + (Xb(ts) - padL) * zv - panv;
+    const xNow = padL + (xNowBase - padL) * zv - panv;
+    // inverse: screen x -> timestamp (for axis labels under zoom)
+    const Tof = (x) => {
+      const xb = (x - padL + panv) / zv + padL;
+      if (xb <= xNowBase) {
+        return t0 + ((xb - padL) / Math.max(xNowBase - padL, 1e-9)) * (tLast - t0);
+      }
+      return tLast + ((xb - xNowBase) / Math.max(padL + plotW - xNowBase, 1e-9)) * (tEnd - tLast);
     };
 
     // price domain
@@ -590,14 +630,25 @@
       ctx.fillText(p.toFixed(1), padL + plotW + 6, y + 3);
     }
 
-    // --- time axis labels ---
+    // --- time axis labels (fixed screen slots, times from the inverse map) ---
     ctx.textAlign = "center";
     ctx.fillStyle = "#5b6a86";
     for (let i = 0; i <= 4; i++) {
-      const ts = t0 + (i / 4) * (tEnd - t0);
-      const x = X(Math.min(ts, tEnd));
+      const x = padL + (i / 4) * plotW;
+      const ts = Math.max(t0, Math.min(tEnd, Tof(x)));
       ctx.fillText(new Date(ts).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" }), x, H - 6);
     }
+    if (zv > 1.001) {
+      ctx.textAlign = "right";
+      ctx.fillStyle = "#8595b0";
+      ctx.fillText(`${zv.toFixed(1)}×`, padL + plotW, padT + 9);
+    }
+
+    // clip everything time-positioned to the plot area while zoomed/panned
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(padL, padT, plotW, plotH);
+    ctx.clip();
 
     // --- "now" divider ---
     ctx.strokeStyle = "rgba(157,123,255,0.35)";
@@ -629,7 +680,7 @@
 
     // --- projection cone (violet) from now to end ---
     const yUp = Y(spot + band), yDn = Y(spot - band), yMid = Y(spot);
-    const xEnd = padL + plotW;
+    const xEnd = X(tEnd);
     const grad = ctx.createLinearGradient(xNow, 0, xEnd, 0);
     grad.addColorStop(0, "rgba(157,123,255,0.02)");
     grad.addColorStop(1, "rgba(157,123,255,0.20)");
@@ -669,13 +720,80 @@
     ctx.lineWidth = 1.75;
     ctx.stroke();
 
-    // --- trade markers ---
-    pts.forEach((p) => {
-      if (p.decision !== "TRADE") return;
-      const x = X(p.ts), y = Y(p.spot);
-      ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2);
-      ctx.fillStyle = "#2ec785"; ctx.fill();
-      ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 1.5; ctx.stroke();
+    // --- trade-event markers (rebuild tooltip hit-boxes every draw) ---
+    chartHits = [];
+    const spotAt = (ts) => {
+      let best = pts[0];
+      for (const p of pts) if (Math.abs(p.ts - ts) < Math.abs(best.ts - ts)) best = p;
+      return best.spot;
+    };
+    const tri = (x, y, r, up) => {
+      ctx.beginPath();
+      ctx.moveTo(x, y + (up ? -r : r));
+      ctx.lineTo(x - r, y + (up ? r * 0.8 : -r * 0.8));
+      ctx.lineTo(x + r, y + (up ? r * 0.8 : -r * 0.8));
+      ctx.closePath();
+    };
+    const diamond = (x, y, r) => {
+      ctx.beginPath();
+      ctx.moveTo(x, y - r); ctx.lineTo(x + r, y); ctx.lineTo(x, y + r); ctx.lineTo(x - r, y);
+      ctx.closePath();
+    };
+    const mark = (x, y, label) => {
+      if (x >= padL - 6 && x <= padL + plotW + 6) chartHits.push({ x, y, label });
+    };
+
+    // TRADE signals from the journal ticks: ▲ call / ▼ put / ◆ neutral
+    const sigTicks = ticks.filter((t) => t.decision === "TRADE" && num(t.spot) != null);
+    sigTicks.forEach((t) => {
+      const ts = new Date(t.ts).getTime();
+      const x = X(ts), y = Y(num(t.spot));
+      const dir = t.regime_direction;
+      ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 1.25;
+      if (dir === "call") {
+        tri(x, y - 9, 5, true); ctx.fillStyle = "#2ec785";
+      } else if (dir === "put") {
+        tri(x, y + 9, 5, false); ctx.fillStyle = "#ff5470";
+      } else {
+        diamond(x, y - 9, 5); ctx.fillStyle = "#9d7bff";
+      }
+      ctx.fill(); ctx.stroke();
+      const fam = t.selected_family || "signal";
+      const strikes = [t.short_strikes, t.long_strikes]
+        .map((s) => Array.isArray(s) ? s.join("/") : "").filter(Boolean).join(" | ");
+      mark(x, y, `SIGNAL ${fam}${strikes ? " " + strikes : ""}${dir && dir !== "none" ? " (" + dir + ")" : ""} · ${new Date(ts).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" })}`);
+    });
+
+    // paper entries/exits from /api/trades (open + closed)
+    const trades = (lastChartData.trades || {});
+    const paperEvents = [];
+    (trades.open || []).forEach((p) => {
+      paperEvents.push({ ts: new Date(p.opened_at).getTime(), kind: "entry",
+        label: `ENTRY ${p.family} ${p.strikes} ×${p.contracts} (open)` });
+    });
+    (trades.closed || []).forEach((p) => {
+      const o = new Date(p.opened_at).getTime(), c = new Date(p.closed_at).getTime();
+      paperEvents.push({ ts: o, kind: "entry",
+        label: `ENTRY ${p.family} ${p.strikes} ×${p.contracts}` });
+      const pnl = num(p.pnl_dollars);
+      paperEvents.push({ ts: c, kind: "exit", pnl,
+        label: `EXIT ${p.family} ${p.exit_reason} ${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : ""}` });
+    });
+    paperEvents.forEach((e) => {
+      if (!isFinite(e.ts) || e.ts < t0 - 60e3 || e.ts > tLast + 60e3) return;
+      const x = X(e.ts), y = Y(spotAt(e.ts));
+      if (e.kind === "entry") {
+        ctx.beginPath(); ctx.arc(x, y, 5.5, 0, Math.PI * 2);
+        ctx.strokeStyle = "#34d5e0"; ctx.lineWidth = 2; ctx.stroke();
+      } else {
+        ctx.strokeStyle = e.pnl != null && e.pnl < 0 ? "#ff5470" : "#ffb648";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x - 4, y - 4); ctx.lineTo(x + 4, y + 4);
+        ctx.moveTo(x + 4, y - 4); ctx.lineTo(x - 4, y + 4);
+        ctx.stroke();
+      }
+      mark(x, y, e.label);
     });
 
     // --- last price dot + tag ---
@@ -684,6 +802,8 @@
     ctx.beginPath(); ctx.arc(lx, ly, 4.5, 0, Math.PI * 2);
     ctx.fillStyle = "#4aa8ff"; ctx.fill();
     ctx.strokeStyle = "#e6edf7"; ctx.lineWidth = 1.5; ctx.stroke();
+
+    ctx.restore();                       // end plot clip; margin tag stays visible
 
     ctx.fillStyle = "#0a0e14";
     const tag = spot.toFixed(2);
@@ -894,13 +1014,14 @@
   async function refresh() {
     if (activeTab === "journal") refreshJournal();
     try {
-      let [live, market, history, report, paper, readiness] = await Promise.all([
+      let [live, market, history, report, paper, readiness, trades] = await Promise.all([
         api("/api/live"),
         api("/api/market-status"),
         api("/api/ticks?limit=200"),
         api("/api/report").catch(() => ({})),
         api("/api/paper").catch(() => ({})),
         api("/api/readiness").catch(() => ({})),
+        api("/api/trades?limit=100").catch(() => ({})),
       ]);
       const ticks = history.ticks || [];
       const latest = ticks.length ? ticks[ticks.length - 1] : null;
@@ -936,11 +1057,105 @@
       renderTimeline(history);
       staleNote(live, market);
 
-      lastChartData = { ticks, live, market };
+      lastChartData = { ticks, live, market, trades };
       drawChart();
     } catch (e) {
       if (e.message !== "Unauthorized") console.warn("refresh", e);
     }
+  }
+
+  /* ---------------- chart zoom / pan / tooltip wiring ---------------- */
+  function initChartControls() {
+    const cv = $("chart");
+    const tip = $("chart-tip");
+    if (!cv) return;
+
+    $("zoom-in").addEventListener("click", () => chartZoomAt(CH_PADL + chartPlotW() / 2, 1.5));
+    $("zoom-out").addEventListener("click", () => chartZoomAt(CH_PADL + chartPlotW() / 2, 1 / 1.5));
+    $("zoom-reset").addEventListener("click", () => {
+      chartView.z = 1; chartView.pan = 0; drawChart();
+    });
+
+    cv.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const x = e.offsetX;
+      chartZoomAt(x, e.deltaY < 0 ? 1.2 : 1 / 1.2);
+    }, { passive: false });
+
+    // drag to pan (only meaningful when zoomed)
+    let drag = null;
+    cv.addEventListener("mousedown", (e) => {
+      if (chartView.z <= 1) return;
+      drag = { x0: e.clientX, pan0: chartView.pan };
+      cv.style.cursor = "grabbing";
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!drag) return;
+      chartView.pan = drag.pan0 - (e.clientX - drag.x0);
+      clampChartView();
+      drawChart();
+    });
+    window.addEventListener("mouseup", () => { drag = null; cv.style.cursor = ""; });
+
+    // touch: one finger pans, two fingers pinch-zoom
+    let touch = null;
+    const tdist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    cv.addEventListener("touchstart", (e) => {
+      if (e.touches.length === 2) {
+        touch = { mode: "pinch", d0: tdist(e.touches), z0: chartView.z,
+                  cx: (e.touches[0].clientX + e.touches[1].clientX) / 2 - cv.getBoundingClientRect().left };
+      } else if (e.touches.length === 1 && chartView.z > 1) {
+        touch = { mode: "pan", x0: e.touches[0].clientX, pan0: chartView.pan };
+      }
+    }, { passive: true });
+    cv.addEventListener("touchmove", (e) => {
+      if (!touch) return;
+      if (touch.mode === "pinch" && e.touches.length === 2) {
+        e.preventDefault();
+        const f = tdist(e.touches) / touch.d0;
+        const target = Math.max(1, Math.min(40, touch.z0 * f));
+        chartZoomAt(touch.cx, target / chartView.z);
+      } else if (touch.mode === "pan" && e.touches.length === 1) {
+        e.preventDefault();
+        chartView.pan = touch.pan0 - (e.touches[0].clientX - touch.x0);
+        clampChartView();
+        drawChart();
+      }
+    }, { passive: false });
+    cv.addEventListener("touchend", () => { touch = null; });
+
+    // marker tooltips
+    const showTip = (hit, xCss, yCss) => {
+      tip.textContent = hit.label;
+      tip.classList.remove("hidden");
+      const wrap = cv.parentElement;
+      const maxX = wrap.clientWidth - tip.offsetWidth - 4;
+      tip.style.left = Math.max(4, Math.min(maxX, xCss + 10)) + "px";
+      tip.style.top = Math.max(4, yCss - 30) + "px";
+    };
+    cv.addEventListener("mousemove", (e) => {
+      if (drag) return;
+      const x = e.offsetX, y = e.offsetY;
+      let best = null, bd = 121;                  // 11px radius
+      for (const h of chartHits) {
+        const d = (h.x - x) ** 2 + (h.y - y) ** 2;
+        if (d < bd) { bd = d; best = h; }
+      }
+      if (best) { showTip(best, best.x, best.y); cv.style.cursor = "pointer"; }
+      else { tip.classList.add("hidden"); if (!drag) cv.style.cursor = chartView.z > 1 ? "grab" : ""; }
+    });
+    cv.addEventListener("mouseleave", () => tip.classList.add("hidden"));
+    cv.addEventListener("touchstart", (e) => {          // tap a marker on mobile
+      if (e.touches.length !== 1) return;
+      const r = cv.getBoundingClientRect();
+      const x = e.touches[0].clientX - r.left, y = e.touches[0].clientY - r.top;
+      let best = null, bd = 400;                  // 20px touch radius
+      for (const h of chartHits) {
+        const d = (h.x - x) ** 2 + (h.y - y) ** 2;
+        if (d < bd) { bd = d; best = h; }
+      }
+      if (best) { showTip(best, best.x, best.y); setTimeout(() => tip.classList.add("hidden"), 2500); }
+    }, { passive: true });
   }
 
   /* ---------------- boot ---------------- */
@@ -948,6 +1163,7 @@
     showApp();
     $("tab-command").addEventListener("click", () => switchTab("command"));
     $("tab-journal").addEventListener("click", () => switchTab("journal"));
+    initChartControls();
     loadMarketStatus();
     refresh();
     countdownTimer = setInterval(tickCountdown, 1000);
