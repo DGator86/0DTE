@@ -146,6 +146,11 @@
           <div class="metrics cols-1" id="edge-metrics"></div>
         </section>
 
+        <section class="panel" id="predict-panel">
+          <h2>Predictive power</h2>
+          <div class="metrics" id="predict-metrics"></div>
+        </section>
+
       </div>
 
       <!-- ---------- FULL WIDTH: live-readiness checklist ---------- -->
@@ -171,6 +176,10 @@
       <section class="panel">
         <h2>Open positions <span class="h2-right" id="tj-open-count">—</span></h2>
         <div id="tj-open"><p class="empty">No open positions</p></div>
+      </section>
+      <section class="panel" id="tj-equity-panel">
+        <h2>Equity curve <span class="h2-right" id="tj-equity-now">—</span></h2>
+        <div class="chart-wrap tj-eq-wrap"><canvas id="tj-equity"></canvas></div>
       </section>
       <section class="panel">
         <h2>Closed trades <span class="h2-right" id="tj-closed-count">—</span></h2>

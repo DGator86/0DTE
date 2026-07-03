@@ -726,6 +726,37 @@
     } else if (note) { note.remove(); }
   }
 
+  /* ---------------- predictive power (calibration readouts) ---------------- */
+  function renderPredict(report) {
+    const cal = (report && report.calibration) || {};
+    const d = (cal.directional && cal.directional.overall) || {};
+    const pp = cal.prob_profit || {};
+    const ev = cal.ev || {};
+    const cards = [];
+    if (d.n) {
+      const hitCls = num(d.hit_rate) >= 0.52 ? "pos" : num(d.hit_rate) < 0.5 ? "neg" : "warn";
+      cards.push(metricCard("Dir. hit rate", `${pct(d.hit_rate)} (n=${d.n})`, hitCls));
+      cards.push(metricCard("Signed move", fmt(d.avg_fwd_move_pct, 3) + "%",
+                            num(d.avg_fwd_move_pct) > 0 ? "pos" : "neg"));
+    } else {
+      cards.push(metricCard("Dir. hit rate", "no sample"));
+    }
+    if (pp.n) {
+      cards.push(metricCard("Brier skill", `${fmt(pp.brier_skill, 2)} (n=${pp.n})`,
+                            num(pp.brier_skill) > 0 ? "pos" : "neg"));
+      cards.push(metricCard("Base rate", pct(pp.base_rate)));
+    }
+    if (ev.n) {
+      const bias = num(ev.mean_ev_error);
+      cards.push(metricCard("EV bias", (bias >= 0 ? "+" : "") + fmt(bias, 3),
+                            Math.abs(bias) <= 0.10 ? "pos" : "warn"));
+      cards.push(metricCard("EV MAE", fmt(ev.mae_ev_error, 3)));
+    }
+    $("predict-metrics").innerHTML = cards.length
+      ? cards.join("")
+      : '<p class="empty">No settled data yet — prediction is scored at settlement</p>';
+  }
+
   /* ---------------- trade journal tab ---------------- */
   let activeTab = "command";
 
@@ -812,9 +843,48 @@
     }).join("");
   }
 
+  function drawEquityCurve(closed) {
+    const panel = $("tj-equity-panel");
+    const eq = closed.slice().reverse()
+      .map((t) => num(t.equity_after)).filter((v) => v != null);
+    if (eq.length < 2) { panel.classList.add("hidden"); return; }
+    panel.classList.remove("hidden");
+    $("tj-equity-now").textContent = "$" + eq[eq.length - 1].toFixed(2);
+
+    const canvas = $("tj-equity");
+    const wrap = canvas.parentElement;
+    const dpr = window.devicePixelRatio || 1;
+    const W = wrap.clientWidth || 600, H = wrap.clientHeight || 160;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const lo = Math.min(...eq), hi = Math.max(...eq);
+    const pad = 12, span = (hi - lo) || 1;
+    const x = (i) => pad + (W - 2 * pad) * (eq.length === 1 ? 0 : i / (eq.length - 1));
+    const y = (v) => H - pad - (H - 2 * pad) * ((v - lo) / span);
+
+    ctx.strokeStyle = "rgba(230,237,247,0.15)";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(pad, y(eq[0])); ctx.lineTo(W - pad, y(eq[0])); ctx.stroke();
+    ctx.setLineDash([]);
+
+    const up = eq[eq.length - 1] >= eq[0];
+    ctx.strokeStyle = up ? "#2ec785" : "#ff5470";
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    eq.forEach((v, i) => (i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v))));
+    ctx.stroke();
+  }
+
   async function refreshJournal() {
     try {
-      renderJournal(await api("/api/trades?limit=200"));
+      const data = await api("/api/trades?limit=200");
+      renderJournal(data);
+      drawEquityCurve(data.closed || []);
     } catch (e) {
       if (e.message !== "Unauthorized") console.warn("journal", e);
     }
@@ -861,6 +931,7 @@
       }
       renderPaper(paper);
       renderEdge(report);
+      renderPredict(report);
       renderReadiness(readiness);
       renderTimeline(history);
       staleNote(live, market);

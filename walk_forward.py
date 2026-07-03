@@ -361,7 +361,67 @@ def run_walk_forward(
 # --------------------------------------------------------------------------- #
 # Demo                                                                          #
 # --------------------------------------------------------------------------- #
-if __name__ == "__main__":
+def _print_calibration(jrn: Journal) -> None:
+    cal = jrn.calibration()
+    d = cal["directional"]["overall"]
+    pp = cal["prob_profit"]
+    ev = cal["ev"]
+    print("\n  Predictive power over the full window (settled ticks, no-trades incl.):")
+    if d["n"]:
+        print(f"    direction: n={d['n']}  hit={d['hit_rate']:.1%}  "
+              f"signed move={d['avg_fwd_move_pct']:+.3f}%")
+    if pp.get("n"):
+        print(f"    prob_profit: n={pp['n']}  Brier={pp['brier']:.4f}  "
+              f"skill={pp['brier_skill']}  base={pp['base_rate']:.1%}")
+    if ev.get("n"):
+        print(f"    EV: n={ev['n']}  bias={ev['mean_ev_error']:+.4f}  "
+              f"MAE={ev['mae_ev_error']:.4f}")
+
+
+def main() -> None:
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Walk-forward validation. Default: demo on the coupled "
+                    "synthetic world. --recorded DIR: out-of-sample test on "
+                    "REAL ticks recorded by shadow mode (chain_store).")
+    ap.add_argument("--recorded", metavar="DIR",
+                    help="directory of ticks_*.jsonl.gz recordings "
+                         "(VPS default: /var/lib/zerodte/ticks)")
+    ap.add_argument("--mode", default="expanding", choices=["expanding", "rolling"])
+    ap.add_argument("--folds", type=int, default=3)
+    ap.add_argument("--train-frac", dest="train_frac", type=float, default=0.6)
+    args = ap.parse_args()
+
+    wf_cfg = WalkForwardConfig(mode=args.mode, n_folds=args.folds,
+                               train_frac=args.train_frac)
+
+    if args.recorded:
+        from backtest import run_backtest
+        from chain_store import RecordedFeed
+
+        probe = RecordedFeed(args.recorded)
+        ticks = probe.timestamps()
+        days = {t.date() for t in ticks}
+        print(f"  {len(ticks):,} recorded ticks across {len(days)} sessions "
+              f"in {args.recorded!r}")
+        if len(ticks) < 100 or len(days) < 3:
+            print("  Not enough recorded history yet for a meaningful walk-forward "
+                  "(want >= 3 sessions). Let shadow mode record longer.")
+            return
+
+        result = run_walk_forward(
+            feed_factory=lambda: RecordedFeed(args.recorded),
+            timestamps=ticks, wf_cfg=wf_cfg,
+        )
+        print()
+        result.print()
+
+        jrn = Journal(":memory:")
+        run_backtest(RecordedFeed(args.recorded), ticks, journal=jrn)
+        _print_calibration(jrn)
+        return
+
     # Demo on the COUPLED synthetic world (synthetic_world.py): GEX drives the
     # price dynamics, chains reprice off the live path every tick, and each
     # session settles at its actual close — so EV accuracy, win rates, and the
@@ -389,3 +449,7 @@ if __name__ == "__main__":
         )
         print()
         result.print()
+
+
+if __name__ == "__main__":
+    main()
