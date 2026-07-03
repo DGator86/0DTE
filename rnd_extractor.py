@@ -435,7 +435,13 @@ def physical_pdf_from_realized_vol(
     if not np.isfinite(sigma_annual) or sigma_annual <= 0:
         return None
     rn_std = rnd.std()
-    target_std = rnd.forward * sigma_annual * np.sqrt(max(rnd.t_years, 0.0))
+    # sigma_annual comes from 1-min bars annualized over TRADING minutes
+    # (MINUTES_PER_YEAR). rnd.t_years is a CALENDAR fraction (the feeds use
+    # seconds/365.25d). For an intraday horizon the remaining calendar minutes
+    # ARE trading minutes, so convert via minutes — mixing the two year
+    # conventions directly would understate the physical std ~2.3x.
+    minutes_left = max(rnd.t_years, 0.0) * 525960.0     # calendar minutes/year
+    target_std = rnd.forward * sigma_annual * np.sqrt(minutes_left / MINUTES_PER_YEAR)
     if rn_std <= 0 or target_std <= 0:
         return None
     scale = float(np.clip(target_std / rn_std, cfg.rv_scale_min, cfg.rv_scale_max))

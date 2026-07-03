@@ -78,6 +78,7 @@ def report_summary(db_path: str) -> dict:
         return {
             "gate_effectiveness": jrn.gate_effectiveness(),
             "component_correlations": jrn.component_correlations(),
+            "calibration": jrn.calibration(),
             "unsettled_dates": jrn.unsettled_dates(),
         }
     finally:
@@ -159,6 +160,12 @@ READINESS_THRESHOLDS = {
     "max_drawdown_pct": 0.20,     # largest peak-to-trough drop must stay under this
     "min_distinct_regimes": 2,    # track record must span more than one gex_regime
     "max_gap_sessions_frac": 0.05,  # share of sessions allowed an intraday pipeline gap
+    # -- predictive-power gates: the system must PREDICT before it sizes up --
+    "min_directional_n": 100,     # resolved-bias ticks needed before judging direction
+    "min_directional_hit": 0.52,  # bias must beat a coin by a spread-covering margin
+    "min_calibration_n": 30,      # settled candidates needed before judging probabilities
+    "min_brier_skill": 0.0,       # prob_profit must beat always-quoting-the-base-rate
+    "max_abs_ev_bias": 0.10,      # |mean ev_error| in $/share; EV must be unbiased-ish
 }
 
 
@@ -174,6 +181,7 @@ def readiness_summary(db_path: str, paper_db_path: str,
         corr = jrn.component_correlations()
         regime = jrn.regime_diversity()
         uptime = jrn.uptime_gaps()
+        cal = jrn.calibration()
     finally:
         jrn.close()
 
@@ -207,6 +215,41 @@ def readiness_summary(db_path: str, paper_db_path: str,
               gap_frac is not None and gap_frac <= cfg["max_gap_sessions_frac"],
               uptime, f"<= {cfg['max_gap_sessions_frac']:.0%} of sessions with a gap"),
     ]
+
+    # -- predictive-power checks: profitability without prediction is luck. --
+    # These use every settled tick (no-trades included), so they resolve fast.
+    dir_all = cal["directional"]["overall"]
+    checks.append(check(
+        "Directional edge present",
+        dir_all["n"] >= cfg["min_directional_n"]
+        and dir_all["hit_rate"] is not None
+        and dir_all["hit_rate"] >= cfg["min_directional_hit"],
+        dir_all,
+        f">= {cfg['min_directional_hit']:.0%} hit rate over "
+        f">= {cfg['min_directional_n']} resolved-bias ticks",
+    ))
+
+    pp = cal["prob_profit"]
+    checks.append(check(
+        "Probabilities calibrated",
+        pp.get("n", 0) >= cfg["min_calibration_n"]
+        and pp.get("brier_skill") is not None
+        and pp["brier_skill"] >= cfg["min_brier_skill"],
+        {k: pp.get(k) for k in ("n", "brier", "brier_skill", "base_rate")},
+        f"Brier skill >= {cfg['min_brier_skill']} over >= {cfg['min_calibration_n']} candidates",
+    ))
+
+    ev = cal["ev"]
+    checks.append(check(
+        "EV unbiased",
+        ev.get("n", 0) >= cfg["min_calibration_n"]
+        and ev.get("mean_ev_error") is not None
+        and abs(ev["mean_ev_error"]) <= cfg["max_abs_ev_bias"],
+        ev,
+        f"|mean ev_error| <= ${cfg['max_abs_ev_bias']:.2f}/share over "
+        f">= {cfg['min_calibration_n']} settled candidates",
+    ))
+
     ready = all(c["ok"] for c in checks)
 
     return {
@@ -219,5 +262,6 @@ def readiness_summary(db_path: str, paper_db_path: str,
             "regime_diversity": regime,
             "uptime": uptime,
             "paper": paper,
+            "calibration": cal,
         },
     }

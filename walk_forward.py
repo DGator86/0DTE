@@ -362,37 +362,25 @@ def run_walk_forward(
 # Demo                                                                          #
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    import numpy as np
-    from rnd_extractor import ChainSnapshot, ChainQuote, _bs_call_fwd
-    from unified_loop import SyntheticUnifiedFeed
+    # Demo on the COUPLED synthetic world (synthetic_world.py): GEX drives the
+    # price dynamics, chains reprice off the live path every tick, and each
+    # session settles at its actual close — so EV accuracy, win rates, and the
+    # directional readouts measure something real about the pipeline, not just
+    # plumbing. (The old static-chain SyntheticUnifiedFeed made prediction
+    # unmeasurable by construction.)
+    from synthetic_world import CoupledSyntheticFeed, WorldConfig
 
-    DAYS = 30
-    spot0 = 600.0
-    T0, r0 = 4.0 / (24 * 365), 0.05
-    DF0 = math.exp(-r0 * T0)
-    F0  = spot0 * math.exp(r0 * T0)
-
-    qs = []
-    for K in np.arange(spot0 - 15, spot0 + 16, 1.0):
-        k = math.log(K / F0)
-        s = max(0.0050 - 0.030 * k, 0.0008)
-        cm = _bs_call_fwd(F0, K, s) * DF0
-        pm = max(cm - DF0 * (F0 - K), 0.0)
-        cm = max(cm, 0.0)
-        h  = 0.01 + 0.002 * max(cm, pm)
-        qs.append(ChainQuote(float(K), max(cm - h, 0), cm + h,
-                             max(pm - h, 0), pm + h))
-    chain = ChainSnapshot(qs, spot=spot0, t_years=T0, r=r0)
-
-    start = dt.datetime(2026, 6, 1, 9, 30, tzinfo=ET)
-    ticks = [start + dt.timedelta(minutes=i) for i in range(DAYS * 390)]
+    DAYS = 12
+    STRIDE = 5      # every 5th minute keeps the demo fast
 
     def make_feed():
-        return SyntheticUnifiedFeed(days=DAYS, chain=chain, settle=spot0)
+        return CoupledSyntheticFeed(WorldConfig(days=DAYS, seed=11, tick_stride=STRIDE))
+
+    ticks = make_feed().timestamps()
 
     for mode in ("expanding", "rolling"):
         print(f"\n{'='*72}")
-        print(f"  Walk-Forward demo — mode={mode}, {DAYS} days, 3 folds")
+        print(f"  Walk-Forward demo — mode={mode}, {DAYS} days (coupled world), 3 folds")
         print(f"{'='*72}\n")
         result = run_walk_forward(
             feed_factory=make_feed,

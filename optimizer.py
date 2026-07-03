@@ -145,6 +145,11 @@ class OptimizerConfig:
     n_trials: int = 20            # used only for random search
     metric: str = "sharpe"        # scoring metric (see module docstring)
     seed: int = 42                # reproducibility for random search
+    # Selection-bias guard: picking the max of N trials on the SAME folds makes
+    # the winner in-sample with respect to the search itself. Reserve the final
+    # fraction of the timeline; the search never sees it, and only the single
+    # winning config is evaluated there once. Judge by the holdout number.
+    holdout_frac: float = 0.0     # 0 disables; 0.2 = final 20% untouched
 
 
 @dataclass
@@ -153,6 +158,8 @@ class OptimResult:
     wf_cfg: WalkForwardConfig
     param_space: dict
     trials: list[Trial]           # sorted best → worst
+    holdout_score: Optional[float] = None      # winner's score on the untouched window
+    holdout_result: Optional[WalkForwardResult] = None
 
     @property
     def best_trial(self) -> Trial:
@@ -216,6 +223,12 @@ class OptimResult:
               f"score={self.best_trial.score:+.4f}")
         for k, v in self.best_trial.params.items():
             print(f"    {k} = {v}")
+        if self.holdout_score is not None:
+            drop = self.best_trial.score - self.holdout_score
+            print(f"  HOLDOUT (untouched final {self.opt_cfg.holdout_frac:.0%}): "
+                  f"score={self.holdout_score:+.4f}  "
+                  f"(search-window score was {self.best_trial.score:+.4f}; "
+                  f"a large drop means the search overfit)")
         print("=" * w)
 
     def to_dict(self) -> dict:
@@ -225,6 +238,7 @@ class OptimResult:
             "n_trials": len(self.trials),
             "best_score": self.best_trial.score,
             "best_params": self.best_trial.params,
+            "holdout_score": self.holdout_score,
             "trials": [
                 {"id": t.trial_id, "params": t.params, "score": t.score}
                 for t in self.trials
@@ -259,6 +273,13 @@ def run_optimizer(
     wf   = wf_cfg  or WalkForwardConfig()
     base = base_engine_cfg or EngineConfig()
 
+    # Carve off the untouched holdout BEFORE the search sees anything.
+    holdout_ts: list[dt.datetime] = []
+    search_ts = timestamps
+    if opt.holdout_frac > 0.0:
+        cut = int(len(timestamps) * (1.0 - opt.holdout_frac))
+        search_ts, holdout_ts = timestamps[:cut], timestamps[cut:]
+
     if opt.search == "grid":
         param_list = _grid_params(param_space)
     elif opt.search == "random":
@@ -268,7 +289,8 @@ def run_optimizer(
 
     n_total = len(param_list)
     print(f"  Optimizer: {opt.search} search, {n_total} trials, "
-          f"metric={opt.metric}, wf={wf.mode}/{wf.n_folds}-fold")
+          f"metric={opt.metric}, wf={wf.mode}/{wf.n_folds}-fold"
+          + (f", holdout={opt.holdout_frac:.0%}" if holdout_ts else ""))
 
     trials: list[Trial] = []
     for i, params in enumerate(param_list, start=1):
@@ -278,7 +300,7 @@ def run_optimizer(
 
         wf_result = run_walk_forward(
             feed_factory=feed_factory,
-            timestamps=timestamps,
+            timestamps=search_ts,
             wf_cfg=wf,
             engine_cfg=engine_cfg,
             risk_cfg=risk_cfg,
@@ -291,9 +313,31 @@ def run_optimizer(
         ))
 
     trials.sort(key=lambda t: t.score, reverse=True)
+
+    # Evaluate ONLY the winner, ONCE, on the untouched window: warm-up on the
+    # full search timeline, one test fold on the holdout.
+    holdout_score = holdout_result = None
+    if holdout_ts:
+        print(f"  Holdout: evaluating winner on final {len(holdout_ts):,} ticks "
+              f"(never seen by the search)")
+        holdout_result = run_walk_forward(
+            feed_factory=feed_factory,
+            timestamps=search_ts + holdout_ts,
+            wf_cfg=WalkForwardConfig(
+                mode="expanding", n_folds=1,
+                train_frac=len(search_ts) / max(1, len(search_ts) + len(holdout_ts)),
+            ),
+            engine_cfg=trials[0].engine_cfg,
+            risk_cfg=risk_cfg,
+        )
+        holdout_score = _score(holdout_result, opt.metric)
+        print(f"  Holdout score: {holdout_score:+.4f} "
+              f"(search score {trials[0].score:+.4f})")
+
     return OptimResult(
         opt_cfg=opt, wf_cfg=wf,
         param_space=param_space, trials=trials,
+        holdout_score=holdout_score, holdout_result=holdout_result,
     )
 
 

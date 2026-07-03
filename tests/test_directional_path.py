@@ -168,6 +168,11 @@ def test_drift_tilt_shifts_density_mean():
     down = physical_pdf_from_realized_vol(rnd, 0.14, drift_std_frac=-0.5)
     m0, mu, md = mean_of(flat), mean_of(up), mean_of(down)
     assert mu > m0 > md
-    # shift magnitude ~ drift_frac * phys_std
-    phys_std = 0.14 * rnd.forward * math.sqrt(rnd.t_years)
-    assert mu - m0 == pytest.approx(0.5 * phys_std, rel=0.35)
+    # shift magnitude ~ drift_frac * phys_std, where phys_std is the clipped
+    # squeeze of rn_std toward the realized-vol target (trading-minute units)
+    from rnd_extractor import MINUTES_PER_YEAR, RNDConfig
+    minutes_left = rnd.t_years * 525960.0
+    target = 0.14 * rnd.forward * math.sqrt(minutes_left / MINUTES_PER_YEAR)
+    cfgd = RNDConfig()
+    scale = min(max(target / rnd.std(), cfgd.rv_scale_min), cfgd.rv_scale_max)
+    assert mu - m0 == pytest.approx(0.5 * scale * rnd.std(), rel=0.35)

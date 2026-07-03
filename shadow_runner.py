@@ -31,6 +31,7 @@ import sys
 import time
 from zoneinfo import ZoneInfo
 
+from chain_store import ChainRecorder
 from composite_feed import build_default_feed
 from journal import Journal
 from unified_loop import UnifiedOrchestrator
@@ -98,6 +99,7 @@ class ShadowRunner:
         paper_db: Optional[str] = None,
         paper_cfg: "Optional[PaperConfig]" = None,
         live_state_path: str = "live_state.json",
+        record_dir: Optional[str] = None,   # None = <db_dir>/ticks; "" disables
     ) -> None:
         self.symbol = symbol
         self.interval_s = interval_s
@@ -124,6 +126,12 @@ class ShadowRunner:
             feed=self._feed, journal=self._jrn, risk_manager=self._risk,
             state_path=os.path.join(state_dir, "adaptive_state.json"),
         )
+        # Record every tick (market + chain + incremental bars) so a REAL-data
+        # walk-forward becomes possible. ~1 MB/session gzipped; you cannot
+        # backfill what you never saved.
+        if record_dir is None:
+            record_dir = os.path.join(state_dir, "ticks")
+        self._recorder = ChainRecorder(record_dir) if record_dir else None
         self._notifier = Notifier()
         self._settled: set[str] = set()
 
@@ -192,6 +200,31 @@ class ShadowRunner:
               f"mean_ev={blocked.get('mean_ev', 0) or 0:.3f}  "
               f"mean_pnl={blocked.get('mean_pnl', 0) or 0:.3f}")
         print(f"  Verdict: {eff['verdict']}")
+
+        # -- predictive power: does the system call the market forward? --
+        cal = self._jrn.calibration()
+        d = cal["directional"]["overall"]
+        print("\n  Predictive power (all settled ticks, no-trades included):")
+        if d["n"]:
+            print(f"    Direction bias:  n={d['n']:5d}  hit={d['hit_rate']:.1%}  "
+                  f"signed fwd move={d['avg_fwd_move_pct']:+.3f}%")
+            for side, s in cal["directional"]["by_direction"].items():
+                if s["n"]:
+                    print(f"      {side:<5} n={s['n']:5d}  hit={s['hit_rate']:.1%}  "
+                          f"move={s['avg_fwd_move_pct']:+.3f}%")
+        else:
+            print("    Direction bias:  no resolved-bias settled ticks yet")
+        pp = cal["prob_profit"]
+        if pp.get("n"):
+            print(f"    prob_profit:     n={pp['n']:5d}  Brier={pp['brier']:.4f}  "
+                  f"skill={pp['brier_skill']}  base_rate={pp['base_rate']:.1%}")
+            for b in pp.get("bins", []):
+                print(f"      p∈{b['bin']}  n={b['n']:4d}  "
+                      f"predicted={b['mean_predicted']:.2f}  realized={b['realized_rate']:.2f}")
+        ev = cal["ev"]
+        if ev.get("n"):
+            print(f"    EV bias:         n={ev['n']:5d}  mean_err={ev['mean_ev_error']:+.4f}  "
+                  f"MAE={ev['mae_ev_error']:.4f}  (mean |EV|={ev['mean_abs_ev']:.4f})")
 
         corr = self._jrn.component_correlations()
         if corr:
@@ -264,6 +297,9 @@ class ShadowRunner:
             )
             return
 
+        if self._recorder and result.snapshot is not None:
+            self._recorder.record(now, result.snapshot)
+
         regime = result.regime.dominant_regime
         struct = result.intent.decision.structure
         mult = result.final_size_mult
@@ -319,6 +355,10 @@ class ShadowRunner:
             return
         n = self._orch.settle(session_date)
         self._settled.add(session_date)
+        if self._recorder:
+            price = self._feed.settlement_price(session_date)
+            if price is not None:
+                self._recorder.record_settlement(session_date, price)
         if self._risk:
             self._risk.close_positions()
         if n > 0:
@@ -355,6 +395,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Starting virtual cash for paper trading (default: 1000)")
     p.add_argument("--live-state", dest="live_state", default="live_state.json",
                    help="Path for dashboard live_state.json (default: live_state.json)")
+    p.add_argument("--record-dir", dest="record_dir", default=None,
+                   help="Directory for tick recordings (default: <db dir>/ticks; "
+                        "pass an empty string to disable)")
     p.add_argument("--settle",   metavar="YYYY-MM-DD",
                    help="Manually settle a specific session date and exit")
     p.add_argument("--max-loss", dest="max_loss", type=float, default=0.0,
@@ -391,6 +434,7 @@ if __name__ == "__main__":
         paper_db=args.paper_db,
         paper_cfg=PaperConfig(starting_cash=args.paper_cash),
         live_state_path=args.live_state,
+        record_dir=args.record_dir,
     )
 
     if args.report:
