@@ -92,6 +92,8 @@ structures, call `spread_selector.select_spreads` with a chain and return the re
 | `unified_loop.py` | **The** live tick loop: Track A RND + realized-vol physical pdf -> matrix -> Track B routing -> Track A fill -> risk -> journal. | `UnifiedOrchestrator`, `TickSnapshot`, `TickResult` | Validated (seam tests) |
 | `shadow_runner.py` | Drives `UnifiedOrchestrator` live in no-order mode; auto-settle 4:15 ET; paper broker + dashboard state. | `ShadowRunner`, `--report` | Works |
 | `composite_feed.py` | Live `DataFeed` with provider failover (Tradier -> Tastytrade -> Massive); Yahoo backstops bars/settlement only. | `build_default_feed` | Works |
+| `chain_store.py` | Record live ticks (market+chain+incremental bars+settlements) to gzipped JSONL; replay them as a `DataFeed` — the missing piece for REAL-data walk-forward. `shadow_runner` records by default. | `ChainRecorder`, `RecordedFeed` | Validated (round-trip test) |
+| `synthetic_world.py` | COUPLED synthetic market: GEX regime drives price dynamics, chains reprice off the live path each tick, settlement = the path's close. Makes prediction measurable in backtests (the frozen-chain `SyntheticUnifiedFeed` cannot). | `CoupledSyntheticFeed`, `WorldConfig` | Validated |
 
 ### Dependency graph
 ```
@@ -221,6 +223,19 @@ Yahoo quarantined to bars/settlement). Remaining, in order:
    `component_correlations` / `gate_effectiveness`) to set the weights, the
    `naked_gap_multiplier`, and the `mc.MCConfig` knobs from data instead of
    priors. Don't build new modules before this loop closes.
+   **Predictive-power readouts now exist and gate readiness:**
+   `journal.directional_accuracy()` (bias vs realized move, scored on EVERY
+   settled tick incl. no-trades), `journal.prob_calibration()` (Brier + skill
+   + reliability bins), and `journal.calibration()` (the readout `mc.py`
+   promises). The dashboard readiness checklist blocks on them: directional
+   hit >= 52% over >= 100 resolved-bias ticks, Brier skill >= 0, |EV bias|
+   <= $0.10/share. Profitability without prediction is luck; these force the
+   distinction before sizing up.
+   **Real-data walk-forward is now buildable:** `shadow_runner` records every
+   tick via `chain_store.ChainRecorder` (default `<db_dir>/ticks`, ~1 MB/day);
+   after a few weeks, `RecordedFeed(dir)` + `run_walk_forward` is an
+   out-of-sample test on actual markets. `optimizer.OptimizerConfig
+   (holdout_frac=0.2)` keeps a final untouched window the search never sees.
 2. **Arbitrate the GEX measurement** (§5 item 4b) with the shadow journal:
    OI-only vs front-weeklies-included vs intraday volume-weighted proxy.
 3. **Adaptive scales — partially done.** `build_matrix` already routes through

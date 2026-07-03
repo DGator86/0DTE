@@ -206,6 +206,112 @@ class Journal:
                 out[c] = corr(xs, y)
         return out
 
+    # ---- predictive-power readouts -------------------------------------------
+    # These answer "does the system predict forward movement?" — distinct from
+    # gate_effectiveness ("did the gate filter well?"). All use data the journal
+    # already collects on EVERY tick, so the sample builds fast: the direction
+    # bias is scored even on no-trade ticks.
+
+    def directional_accuracy(self) -> dict:
+        """
+        Hit rate of the regime direction bias vs the realized move to settlement,
+        over ALL settled ticks whose bias resolved ("call"/"put") — trades and
+        no-trades alike. A flat close counts as a miss (you paid theta/spread to
+        be there). This is the sample that tells you within days, not weeks,
+        whether the directional engine's premise holds.
+        """
+        rows = [r for r in self.fetch(settled_only=True)
+                if r["regime_direction"] in ("call", "put")
+                and r["spot"] is not None and r["settle_price"] is not None]
+
+        def stats(rs):
+            if not rs:
+                return {"n": 0, "hit_rate": None, "avg_fwd_move_pct": None}
+            hits = 0
+            moves = []
+            for r in rs:
+                move = (r["settle_price"] - r["spot"]) / r["spot"]
+                signed = move if r["regime_direction"] == "call" else -move
+                moves.append(signed)
+                if signed > 0:
+                    hits += 1
+            return {"n": len(rs), "hit_rate": round(hits / len(rs), 4),
+                    "avg_fwd_move_pct": round(sum(moves) / len(moves) * 100, 4)}
+
+        overall = stats(rows)
+        return {
+            "overall": overall,
+            "by_direction": {
+                d: stats([r for r in rows if r["regime_direction"] == d])
+                for d in ("call", "put")
+            },
+            "traded_only": stats([r for r in rows if r["was_traded"] == 1]),
+            "note": ("hit = settlement moved in the bias direction; "
+                     "avg_fwd_move_pct is the bias-signed mean move (edge in %, "
+                     "positive means the bias points the right way on average)"),
+        }
+
+    def prob_calibration(self, n_bins: int = 5) -> dict:
+        """
+        Is prob_profit an honest probability? Brier score over settled rows with
+        a candidate, a Brier SKILL score vs always-guessing-the-base-rate
+        (positive = the model's probabilities carry information; <= 0 = you
+        could do as well quoting one constant), and a reliability table.
+        """
+        rows = [r for r in self.fetch(settled_only=True)
+                if r["prob_profit"] is not None and r["realized_pnl"] is not None]
+        if not rows:
+            return {"n": 0, "note": "no settled rows with prob_profit"}
+
+        pairs = [(float(r["prob_profit"]), 1.0 if r["realized_pnl"] > 0 else 0.0)
+                 for r in rows]
+        n = len(pairs)
+        base = sum(w for _, w in pairs) / n
+        brier = sum((p - w) ** 2 for p, w in pairs) / n
+        brier_base = sum((base - w) ** 2 for _, w in pairs) / n
+        skill = (1.0 - brier / brier_base) if brier_base > 0 else None
+
+        bins = []
+        for i in range(n_bins):
+            lo, hi = i / n_bins, (i + 1) / n_bins
+            inb = [(p, w) for p, w in pairs
+                   if (lo <= p < hi) or (i == n_bins - 1 and p == hi)]
+            if inb:
+                bins.append({
+                    "bin": f"{lo:.1f}-{hi:.1f}",
+                    "n": len(inb),
+                    "mean_predicted": round(sum(p for p, _ in inb) / len(inb), 4),
+                    "realized_rate": round(sum(w for _, w in inb) / len(inb), 4),
+                })
+
+        return {"n": n, "base_rate": round(base, 4), "brier": round(brier, 4),
+                "brier_skill": round(skill, 4) if skill is not None else None,
+                "bins": bins}
+
+    def calibration(self) -> dict:
+        """
+        The readout mc.py promises: predicted quantities vs realized outcomes.
+        Three panels — direction (does the bias point the right way), probability
+        (is prob_profit honest), and EV (is the physical-density EV unbiased).
+        If MC/selector says one thing and this says another, believe this.
+        """
+        rows = [r for r in self.fetch(settled_only=True)
+                if r["ev"] is not None and r["ev_error"] is not None]
+        ev_panel: dict = {"n": len(rows)}
+        if rows:
+            errs = [r["ev_error"] for r in rows]
+            evs = [abs(r["ev"]) for r in rows]
+            ev_panel.update({
+                "mean_ev_error": round(sum(errs) / len(errs), 4),
+                "mae_ev_error": round(sum(abs(e) for e in errs) / len(errs), 4),
+                "mean_abs_ev": round(sum(evs) / len(evs), 4),
+            })
+        return {
+            "directional": self.directional_accuracy(),
+            "prob_profit": self.prob_calibration(),
+            "ev": ev_panel,
+        }
+
     def regime_diversity(self) -> dict:
         """
         Distribution of gex_regime across settled trades that were actually
