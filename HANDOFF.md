@@ -247,6 +247,26 @@ Yahoo quarantined to bars/settlement). Remaining, in order:
    to end (see §5 item 7): `GateConfig.w_dir_*`, `dir_adx_floor/full`, and
    `RNDConfig.dir_drift_frac` are structured guesses. The journal settles
    every directional would-be candidate — regress and adjust from data.
+5. **Promote (or kill) the observation-only signal tranche.** New orthogonal
+   signals now flow through a fixed admission pipeline: journaled in
+   `signals_json` on every tick + rendered as un-consumed MTF rows, scored by
+   `component_correlations()` (`sig:*` keys) and the recorded walk-forward.
+   Currently under observation, with ZERO gate/veto power (a test enforces
+   this):
+   - **Dealer dynamics** (`market_dynamics.DynamicsWindow`, state persisted):
+     flip_velocity, flip_chase, call/put_wall_velocity, gex_velocity_bn,
+     wall_rupture (signed acceptance beyond a wall), straddle_ramp.
+   - **expected_move_consumed** = |spot − session_open| / ATM straddle — the
+     cheap 0DTE continuation filter candidate.
+   - **Options-flow lite** (`massive_feed.flow_lite`, all feeds): pcr_volume,
+     volume_oi_ratio. NaN when the provider has no volume (tastytrade stream).
+   - **Breadth lite** (`tradier_feed.get_breadth_lite`, Tradier only, one
+     batched quote call): rsp_spy_div, sector_align, top10_pressure.
+   When a signal's `sig:` correlation holds up over a real sample, wire it
+   into `_REGIME_DEF` / `DIR_VARS` / a veto — that step is deliberate and
+   data-earned, never done at introduction. Deferred until a data vendor
+   exists: ES futures lead/lag, real $TICK/TRIN internals, trade-level
+   options delta flow.
 
 ---
 

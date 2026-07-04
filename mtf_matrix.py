@@ -93,6 +93,30 @@ VARS: list[MTFVar] = [
     # Order flow (NATIVE, windowed)
     MTFVar("flow", "cvd_persistence", NATIVE,  lambda x: S(x, 0.4),            S,    0.40),
     MTFVar("flow", "tick_two_sided", NATIVE,   lambda x: N(x, 600.0),          N,  600.0),
+    # ------------------------------------------------------------------
+    # OBSERVATION-ONLY signal domains (see journal.py's admission rule).
+    # These rows render in the matrix and journal via signals_json, but no
+    # regime blend, decision cell, gate, or veto consumes them until
+    # component_correlations() on settled ticks earns them that power.
+    # ------------------------------------------------------------------
+    # Dealer dynamics (market_dynamics.DynamicsWindow)
+    MTFVar("dealer", "flip_velocity", SNAPSHOT,     lambda x: S(x, 1.0),       S,    1.0),
+    MTFVar("dealer", "flip_chase", SNAPSHOT,        lambda x: S(x, 1.0),       S,    1.0),
+    MTFVar("dealer", "call_wall_velocity", SNAPSHOT, lambda x: S(x, 1.0),      S,    1.0),
+    MTFVar("dealer", "put_wall_velocity", SNAPSHOT, lambda x: S(x, 1.0),       S,    1.0),
+    MTFVar("dealer", "gex_velocity_bn", SNAPSHOT,   lambda x: S(x, 0.5),       S,    0.5),
+    MTFVar("dealer", "wall_rupture", SNAPSHOT,      lambda x: S(x, 0.5),       S,    0.5),
+    # Vol-state dynamics
+    MTFVar("vol", "straddle_ramp", SNAPSHOT,        lambda x: S(x, 0.05),      S,    0.05),
+    MTFVar("vol", "expected_move_consumed", SNAPSHOT, lambda x: clip100(100 * x / 1.5)),
+    # Options-flow lite (from the live chain the RND already uses).
+    # pcr is centered at 1.0, so no ScaleBook adapt_fn (S adapts around 0).
+    MTFVar("flow", "pcr_volume", SNAPSHOT,          lambda x: S(x - 1.0, 0.5)),
+    MTFVar("flow", "volume_oi_ratio", SNAPSHOT,     lambda x: clip100(100 * x / 5.0)),
+    # Breadth lite (batched quotes: RSP, sector ETFs, top-10 names)
+    MTFVar("breadth", "rsp_spy_div", SNAPSHOT,      lambda x: S(x, 0.004),     S,    0.004),
+    MTFVar("breadth", "sector_align", SNAPSHOT,     lambda x: P(x)),
+    MTFVar("breadth", "top10_pressure", SNAPSHOT,   lambda x: S(x, 0.006),     S,    0.006),
 ]
 
 

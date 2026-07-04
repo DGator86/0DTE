@@ -43,6 +43,7 @@ from yahoo_feed import YahooBackstop
 from gex_window import GexRankWindow
 # Reuse the chain/technical helpers already proven against the Massive feed.
 from massive_feed import (
+    flow_lite,
     _option_rows_to_chain_snapshot, _bar_technicals,
     _session_vwap_and_reversions, _atm_straddle_price,
 )
@@ -302,6 +303,7 @@ class TastytradeDataFeed:
         vwap, vwap_rev = _session_vwap_and_reversions(raw, now)
         straddle_be = _atm_straddle_price(rows, spot)
 
+        flow = flow_lite(rows)
         market = MarketSnapshot(
             spot=spot, net_gex=gm.net_gex, gamma_flip=gm.gamma_flip,
             call_wall=gm.call_wall, put_wall=gm.put_wall, gex_pct_rank=gex_rank,
@@ -314,6 +316,7 @@ class TastytradeDataFeed:
             tick_abs_mean=480.0,            # $TICK not sourced here; calm default
             cvd_slope=tech["cvd_slope"],
             now=now, has_catalyst=self.has_catalyst, catalyst_label=self.catalyst_label,
+            pcr_volume=flow["pcr_volume"], volume_oi_ratio=flow["volume_oi_ratio"],
         )
         return TickSnapshot(market=market, bars=raw, chain=chain)
 

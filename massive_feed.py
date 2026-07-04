@@ -98,7 +98,8 @@ def _row_from_contract(c: dict) -> OptionRow | None:
 
     return OptionRow(side=side, strike=float(strike), oi=int(oi),
                      gamma=float(gamma), bid=float(bid), ask=float(ask),
-                     delta=abs(float(delta)), quote_source=source, quote_valid=valid)
+                     delta=abs(float(delta)), quote_source=source, quote_valid=valid,
+                     volume=int(day.get("volume") or 0))
 
 
 def _estimate_spot(rows: list[OptionRow]) -> float:
@@ -397,6 +398,25 @@ def _session_vwap_and_reversions(raw: RawBars, now: dt.datetime) -> tuple[float,
     return vwap, crossings
 
 
+def flow_lite(rows: list[OptionRow]) -> dict:
+    """Options-flow lite from the chain rows every feed already fetches.
+
+    Observation-only signals (see journal.py's admission rule): put/call
+    volume ratio and volume/OI participation shock. NaN when the provider
+    supplies no volume — absent must never read as zero flow.
+    """
+    import math as _math
+    call_vol = sum(r.volume for r in rows if r.side == "call")
+    put_vol = sum(r.volume for r in rows if r.side == "put")
+    total_oi = sum(r.oi for r in rows)
+    total_vol = call_vol + put_vol
+    return {
+        "pcr_volume": (put_vol / call_vol) if call_vol > 0 else float("nan"),
+        "volume_oi_ratio": (total_vol / total_oi)
+                           if (total_oi > 0 and total_vol > 0) else float("nan"),
+    }
+
+
 def _bar_technicals(raw: RawBars) -> dict:
     """
     Compute bar-derived MarketSnapshot fields by resampling to 5m.
@@ -618,6 +638,7 @@ class MassiveDataFeed:
         straddle_be = _atm_straddle_price(rows, spot)
         expected_range = straddle_be / 1.25   # rough log-normal 1-sigma scaling
 
+        flow = flow_lite(rows)
         market = MarketSnapshot(
             spot=spot,
             net_gex=gm.net_gex,
@@ -643,6 +664,7 @@ class MassiveDataFeed:
             now=now,
             has_catalyst=self.has_catalyst,
             catalyst_label=self.catalyst_label,
+            pcr_volume=flow["pcr_volume"], volume_oi_ratio=flow["volume_oi_ratio"],
         )
         return TickSnapshot(market=market, bars=raw, chain=chain)
 
