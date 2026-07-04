@@ -38,7 +38,15 @@ COLUMNS = [
     "gate_pass", "gate_score", "gate_failed", "veto_reasons",
     "decision", "no_trade_reason", "was_traded", "candidate_present",
     "regime_direction",     # Track B direction: "call"|"put"|"both"|"none"
+    "signals_json",         # JSON dict of observation-only signals (see below)
 ]
+
+# signals_json is the admission channel for NEW signal domains (dealer
+# dynamics, options flow, breadth, ...). A candidate signal is journaled here
+# on every tick — with NO gate or veto power — until component_correlations()
+# and the recorded walk-forward show it predicts realized P&L. Only then does
+# it earn a matrix weight or veto. Flexible JSON so adding a signal never
+# requires a schema migration.
 
 _SETTLE_COLUMNS = ["settle_price", "realized_pnl", "ev_error", "settled"]
 
@@ -47,7 +55,7 @@ def _coltype(col: str) -> str:
     if col in ("session_date", "ts", "gex_regime", "selected_family",
                "short_strikes", "long_strikes", "legs_json",
                "gate_failed", "veto_reasons", "decision", "no_trade_reason",
-               "regime_direction"):
+               "regime_direction", "signals_json"):
         return "TEXT"
     if col in ("gate_pass", "was_traded", "candidate_present"):
         return "INTEGER"
@@ -86,10 +94,16 @@ class Journal:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_CREATE)
+        # migration: signals_json added after live DBs already existed
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(evaluations)")}
+        if "signals_json" not in cols:
+            self.conn.execute("ALTER TABLE evaluations ADD COLUMN signals_json TEXT")
         self.conn.commit()
 
     # ---- write ----
     def log(self, row: dict) -> int:
+        row = dict(row)
+        row.setdefault("signals_json", None)     # optional; older callers omit it
         missing = [c for c in COLUMNS if c not in row]
         if missing:
             raise ValueError(f"row missing columns: {missing}")
@@ -204,6 +218,23 @@ class Journal:
             xs = [r[c] for r in rows if r[c] is not None]
             if len(xs) == len(y):
                 out[c] = corr(xs, y)
+
+        # observation-only signals (signals_json): score each numeric key the
+        # same way — this is how a candidate signal EARNS gate/veto power
+        sig_rows = []
+        for r in rows:
+            try:
+                sig = json.loads(r["signals_json"]) if r.get("signals_json") else None
+            except (json.JSONDecodeError, TypeError):
+                sig = None
+            sig_rows.append(sig if isinstance(sig, dict) else {})
+        keys = sorted({k for s in sig_rows for k in s
+                       if isinstance(s[k], (int, float))})
+        for k in keys:
+            pairs = [(s[k], yy) for s, yy in zip(sig_rows, y)
+                     if isinstance(s.get(k), (int, float))]
+            if len(pairs) >= 3:
+                out[f"sig:{k}"] = corr([p for p, _ in pairs], [p for _, p in pairs])
         return out
 
     # ---- predictive-power readouts -------------------------------------------

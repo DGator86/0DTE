@@ -58,6 +58,7 @@ class OptionRow:
     # and silently defeat the spread filter. Track it; reject it for live trades.
     quote_source: str = "live_quote"   # "live_quote" | "day_close_fallback"
     quote_valid: bool = True
+    volume: int = 0                    # same-day contract volume (0 = not provided)
 
     @property
     def mid(self) -> float:

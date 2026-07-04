@@ -53,7 +53,7 @@ from gex_window import GexRankWindow
 # Reuse the chain/technical helpers already proven against the Massive feed.
 from massive_feed import (
     _option_rows_to_chain_snapshot, _bar_technicals,
-    _session_vwap_and_reversions, _atm_straddle_price,
+    _session_vwap_and_reversions, _atm_straddle_price, flow_lite,
 )
 
 ET = ZoneInfo("America/New_York")
@@ -100,6 +100,66 @@ def _as_list(node: Any) -> list:
 
 
 # --------------------------------------------------------------------------- #
+# Breadth lite (observation-only; see journal.py's admission rule)             #
+# --------------------------------------------------------------------------- #
+# One batched quote request covers equal-weight divergence, sector alignment,
+# and mega-cap pressure — the ~80% of a full 500-constituent breadth engine
+# that costs ~0.1% of the data. Full constituents only if this earns its keep.
+SECTOR_ETFS = ["XLK", "XLF", "XLV", "XLY", "XLP", "XLE",
+               "XLI", "XLB", "XLRE", "XLU", "XLC"]
+# Approximate SPX top-10 weights (renormalized in code; refresh occasionally).
+TOP10_WEIGHTS = {
+    "NVDA": 7.5, "MSFT": 6.8, "AAPL": 6.1, "AMZN": 4.0, "META": 2.9,
+    "AVGO": 2.5, "GOOGL": 2.2, "GOOG": 1.8, "TSLA": 1.7, "BRK.B": 1.6,
+}
+
+
+def get_breadth_lite() -> dict:
+    """RSP-SPY divergence, sector alignment, top-10 pressure from one batched
+    /markets/quotes call. NaN on any failure — absent must not read as zero."""
+    nan = float("nan")
+    out = {"rsp_spy_div": nan, "sector_align": nan, "top10_pressure": nan}
+    symbols = ["SPY", "RSP"] + SECTOR_ETFS + list(TOP10_WEIGHTS)
+    try:
+        data = _get("/markets/quotes", {"symbols": ",".join(symbols)})
+        quotes = {q.get("symbol"): q
+                  for q in _as_list((data.get("quotes") or {}).get("quote"))}
+
+        def day_pct(sym):
+            q = quotes.get(sym)
+            if not q:
+                return None
+            cp = q.get("change_percentage")
+            if cp is not None:
+                return float(cp) / 100.0
+            last, prev = q.get("last"), q.get("prevclose")
+            if last and prev:
+                return float(last) / float(prev) - 1.0
+            return None
+
+        spy, rsp = day_pct("SPY"), day_pct("RSP")
+        if spy is not None and rsp is not None:
+            out["rsp_spy_div"] = rsp - spy
+
+        sector_moves = [day_pct(s) for s in SECTOR_ETFS]
+        sector_moves = [m for m in sector_moves if m is not None]
+        if sector_moves:
+            out["sector_align"] = sum(1 for m in sector_moves if m > 0) / len(sector_moves)
+
+        num = den = 0.0
+        for sym, w in TOP10_WEIGHTS.items():
+            m = day_pct(sym)
+            if m is not None:
+                num += w * m
+                den += w
+        if den > 0:
+            out["top10_pressure"] = num / den
+    except Exception:
+        pass
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Market data                                                                   #
 # --------------------------------------------------------------------------- #
 def get_spot(symbol: str) -> float:
@@ -140,7 +200,8 @@ def _row_from_option(o: dict) -> Optional[OptionRow]:
     return OptionRow(side=side, strike=float(strike), oi=int(oi),
                      gamma=float(gamma), bid=float(bid), ask=float(ask),
                      delta=abs(float(delta)),
-                     quote_source="tradier_live", quote_valid=True)
+                     quote_source="tradier_live", quote_valid=True,
+                     volume=int(o.get("volume") or 0))
 
 
 def get_chain(symbol: str, expiration: str) -> list[OptionRow]:
@@ -290,6 +351,8 @@ class TradierDataFeed:
         tech = _bar_technicals(raw)
         vwap, vwap_rev = _session_vwap_and_reversions(raw, now)
         straddle_be = _atm_straddle_price(rows, spot)
+        flow = flow_lite(rows)
+        breadth = get_breadth_lite()
 
         market = MarketSnapshot(
             spot=spot, net_gex=gm.net_gex, gamma_flip=gm.gamma_flip,
@@ -303,6 +366,9 @@ class TradierDataFeed:
             tick_abs_mean=480.0,            # $TICK not sourced here; calm default
             cvd_slope=tech["cvd_slope"],
             now=now, has_catalyst=self.has_catalyst, catalyst_label=self.catalyst_label,
+            pcr_volume=flow["pcr_volume"], volume_oi_ratio=flow["volume_oi_ratio"],
+            rsp_spy_div=breadth["rsp_spy_div"], sector_align=breadth["sector_align"],
+            top10_pressure=breadth["top10_pressure"],
         )
         return TickSnapshot(market=market, bars=raw, chain=chain)
 

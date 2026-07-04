@@ -104,6 +104,7 @@ class TradeDecision:
             "was_traded": 1 if self.decision == "TRADE" else 0,
             "candidate_present": 1 if c else 0,
             "regime_direction": self.direction,
+            "signals_json": None,     # observation-only signals; unified_loop fills it
         }
 
 

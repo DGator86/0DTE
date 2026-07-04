@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import datetime as dt
+import math
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -80,6 +81,17 @@ class MarketSnapshot:
     has_catalyst: bool             # FOMC/CPI/PCE/NFP/mega-cap earnings in the danger window
     catalyst_label: str = ""
 
+    # --- OBSERVATION-ONLY orthogonal signals (NaN = source unavailable) ---
+    # Options-flow lite, from the same chain snapshot the RND already uses:
+    pcr_volume: float = float("nan")        # put volume / call volume (0DTE chain)
+    volume_oi_ratio: float = float("nan")   # total chain volume / total OI (participation shock)
+    # Breadth lite, from one batched quote request (Tradier primary only):
+    rsp_spy_div: float = float("nan")       # RSP day% - SPY day% (equal- vs cap-weight)
+    sector_align: float = float("nan")      # fraction of the 11 sector ETFs green on day
+    top10_pressure: float = float("nan")    # weighted day% of the top-10 SPX names
+    # These journal via signals_json and appear in the matrix, but nothing
+    # gates or vetoes on them until component_correlations earns them power.
+
     def et_time(self) -> dt.time:
         t = self.now if self.now.tzinfo else self.now.replace(tzinfo=ET)
         return t.astimezone(ET).time()
@@ -87,7 +99,7 @@ class MarketSnapshot:
     def mtf_snapshot(self) -> dict:
         """Snapshot dict for mtf_matrix SNAPSHOT-kind variables (pre-standardized inputs)."""
         s = self.spot
-        return {
+        out = {
             "gamma_sign":        self.net_gex,
             "gamma_magnitude":   self.gex_pct_rank,
             "flip_cushion":      (s - self.gamma_flip) / s,
@@ -97,6 +109,16 @@ class MarketSnapshot:
             "vvix_elevation":    self.vvix / self.vvix_baseline - 1.0 if self.vvix_baseline else 0.0,
             # richness / skew_dir / tail_heaviness injected from RND after extraction
         }
+        # observation-only extras: emit only when the source actually provided
+        # them, so an unavailable feed drops out instead of reading as 0
+        for name, v in (("pcr_volume", self.pcr_volume),
+                        ("volume_oi_ratio", self.volume_oi_ratio),
+                        ("rsp_spy_div", self.rsp_spy_div),
+                        ("sector_align", self.sector_align),
+                        ("top10_pressure", self.top10_pressure)):
+            if v is not None and math.isfinite(v):
+                out[name] = v
+        return out
 
     def dealer_vetoes(self) -> list:
         """Hard vetoes for the regime classifier and Track B routing."""

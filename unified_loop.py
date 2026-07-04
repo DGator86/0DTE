@@ -51,6 +51,7 @@ from mtf_matrix import build_matrix, regime_rows
 from decision_matrix import decide_from_matrix, TradeIntent
 from regime_classifier import RegimeClassifier, RegimeState, ClassifierContext, ClassifierConfig, ScaleBook
 from journal import Journal
+from market_dynamics import DynamicsWindow, session_open_from_bars
 from risk_manager import RiskManager
 
 ET = ZoneInfo("America/New_York")
@@ -105,6 +106,13 @@ class UnifiedOrchestrator:
         self._prev_std: Optional[dict] = None   # for information-gain computation
         self._matrix_scale_book = ScaleBook()   # adaptive scales for MTF matrix variables
         self._ticks_since_save = 0
+        # dealer-surface / vol-state derivatives (observation-only signals)
+        dyn_path = None
+        if self.state_path:
+            import os
+            dyn_path = os.path.join(os.path.dirname(self.state_path) or ".",
+                                    "dynamics_state.json")
+        self._dynamics = DynamicsWindow(path=dyn_path)
         self._load_state()
 
     # -- adaptive-state persistence -------------------------------------------
@@ -181,6 +189,32 @@ class UnifiedOrchestrator:
             except Exception:
                 pass
 
+        # ---- Observation-only orthogonal signals (admission pipeline) ----
+        # Dealer-surface derivatives + expected-move-consumed from the
+        # dynamics window; flow/breadth extras from the feed. They render in
+        # the matrix and land in signals_json for component_correlations to
+        # score — nothing downstream gates or vetoes on them yet.
+        m = snap.market
+        signals: dict = {}
+        try:
+            sess_open = (session_open_from_bars(snap.bars, now)
+                         if snap.bars is not None else None)
+            signals = self._dynamics.update(
+                now.timestamp(), spot=m.spot, gamma_flip=m.gamma_flip,
+                call_wall=m.call_wall, put_wall=m.put_wall, net_gex=m.net_gex,
+                straddle_be=m.straddle_breakeven, session_open=sess_open,
+            )
+        except Exception:
+            signals = {}
+        for k in ("pcr_volume", "volume_oi_ratio", "rsp_spy_div",
+                  "sector_align", "top10_pressure"):
+            v = getattr(m, k, None)
+            if isinstance(v, (int, float)) and math.isfinite(v):
+                signals[k] = v
+        snap_dict.update(signals)
+        signals_json = json.dumps({k: round(v, 6) for k, v in signals.items()
+                                   if isinstance(v, (int, float))}) if signals else None
+
         # ---- Track B: regime classifier ----
         clf_ctx = ClassifierContext(market=snap.market, rnd=rnd, edge=edge)
         regime_state = self._classifier.classify(clf_ctx, self._prev_std)
@@ -207,7 +241,8 @@ class UnifiedOrchestrator:
             )
             if self.journal:
                 self.journal.log(_no_trade_row(snap.market, intent, regime_state,
-                                               direction=intent.decision.direction))
+                                               direction=intent.decision.direction,
+                                               signals_json=signals_json))
             return result
 
         # ---- Track A: full engine (requires chain) ----
@@ -246,13 +281,16 @@ class UnifiedOrchestrator:
                 else:
                     self.risk_manager.record_trade(decision.candidate, session_date)
             if self.journal:
-                self.journal.log(decision.as_row())
+                row = decision.as_row()
+                row["signals_json"] = signals_json
+                self.journal.log(row)
         else:
             # No chain yet — log intent as a no-trade stub for calibration
             if self.journal:
                 self.journal.log(_no_trade_row(snap.market, intent, regime_state,
                                                reason="no_chain",
-                                               direction=intent.decision.direction))
+                                               direction=intent.decision.direction,
+                                               signals_json=signals_json))
 
         # size_mult from Track B scales the Track A position
         final_size = intent.size_mult if (decision is not None
@@ -332,7 +370,7 @@ def _realized_vol_pdf(rnd, bars: RawBars, cfg: RNDConfig):
 # --------------------------------------------------------------------------- #
 def _no_trade_row(market: MarketSnapshot, intent: TradeIntent,
                   regime: RegimeState, reason: str = "",
-                  direction: str = "") -> dict:
+                  direction: str = "", signals_json=None) -> dict:
     now = market.now
     session_date = now.astimezone(ET).date().isoformat()
     gex_regime = "long" if market.net_gex > 0 else ("short" if market.net_gex < 0 else "flat")
@@ -368,6 +406,7 @@ def _no_trade_row(market: MarketSnapshot, intent: TradeIntent,
         "was_traded": 0,
         "candidate_present": 0,
         "regime_direction": direction or intent.decision.direction,
+        "signals_json": signals_json,
     }
 
 
