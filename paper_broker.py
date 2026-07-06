@@ -63,12 +63,36 @@ class PaperConfig:
     stop_cooldown_min: float = 30.0       # ... doubled cool-off after a stop-loss exit
     max_trades_per_day: int = 10          # hard cap on entries per session
 
-    # --- exits (fractions of the trade's own max profit / max loss) ---
+    # Conviction scales size: the gate already maps its score to a Kelly
+    # fraction (score_floor -> kelly_frac_min ... 100 -> kelly_frac_max), but
+    # the broker used to ignore it and deploy the FULL risk budget on any
+    # passing signal — a 14/100 score at 9:33 sized identically to an 85 at
+    # 11:00. With this on, that 9:33 signal is a 1-lot probe, not half the
+    # account.
+    use_gate_kelly: bool = True
+
+    # --- exits ---
     stop_loss_frac: float = 0.60          # exit when loss >= this * defined max loss
     profit_target_frac: float = 0.60      # exit when profit >= this * max profit
-    trailing_arm_frac: float = 0.35       # arm the trailing stop after capturing this * max profit
-    trailing_giveback_frac: float = 0.40  # once armed, exit if peak profit gives back this * max profit
     eod_close_et: tuple = (15, 55)        # force-close all positions at/after this ET time (0DTE)
+
+    # --- trailing stop (peak-relative) ---
+    # The old trail measured giveback as a fraction of MAX PROFIT: a trade that
+    # armed at 35% and peaked at 38% could ride back to -2% before "trailing"
+    # out — a losing exit from a winning trade. And far-OTM debit spreads
+    # (tiny max loss, huge max profit) never reached the arm threshold at all,
+    # so they had no protection until the hard stop. New rules:
+    #   arm    when peak >= min(arm_frac * max_profit, arm_R * max_loss)
+    #   floor  = peak * (1 - giveback_frac)      <- giveback is OF THE PEAK
+    #   floor tightens once peak >= tighten_at * max_profit
+    #   armed trades never exit below ~breakeven (entry slippage as the proxy
+    #   for exit slippage), so an armed winner cannot become a loser.
+    trailing_arm_frac: float = 0.35       # arm at this fraction of max profit ...
+    trailing_arm_R: float = 0.75          # ... OR this multiple of max loss, whichever is FIRST
+    trailing_giveback_frac: float = 0.40  # give back at most this fraction of the peak
+    trailing_tighten_at: float = 0.60     # peak >= this * max profit ->
+    trailing_tight_giveback: float = 0.25 # ... only this fraction of peak may be given back
+    trailing_lock_breakeven: bool = True  # armed trades floor at ~breakeven
 
     slippage_frac: float = 0.50           # fraction of each leg's bid-ask half-spread paid per side
 
@@ -91,6 +115,7 @@ class PaperPosition:
     peak_pnl_ps: float = 0.0     # best (highest) per-share P&L seen
     trailing_armed: bool = False
     last_pnl_ps: float = 0.0
+    slip_entry_ps: float = 0.0   # entry slippage; proxy for exit cost in the breakeven floor
     entry_ctx: dict = field(default_factory=dict)   # why we entered (regime/gate/EV)
 
     def strikes_str(self) -> str:
@@ -141,10 +166,12 @@ class PaperBroker:
                 pnl_ps REAL, pnl_dollars REAL, exit_reason TEXT,
                 equity_after REAL
             )""")
-        # migration: entry_ctx (why the trade was taken) for the journal view
+        # migrations: entry_ctx (why entered), peak_pnl_ps (trail-discipline audit)
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(paper_trades)")}
         if "entry_ctx" not in cols:
             self._db.execute("ALTER TABLE paper_trades ADD COLUMN entry_ctx TEXT")
+        if "peak_pnl_ps" not in cols:
+            self._db.execute("ALTER TABLE paper_trades ADD COLUMN peak_pnl_ps REAL")
         self._db.commit()
 
     def _record(self, pos: PaperPosition, now: dt.datetime, credit_now: float,
@@ -154,14 +181,15 @@ class PaperBroker:
             "INSERT OR REPLACE INTO paper_trades "
             "(id, symbol, family, strikes, contracts, opened_at, closed_at, "
             " hold_min, entry_credit, exit_value, max_profit_ps, max_loss_ps, "
-            " pnl_ps, pnl_dollars, exit_reason, equity_after, entry_ctx) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " pnl_ps, pnl_dollars, exit_reason, equity_after, entry_ctx, peak_pnl_ps) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pos.id, self.symbol, pos.family, pos.strikes_str(), pos.contracts,
              pos.opened_at.isoformat(), now.isoformat(), round(hold_min, 1),
              round(pos.entry_credit, 4), round(credit_now, 4),
              round(pos.max_profit_ps, 4), round(pos.max_loss_ps, 4),
              round(pnl_ps, 4), round(pnl_dollars, 2), reason, round(self.cash, 2),
-             json.dumps(pos.entry_ctx) if pos.entry_ctx else None),
+             json.dumps(pos.entry_ctx) if pos.entry_ctx else None,
+             round(pos.peak_pnl_ps, 4)),
         )
         self._db.commit()
 
@@ -232,11 +260,17 @@ class PaperBroker:
         if ml <= 0:
             return None                                     # degenerate / no defined risk
 
-        # size against CURRENT equity and the regime size multiplier
+        # size against CURRENT equity, the regime size multiplier, and the
+        # gate's conviction (score -> Kelly fraction)
         size_mult = float(getattr(result, "final_size_mult", 1.0)) or 1.0
+        kelly = 1.0
+        if self.cfg.use_gate_kelly:
+            k = getattr(dec, "gate_kelly", None)
+            if isinstance(k, (int, float)) and 0.0 < k <= 1.0:
+                kelly = float(k)
         risk_budget = self.cash * self.cfg.risk_per_trade_frac
         per_contract_risk = ml * self.cfg.multiplier
-        contracts = int(np.floor((risk_budget * size_mult) / per_contract_risk))
+        contracts = int(np.floor((risk_budget * size_mult * kelly) / per_contract_risk))
         # never risk more than the cash on hand
         contracts = min(contracts, int(np.floor(self.cash / per_contract_risk)))
         if contracts < 1:
@@ -258,6 +292,7 @@ class PaperBroker:
             "prob_profit": getattr(cand, "prob_profit", None),
             "credit_mid": getattr(cand, "credit", None),
             "size_mult": size_mult,
+            "gate_kelly": kelly,
             "spot": getattr(chain, "spot", None),
             "risk_budget": round(risk_budget, 2),
             "equity_at_entry": round(self.cash, 2),
@@ -267,7 +302,7 @@ class PaperBroker:
             id=uuid.uuid4().hex[:12], opened_at=now, family=cand.family, legs=legs,
             contracts=contracts, entry_credit=entry_credit, max_profit_ps=mp, max_loss_ps=ml,
             short_strikes=tuple(cand.short_strikes), long_strikes=tuple(cand.long_strikes),
-            entry_ctx=entry_ctx,
+            slip_entry_ps=slip_entry, entry_ctx=entry_ctx,
         )
         self.open_positions.append(pos)
         self._day_entries[date] = self._day_entries.get(date, 0) + 1
@@ -285,8 +320,14 @@ class PaperBroker:
         pnl_ps = pos.entry_credit - credit_now              # per share, gross of exit slippage
         pos.last_pnl_ps = pnl_ps
         pos.peak_pnl_ps = max(pos.peak_pnl_ps, pnl_ps)
-        if not pos.trailing_armed and pos.peak_pnl_ps >= self.cfg.trailing_arm_frac * pos.max_profit_ps:
-            pos.trailing_armed = True
+        if not pos.trailing_armed:
+            # arm on max-profit fraction OR R-multiple, whichever comes first —
+            # the R path is what gives far-OTM debit spreads (tiny max loss,
+            # huge max profit) any trailing protection at all
+            arm_at = min(self.cfg.trailing_arm_frac * pos.max_profit_ps,
+                         self.cfg.trailing_arm_R * pos.max_loss_ps)
+            if pos.peak_pnl_ps >= arm_at > 0:
+                pos.trailing_armed = True
 
         reason = self._exit_reason(pos, now, pnl_ps)
         if reason is None:
@@ -315,12 +356,31 @@ class PaperBroker:
             return "stop"
         if pnl_ps >= cfg.profit_target_frac * pos.max_profit_ps:
             return "target"
-        if pos.trailing_armed and (pos.peak_pnl_ps - pnl_ps) >= cfg.trailing_giveback_frac * pos.max_profit_ps:
+        if pos.trailing_armed and pnl_ps <= self._trail_floor(pos):
             return "trail"
         et = now.astimezone(ET)
         if (et.hour, et.minute) >= cfg.eod_close_et:
             return "eod"
         return None
+
+    def _trail_floor(self, pos) -> float:
+        """Per-share P&L level an ARMED position may not fall below.
+
+        Peak-relative: keep at least (1 - giveback) of the best P&L seen,
+        tightening once the peak is a real fraction of max profit. With the
+        breakeven lock, the floor never sits below ~breakeven (entry slippage
+        stands in for the exit slippage the close will pay), so an armed
+        winner cannot round-trip into a loser — the exact failure mode of the
+        old max-profit-denominated giveback.
+        """
+        cfg = self.cfg
+        gb = (cfg.trailing_tight_giveback
+              if pos.peak_pnl_ps >= cfg.trailing_tighten_at * pos.max_profit_ps
+              else cfg.trailing_giveback_frac)
+        floor = pos.peak_pnl_ps * (1.0 - gb)
+        if cfg.trailing_lock_breakeven:
+            floor = max(floor, pos.slip_entry_ps)
+        return floor
 
     # -- helpers ------------------------------------------------------------
     def _slippage_ps(self, legs, spr) -> float:

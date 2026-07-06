@@ -104,6 +104,34 @@ def test_max_trades_per_day(tmp_path):
     assert b.report()["trades"] == 2
 
 
+def test_gate_kelly_scales_contracts(tmp_path):
+    """Conviction sizes the fill: a weak gate score (kelly 0.15) must probe,
+    not deploy the full risk budget — the 9:33 x11 lesson."""
+    b = _broker(tmp_path, starting_cash=10000.0)
+    res = _result(ENTRY)
+    res.decision.gate_kelly = 1.0
+    b.on_tick(T[0], res)
+    full = b.open_positions[0].contracts
+    assert full >= 10                                       # 50% of $10k at ~$405/lot
+
+    b2 = PaperBroker(db_path=str(tmp_path / "k2.sqlite"),
+                     cfg=PaperConfig(starting_cash=10000.0))
+    res2 = _result(ENTRY)
+    res2.decision.gate_kelly = 0.15                         # score at the floor
+    b2.on_tick(T[0], res2)
+    probe = b2.open_positions[0].contracts
+    assert probe <= max(1, int(full * 0.2))
+    assert b2.open_positions[0].entry_ctx["gate_kelly"] == 0.15
+
+    # opt-out restores flat sizing
+    b3 = PaperBroker(db_path=str(tmp_path / "k3.sqlite"),
+                     cfg=PaperConfig(starting_cash=10000.0, use_gate_kelly=False))
+    res3 = _result(ENTRY)
+    res3.decision.gate_kelly = 0.15
+    b3.on_tick(T[0], res3)
+    assert b3.open_positions[0].contracts == full
+
+
 # --------------------------------------------------------------------------- #
 # equity-based sizing                                                          #
 # --------------------------------------------------------------------------- #
