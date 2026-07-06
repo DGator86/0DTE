@@ -66,6 +66,7 @@ class TradeDecision:
     no_trade_reason: str
     edge_richness: float
     direction: str = ""           # Track B direction: call|put|both|none
+    gate_kelly: float = 1.0       # gate's score->Kelly fraction; sizes the fill
 
     def as_row(self) -> dict:
         c = self.candidate
@@ -190,5 +191,5 @@ def decide(
         candidate=candidate,
         gate_pass=gate_pass, gate_score=gate.score, gate_failed=gate.failed_gates,
         decision=decision, no_trade_reason=reason, edge_richness=edge_rich,
-        direction=direction,
+        direction=direction, gate_kelly=gate.kelly_fraction,
     )

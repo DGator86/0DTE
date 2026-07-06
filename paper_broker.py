@@ -63,6 +63,14 @@ class PaperConfig:
     stop_cooldown_min: float = 30.0       # ... doubled cool-off after a stop-loss exit
     max_trades_per_day: int = 10          # hard cap on entries per session
 
+    # Conviction scales size: the gate already maps its score to a Kelly
+    # fraction (score_floor -> kelly_frac_min ... 100 -> kelly_frac_max), but
+    # the broker used to ignore it and deploy the FULL risk budget on any
+    # passing signal — a 14/100 score at 9:33 sized identically to an 85 at
+    # 11:00. With this on, that 9:33 signal is a 1-lot probe, not half the
+    # account.
+    use_gate_kelly: bool = True
+
     # --- exits (fractions of the trade's own max profit / max loss) ---
     stop_loss_frac: float = 0.60          # exit when loss >= this * defined max loss
     profit_target_frac: float = 0.60      # exit when profit >= this * max profit
@@ -232,11 +240,17 @@ class PaperBroker:
         if ml <= 0:
             return None                                     # degenerate / no defined risk
 
-        # size against CURRENT equity and the regime size multiplier
+        # size against CURRENT equity, the regime size multiplier, and the
+        # gate's conviction (score -> Kelly fraction)
         size_mult = float(getattr(result, "final_size_mult", 1.0)) or 1.0
+        kelly = 1.0
+        if self.cfg.use_gate_kelly:
+            k = getattr(dec, "gate_kelly", None)
+            if isinstance(k, (int, float)) and 0.0 < k <= 1.0:
+                kelly = float(k)
         risk_budget = self.cash * self.cfg.risk_per_trade_frac
         per_contract_risk = ml * self.cfg.multiplier
-        contracts = int(np.floor((risk_budget * size_mult) / per_contract_risk))
+        contracts = int(np.floor((risk_budget * size_mult * kelly) / per_contract_risk))
         # never risk more than the cash on hand
         contracts = min(contracts, int(np.floor(self.cash / per_contract_risk)))
         if contracts < 1:
@@ -258,6 +272,7 @@ class PaperBroker:
             "prob_profit": getattr(cand, "prob_profit", None),
             "credit_mid": getattr(cand, "credit", None),
             "size_mult": size_mult,
+            "gate_kelly": kelly,
             "spot": getattr(chain, "spot", None),
             "risk_budget": round(risk_budget, 2),
             "equity_at_entry": round(self.cash, 2),
