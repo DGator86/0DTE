@@ -113,6 +113,74 @@ def ras_history(db_path: str, position_id: Optional[str] = None,
     return out
 
 
+def validation_reports(db_path: str, report_type: Optional[str] = None,
+                       limit: int = 50) -> list[dict]:
+    """Validation report history (newest first) from journal.validation_reports,
+    with metrics/flags JSON decoded per row. Read-only; degrades to [] on
+    legacy databases without the table."""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return []
+    try:
+        sql = "SELECT * FROM validation_reports"
+        args: list = []
+        if report_type:
+            sql += " WHERE report_type = ?"
+            args.append(report_type)
+        sql += " ORDER BY report_date DESC, id DESC LIMIT ?"
+        args.append(limit)
+        rows = conn.execute(sql, args).fetchall()
+    except sqlite3.Error:
+        return []                        # table absent on pre-validation journals
+    finally:
+        conn.close()
+
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["metrics"] = json.loads(d.pop("metrics_json") or "{}") or {}
+        except (json.JSONDecodeError, TypeError):
+            d["metrics"] = {}
+        try:
+            d["flags"] = json.loads(d.pop("flags_json") or "[]") or []
+        except (json.JSONDecodeError, TypeError):
+            d["flags"] = []
+        out.append(d)
+    return out
+
+
+def validation_report_by_id(db_path: str, report_id: int) -> Optional[dict]:
+    """Single validation report with full decoded metrics, or None."""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT * FROM validation_reports WHERE id = ?", (report_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    d = dict(row)
+    try:
+        d["metrics"] = json.loads(d.pop("metrics_json") or "{}") or {}
+    except (json.JSONDecodeError, TypeError):
+        d["metrics"] = {}
+    try:
+        d["flags"] = json.loads(d.pop("flags_json") or "[]") or []
+    except (json.JSONDecodeError, TypeError):
+        d["flags"] = []
+    return d
+
+
 def report_summary(db_path: str) -> dict:
     jrn = Journal(db_path)
     try:

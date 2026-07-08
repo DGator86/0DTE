@@ -48,6 +48,9 @@
     <nav class="tabbar">
       <button class="tab active" id="tab-command" type="button">Command Center</button>
       <button class="tab" id="tab-journal" type="button">Trade Journal</button>
+      <button class="tab" id="tab-validation" type="button">Validation
+        <span class="val-alert-dot hidden" id="tab-validation-dot"></span>
+      </button>
     </nav>
 
     <!-- ===================== GRID ===================== -->
@@ -213,6 +216,24 @@
           </table>
         </div>
         <p class="empty hidden" id="tj-empty">No closed trades yet</p>
+      </section>
+    </div>
+
+    <!-- ===================== VALIDATION VIEW ===================== -->
+    <div class="validation-view hidden" id="view-validation">
+      <section class="panel" id="val-list-panel">
+        <h2>Validation reports <span class="h2-right" id="val-count">—</span></h2>
+        <div class="val-filters" id="val-filters">
+          <button class="val-filter active" data-type="" type="button">All</button>
+          <button class="val-filter" data-type="daily" type="button">Daily</button>
+          <button class="val-filter" data-type="weekly" type="button">Weekly</button>
+          <button class="val-filter" data-type="feature_impact" type="button">Feature Impact</button>
+        </div>
+        <div class="val-list" id="val-list"><p class="empty">No validation reports yet</p></div>
+      </section>
+      <section class="panel" id="val-detail-panel">
+        <h2>Report detail <span class="h2-right" id="val-detail-date">—</span></h2>
+        <div id="val-detail"><p class="empty">Select a report</p></div>
       </section>
     </div>
 
