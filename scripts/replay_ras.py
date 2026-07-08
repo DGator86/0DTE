@@ -236,7 +236,7 @@ def synthetic_demo(verbose: bool) -> None:
     ]
 
     _print_header("synthetic deterioration demo (bull LCS, regime turns bear)")
-    cfg = RASConfig()      # exit_enabled=False: exits must print as warnings
+    cfg = RASConfig()      # library defaults (exit_enabled=True since activation)
     scores = []
     for label, reg, itt, mkt in stages:
         ras = compute_regime_alignment(reg, itt, mkt, ctx, cfg=cfg)

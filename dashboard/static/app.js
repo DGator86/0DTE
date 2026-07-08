@@ -399,6 +399,69 @@
     $("tech-metrics").innerHTML = cards.join("");
   }
 
+  /* ---------------- RAS (regime alignment) helpers ---------------- */
+  // Color bands per the activation spec: green > -20, amber -50..-20, red <= -50.
+  function rasCls(v) {
+    const n = num(v);
+    if (n == null) return "";
+    return n > -20 ? "ok" : n > -50 ? "warn" : "bad";
+  }
+
+  function rasEma(ctx) {
+    if (!ctx) return null;
+    const e = num(ctx.ras_ema_score);
+    return e != null ? e : num(ctx.ras_score);
+  }
+
+  function rasCompRow(c) {
+    const r = num(c.raw);
+    const cl = r == null ? "" : r < 0 ? "neg" : r > 0 ? "pos" : "";
+    return `<div class="ras-comp"><span class="mono ${cl}">${sign(r, 2)}</span>
+      <span class="ras-comp-name">${esc(String(c.name || "").replace(/_/g, " "))}</span>
+      <small>${esc(c.note || "")}</small></div>`;
+  }
+
+  // Full RAS health block for an open position card: score + action badge,
+  // top negative components inline, complete breakdown behind <details>.
+  function rasBlock(ctx) {
+    const ema = rasEma(ctx);
+    if (ema == null) return "";
+    const cls = rasCls(ema);
+    const action = String(ctx.ras_action || "ok");
+    const comps = arr(ctx.ras_components);
+    const negs = comps.filter((c) => num(c.raw) != null && c.raw < -0.01)
+      .sort((a, b) => a.raw - b.raw).slice(0, 3);
+    return `<div class="ras-block ${cls}">
+      <div class="ras-head">
+        <span class="ras-title">Regime alignment</span>
+        <span class="ras-score mono ${cls}">${sign(ema, 1)}</span>
+        <span class="ras-badge ${action}">${esc(action)}</span>
+      </div>
+      ${negs.map(rasCompRow).join("")}
+      ${comps.length ? `<details class="ras-details"><summary>all ${comps.length} components</summary>${comps.map(rasCompRow).join("")}</details>` : ""}
+    </div>`;
+  }
+
+  // Compact one-line RAS chip for trade-journal rows.
+  function rasInline(ctx) {
+    const ema = rasEma(ctx);
+    if (ema == null) return "";
+    const action = String(ctx.ras_action || "ok");
+    return `<span class="ras-badge ${action}">RAS ${sign(ema, 1)} · ${esc(action)}</span>`;
+  }
+
+  // Closed-trade RAS summary: final score at exit, worst score seen, last action.
+  function rasExitLine(ctx) {
+    if (!ctx) return "";
+    const atExit = num(ctx.ras_at_exit), worst = num(ctx.ras_worst);
+    if (atExit == null && worst == null) return "";
+    const bits = [];
+    if (atExit != null) bits.push(`at exit ${sign(atExit, 1)}`);
+    if (worst != null) bits.push(`worst ${sign(worst, 1)}`);
+    if (ctx.ras_last_action && ctx.ras_last_action !== "ok") bits.push(esc(ctx.ras_last_action));
+    return `<div class="tj-sub mono ras-exit-line ${rasCls(worst != null ? worst : atExit)}">RAS ${bits.join(" · ")}</div>`;
+  }
+
   /* ---------------- open position(s) ---------------- */
   function renderOpenPositions(livePaper) {
     const panel = $("open-positions-panel");
@@ -429,6 +492,7 @@
           <div><span class="k">Max loss</span><span class="v neg">${fmt(p.max_loss_ps, 2)}</span></div>
           <div><span class="k">Opened</span><span class="v">${etTime(p.opened_at)}</span></div>
         </div>
+        ${rasBlock(p.entry_ctx || {})}
       </div>`;
     }).join("");
   }
@@ -912,6 +976,7 @@
       target: "profit target: captured its fraction of max profit",
       trail:  "trailing stop: gave back too much of peak profit",
       eod:    "end of day: forced flat before the close",
+      ras_invalidate: "regime alignment: the regime moved against the position's thesis",
     };
     return map[t.exit_reason] || esc(t.exit_reason || "—");
   }
@@ -931,8 +996,10 @@
             <span>×${p.contracts}</span>
             <span class="mono ${cls}">${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : "—"}</span>
             <span class="tj-dim">${fmt(p.hold_min, 0)}m held</span>
+            ${rasInline(p.entry_ctx || {})}
           </div>
           <div class="tj-sub">${entryLogicLine(p.entry_ctx)}</div>
+          ${rasBlock(p.entry_ctx || {})}
         </div>`;
       }).join("");
     }
@@ -946,7 +1013,8 @@
       const cls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
       const opened = (t.opened_at || "").slice(11, 16);
       const reasonCls = t.exit_reason === "target" || t.exit_reason === "trail" ? "good"
-                      : t.exit_reason === "stop" ? "bad" : "";
+                      : t.exit_reason === "stop" ? "bad"
+                      : t.exit_reason === "ras_invalidate" ? "warn" : "";
       return `<tr>
         <td class="mono">${esc((t.opened_at || "").slice(0, 10))} ${opened}</td>
         <td><b>${esc(t.family)}</b> <span class="mono tj-dim">${esc(t.strikes)}</span>
@@ -957,7 +1025,8 @@
         <td class="mono">${fmt(t.hold_min, 0)}m</td>
         <td class="mono ${cls}">${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : "—"}</td>
         <td><span class="tj-reason ${reasonCls}">${esc(t.exit_reason || "—")}</span>
-            <div class="tj-sub">${exitLogicLine(t)}</div></td>
+            <div class="tj-sub">${exitLogicLine(t)}</div>
+            ${rasExitLine(t.entry_ctx)}</td>
         <td class="mono">$${fmt(t.equity_after, 2)}</td>
       </tr>`;
     }).join("");

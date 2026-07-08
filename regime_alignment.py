@@ -42,11 +42,17 @@ default -70).
 
 Paper-trading safety
 --------------------
-RASConfig.exit_enabled defaults to False: an "exit" action is downgraded to
-"warning" both here and in risk_manager.PositionMonitor.evaluate. Until the
-user explicitly enables it after reviewing logged evaluations, RAS is
-observation-only — every evaluation is journaled (journal.Journal.log_ras)
-with the full component breakdown so score moves are explainable.
+RAS actively manages PAPER positions only — no real orders exist anywhere in
+this system. RASConfig.exit_enabled defaults to True: an "exit" action closes
+the paper position (exit reason "ras_invalidate") and "tighten" narrows the
+trailing stop. To run observation-only, pass RASConfig(exit_enabled=False)
+(and PaperConfig(ras_exit_enabled=False)); shadow_runner exposes this as the
+--no-ras-exit flag. Either flag alone is sufficient to suppress exits: the
+action is downgraded to "warning" in compute_ras / PositionMonitor.evaluate
+when exit_enabled is off, and the broker additionally checks its own
+ras_exit_enabled before closing. Every evaluation is journaled
+(journal.Journal.log_ras) with the full component breakdown so score moves
+are explainable and thresholds can be recalibrated from data.
 
 NOT financial advice.
 """
@@ -148,7 +154,9 @@ class RASResult:
 @dataclass
 class RASConfig:
     enabled: bool = True
-    exit_enabled: bool = False
+    # Paper-only automation: True lets an "exit" action close a paper position.
+    # Set False (or shadow_runner --no-ras-exit) for observation-only mode.
+    exit_enabled: bool = True
     warning_threshold: float = -30.0
     tighten_threshold: float = -50.0
     exit_threshold: float = -70.0

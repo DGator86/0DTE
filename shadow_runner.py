@@ -31,16 +31,18 @@ import sys
 import time
 from zoneinfo import ZoneInfo
 
+import dataclasses
+
 from chain_store import ChainRecorder
 from composite_feed import build_default_feed
 from journal import Journal
 from unified_loop import UnifiedOrchestrator
 from notifier import Notifier, Ticket
-from risk_manager import RiskConfig, RiskManager
+from risk_manager import PositionMonitor, PositionRiskConfig, RiskConfig, RiskManager
 from paper_broker import PaperBroker, PaperConfig
 from market_calendar import is_market_open, next_market_open, market_status
 from dashboard.state import heartbeat_state, serialize_tick_result, write_live_state
-from regime_alignment import position_context_from_entry_ctx
+from regime_alignment import RASConfig, position_context_from_entry_ctx
 from typing import Optional
 
 ET = ZoneInfo("America/New_York")
@@ -101,6 +103,7 @@ class ShadowRunner:
         paper_cfg: "Optional[PaperConfig]" = None,
         live_state_path: str = "live_state.json",
         record_dir: Optional[str] = None,   # None = <db_dir>/ticks; "" disables
+        ras_exit: bool = True,              # False = RAS observation-only (no auto-exits)
     ) -> None:
         self.symbol = symbol
         self.interval_s = interval_s
@@ -123,9 +126,15 @@ class ShadowRunner:
             gex_history_path=os.path.join(state_dir, "gex_history.json"),
         )
         self._risk = RiskManager(risk_cfg) if risk_cfg else None
+        # One RASConfig shared by the orchestrator (scores + actions), the
+        # position monitor (action suppression), and the paper broker (whether
+        # an "exit" action actually closes) — a single flag, never three that
+        # can drift apart.
+        self._ras_cfg = RASConfig(exit_enabled=ras_exit)
         self._orch = UnifiedOrchestrator(
             feed=self._feed, journal=self._jrn, risk_manager=self._risk,
             state_path=os.path.join(state_dir, "adaptive_state.json"),
+            ras_cfg=self._ras_cfg,
         )
         # Record every tick (market + chain + incremental bars) so a REAL-data
         # walk-forward becomes possible. ~1 MB/session gzipped; you cannot
@@ -137,16 +146,22 @@ class ShadowRunner:
         self._settled: set[str] = set()
 
         # In-house paper trading: auto-executes TRADE tickets on SIMULATED fills
-        # over the live chain, with stop-loss / target / trailing / EOD exits.
-        # No real orders are ever placed.
+        # over the live chain, with stop-loss / target / trailing / EOD / RAS
+        # exits. No real orders are ever placed.
+        paper_cfg = dataclasses.replace(paper_cfg or PaperConfig(),
+                                        ras_exit_enabled=ras_exit)
         self._paper = PaperBroker(
             db_path=paper_db or "paper.sqlite",
             cfg=paper_cfg, notifier=self._notifier, symbol=symbol,
+            position_monitor=PositionMonitor(PositionRiskConfig(ras=self._ras_cfg)),
         )
 
         log.info("Initialized. DB=%s symbol=%s interval=%ds", db_path, symbol, interval_s)
         log.info("Paper account: $%.0f start (simulated fills, no real orders).",
                  self._paper.cfg.starting_cash)
+        log.info("RAS position management: %s",
+                 "ACTIVE (warning/tighten/exit on paper positions)" if ras_exit
+                 else "observation-only (--no-ras-exit)")
         if self._risk:
             cfg = risk_cfg
             log.info(
@@ -412,6 +427,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Max concurrent open positions (0 = unlimited)")
     p.add_argument("--max-gamma", dest="max_gamma", type=float, default=0.0,
                    help="Max portfolio net |gamma| (0 = disabled)")
+    p.add_argument("--no-ras-exit", dest="ras_exit", action="store_false",
+                   help="RAS observation-only: log scores/actions but never "
+                        "auto-close paper positions (default: exits enabled)")
     return p
 
 
@@ -441,6 +459,7 @@ if __name__ == "__main__":
         paper_cfg=PaperConfig(starting_cash=args.paper_cash),
         live_state_path=args.live_state,
         record_dir=args.record_dir,
+        ras_exit=args.ras_exit,
     )
 
     if args.report:
