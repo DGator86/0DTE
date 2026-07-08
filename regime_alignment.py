@@ -33,6 +33,9 @@ note (every RASResult carries the full breakdown for journaling):
   veto_escalation       New vetoes since entry that undermine this structure.
   confidence_erosion    Has the structure-relevant regime confidence decayed?
   regime_flip           Permitted engine / dominant regime turned hostile.
+  channel_break         Donchian breakout against the position, or price
+                        pinned at a hostile Keltner band while Bollinger
+                        width expands (volatility-channel deterioration).
 
 The weighted mean of the components maps to a score in [-100, +100], smoothed
 by an EMA (RASConfig.ema_alpha) so one noisy tick cannot trigger an action.
@@ -76,7 +79,18 @@ DEFAULT_WEIGHTS = {
     "veto_escalation": 1.0,
     "confidence_erosion": 0.8,
     "regime_flip": 1.0,
+    "channel_break": 0.8,
 }
+
+# ---- channel_break thresholds (standardized 0..100 classifier features) ----
+# Donchian breakout legs read 50 when price is inside the prior channel and
+# rise with penetration (in ATRs, tanh-scaled).
+CHANNEL_BREAK_STRONG = 85.0   # hostile leg at/above this -> full -1.0
+CHANNEL_BREAK_WARN = 65.0     # hostile leg at/above this -> -0.5
+# keltner_position: 0 = lower band, 100 = upper band.
+KELTNER_PIN_LOW = 15.0
+KELTNER_PIN_HIGH = 85.0
+BB_EXPANSION_HOT = 60.0       # bb_expansion above this = width actively expanding
 
 PREMIUM_VETOES = frozenset({
     "short_gamma", "short_gamma_regime",
@@ -461,6 +475,60 @@ def _score_confidence_erosion(regime: RegimeState,
     return -1.0, f"{key} confidence collapsed {delta:+.1f}"
 
 
+def _score_channel_break(regime: RegimeState, entry: EntrySnapshot,
+                         bias: str) -> tuple[float, str]:
+    """Volatility-channel deterioration: a Donchian breakout against the
+    position, or price pinned at a hostile Keltner extreme while Bollinger
+    width expands. Reads the standardized channel features the classifier
+    publishes (None when the caller supplies no bar stream -> neutral 0).
+    Vol positions (long strangle) are helped, not hurt, by a break."""
+    brk_up = _std_feature(regime, "donchian_breakout_up")
+    brk_dn = _std_feature(regime, "donchian_breakout_down")
+    kpos = _std_feature(regime, "keltner_position")
+    bb_exp = _std_feature(regime, "bb_expansion")
+    if brk_up is None and brk_dn is None and kpos is None:
+        return 0.0, "channel features unavailable"
+
+    up = brk_up if brk_up is not None else 50.0
+    dn = brk_dn if brk_dn is not None else 50.0
+    expanding = bb_exp is not None and bb_exp >= BB_EXPANSION_HOT
+
+    if bias == "vol":
+        if max(up, dn) >= CHANNEL_BREAK_WARN:
+            return 0.5, "channel breakout supports vol position"
+        return 0.0, "no channel breakout yet"
+
+    if bias == "bull":
+        hostile, supportive, hostile_side = dn, up, "down"
+        pinned_hostile = kpos is not None and kpos <= KELTNER_PIN_LOW
+    elif bias == "bear":
+        hostile, supportive, hostile_side = up, dn, "up"
+        pinned_hostile = kpos is not None and kpos >= KELTNER_PIN_HIGH
+    else:  # neutral premium: either side of the channel breaking is hostile
+        hostile, supportive, hostile_side = max(up, dn), 50.0, "either"
+        pinned_hostile = kpos is not None and (kpos <= KELTNER_PIN_LOW
+                                               or kpos >= KELTNER_PIN_HIGH)
+
+    score = 0.0
+    notes = []
+    if hostile >= CHANNEL_BREAK_STRONG:
+        score -= 1.0
+        notes.append(f"strong donchian break {hostile_side} ({hostile:.0f})")
+    elif hostile >= CHANNEL_BREAK_WARN:
+        score -= 0.5
+        notes.append(f"donchian break {hostile_side} building ({hostile:.0f})")
+    if pinned_hostile and expanding:
+        score -= 0.5
+        notes.append(f"pinned at hostile keltner band (pos {kpos:.0f}) with bb expanding")
+    if score == 0.0 and bias in ("bull", "bear") and supportive >= CHANNEL_BREAK_WARN:
+        score += 0.3
+        notes.append("donchian break supports position")
+
+    if not notes:
+        return 0.0, "channels quiet"
+    return _clip_unit(score), "; ".join(notes)
+
+
 def _engine_compatible(engine: str, structure_class: str) -> bool:
     if engine == "none":
         return False
@@ -532,6 +600,7 @@ def compute_ras(regime: RegimeState, intent: Optional[TradeIntent],
         ("veto_escalation", *_score_veto_escalation(regime, entry)),
         ("confidence_erosion", *_score_confidence_erosion(regime, entry)),
         ("regime_flip", *_score_regime_flip(regime, intent, entry, bias)),
+        ("channel_break", *_score_channel_break(regime, entry, bias)),
     ]
 
     components: list[RASComponent] = []
