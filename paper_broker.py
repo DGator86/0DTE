@@ -36,6 +36,11 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from spread_selector import Leg, _chain_maps, _credit, _payoff_curve
+from regime_alignment import (
+    build_entry_snapshot, derive_position_bias, entry_snapshot_to_dict,
+    structure_class_from_family,
+)
+from risk_manager import PositionMonitor
 
 ET = ZoneInfo("America/New_York")
 
@@ -96,6 +101,9 @@ class PaperConfig:
 
     slippage_frac: float = 0.50           # fraction of each leg's bid-ask half-spread paid per side
 
+    # --- regime alignment (RAS) ---
+    ras_exit_enabled: bool = False        # off until calibrated; mirrors RASConfig.exit_enabled
+
 
 # --------------------------------------------------------------------------- #
 # Position                                                                      #
@@ -130,10 +138,12 @@ class PaperBroker:
     """Virtual account that auto-executes TRADE tickets on simulated fills."""
 
     def __init__(self, db_path: str = "paper.sqlite", cfg: Optional[PaperConfig] = None,
-                 notifier=None, symbol: str = "SPY") -> None:
+                 notifier=None, symbol: str = "SPY",
+                 position_monitor: Optional[PositionMonitor] = None) -> None:
         self.cfg = cfg or PaperConfig()
         self.symbol = symbol
         self._notifier = notifier
+        self.position_monitor = position_monitor or PositionMonitor()
         self.open_positions: list[PaperPosition] = []
         self._db = sqlite3.connect(db_path)
         self._init_db()
@@ -147,6 +157,7 @@ class PaperBroker:
         self._day_entries: dict[str, int] = {}      # ET date -> entries opened
         self._last_exit_at: Optional[dt.datetime] = None
         self._last_exit_reason: str = ""
+        self._ras_trail_mult: float = 1.0   # per-tick trailing giveback multiplier
 
     def _restore_equity(self) -> float:
         row = self._db.execute(
@@ -214,7 +225,7 @@ class PaperBroker:
 
         # 1) manage / exit open positions (iterate over a copy; we mutate the list)
         for pos in list(self.open_positions):
-            ev = self._manage(pos, now, cmid, pmid, spr)
+            ev = self._manage(pos, now, cmid, pmid, spr, result=result)
             if ev:
                 events.append(ev)
 
@@ -278,12 +289,32 @@ class PaperBroker:
 
         intent = getattr(result, "intent", None)
         regime = getattr(result, "regime", None)
+        intent_dec = getattr(intent, "decision", None) if intent is not None else None
+        structure = getattr(intent_dec, "structure", None) if intent_dec else None
+        direction = getattr(intent_dec, "direction", None) if intent_dec else None
+        structure_class = structure_class_from_family(cand.family)
+        position_bias = derive_position_bias(
+            direction or "none", structure or "", structure_class)
+        entry_snapshot = None
+        if regime is not None and intent is not None:
+            market = getattr(getattr(result, "snapshot", None), "market", None)
+            if (market is not None
+                    and hasattr(regime, "confidences")
+                    and hasattr(intent, "exec_regime")):
+                try:
+                    entry_snapshot = build_entry_snapshot(
+                        regime, intent, market, structure_class, structure=structure)
+                except Exception:
+                    entry_snapshot = None
         entry_ctx = {
             "regime": getattr(regime, "dominant_regime", None),
             "engine": getattr(regime, "permitted_engine", None),
             "cell": ([intent.exec_regime, intent.context_regime, intent.direction_bias]
                      if intent is not None else None),
-            "direction": (intent.decision.direction if intent is not None else None),
+            "direction": direction,
+            "structure": structure,
+            "structure_class": structure_class,
+            "position_bias": position_bias,
             "conviction": (intent.decision.conviction if intent is not None else None),
             "capture": (intent.decision.capture if intent is not None else None),
             "gate_score": getattr(dec, "gate_score", None),
@@ -296,6 +327,9 @@ class PaperBroker:
             "spot": getattr(chain, "spot", None),
             "risk_budget": round(risk_budget, 2),
             "equity_at_entry": round(self.cash, 2),
+            "entry_snapshot": (entry_snapshot_to_dict(entry_snapshot)
+                               if entry_snapshot is not None else None),
+            "ras_at_entry": 0.0,
         }
 
         pos = PaperPosition(
@@ -305,6 +339,7 @@ class PaperBroker:
             slip_entry_ps=slip_entry, entry_ctx=entry_ctx,
         )
         self.open_positions.append(pos)
+        self.position_monitor.register(pos.id, entry_ctx)
         self._day_entries[date] = self._day_entries.get(date, 0) + 1
         self._notify("PAPER ENTRY",
                      f"{pos.family} {pos.strikes_str()} x{contracts} "
@@ -313,7 +348,7 @@ class PaperBroker:
                 f"entry={entry_credit:+.2f}")
 
     # -- management / exit --------------------------------------------------
-    def _manage(self, pos, now, cmid, pmid, spr) -> Optional[str]:
+    def _manage(self, pos, now, cmid, pmid, spr, result=None) -> Optional[str]:
         credit_now = _credit(pos.legs, cmid, pmid)
         if credit_now is None:
             return None                                     # a leg has no quote; hold
@@ -329,7 +364,28 @@ class PaperBroker:
             if pos.peak_pnl_ps >= arm_at > 0:
                 pos.trailing_armed = True
 
-        reason = self._exit_reason(pos, now, pnl_ps)
+        self._ras_trail_mult = 1.0
+        ras_exit = False
+        if result is not None:
+            ras_list = getattr(result, "ras_results", None) or []
+            ras = next((r for r in ras_list if r.position_id == pos.id), None)
+            if ras is not None:
+                action = self.position_monitor.evaluate(ras)
+                pos.entry_ctx["ras_score"] = ras.score
+                pos.entry_ctx["ras_action"] = ras.action
+                pos.entry_ctx["ras_ema_score"] = ras.ema_score
+                pos.entry_ctx["ras_components"] = [
+                    {"name": c.name, "raw": c.raw, "note": c.note}
+                    for c in ras.components
+                ]
+                if action.action == "warning":
+                    pos.entry_ctx["ras_warning"] = action.reasons
+                elif action.action == "tighten":
+                    self._ras_trail_mult = 0.75
+                elif action.action == "exit" and self.cfg.ras_exit_enabled:
+                    ras_exit = True
+
+        reason = self._exit_reason(pos, now, pnl_ps, ras_exit=ras_exit)
         if reason is None:
             return None
 
@@ -341,6 +397,8 @@ class PaperBroker:
         self._day_realized[date] = self._day_realized.get(date, 0.0) + pnl_dollars
 
         self.open_positions.remove(pos)
+        self.position_monitor.release(pos.id)
+        pos.entry_ctx["ras_at_exit"] = pos.entry_ctx.get("ras_score")
         self._last_exit_at = now
         self._last_exit_reason = reason
         self._record(pos, now, credit_now, net_ps, pnl_dollars, reason)
@@ -350,8 +408,10 @@ class PaperBroker:
         return (f"PAPER EXIT {pos.family} {reason} pnl=${pnl_dollars:+.2f} "
                 f"equity=${self.cash:.2f}")
 
-    def _exit_reason(self, pos, now, pnl_ps) -> Optional[str]:
+    def _exit_reason(self, pos, now, pnl_ps, ras_exit: bool = False) -> Optional[str]:
         cfg = self.cfg
+        if ras_exit:
+            return "ras_invalidate"
         if pnl_ps <= -cfg.stop_loss_frac * pos.max_loss_ps:
             return "stop"
         if pnl_ps >= cfg.profit_target_frac * pos.max_profit_ps:
@@ -377,6 +437,7 @@ class PaperBroker:
         gb = (cfg.trailing_tight_giveback
               if pos.peak_pnl_ps >= cfg.trailing_tighten_at * pos.max_profit_ps
               else cfg.trailing_giveback_frac)
+        gb *= getattr(self, "_ras_trail_mult", 1.0)
         floor = pos.peak_pnl_ps * (1.0 - gb)
         if cfg.trailing_lock_breakeven:
             floor = max(floor, pos.slip_entry_ps)

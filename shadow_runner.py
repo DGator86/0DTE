@@ -40,6 +40,7 @@ from risk_manager import RiskConfig, RiskManager
 from paper_broker import PaperBroker, PaperConfig
 from market_calendar import is_market_open, next_market_open, market_status
 from dashboard.state import heartbeat_state, serialize_tick_result, write_live_state
+from regime_alignment import position_context_from_entry_ctx
 from typing import Optional
 
 ET = ZoneInfo("America/New_York")
@@ -281,8 +282,13 @@ class ShadowRunner:
             log.warning("heartbeat write error: %s", exc)
 
     def _tick(self, now: dt.datetime) -> None:
+        position_contexts = []
+        for pos in self._paper.open_positions:
+            ctx = position_context_from_entry_ctx(pos.id, pos.entry_ctx)
+            if ctx is not None:
+                position_contexts.append(ctx)
         try:
-            result = self._orch.tick(now)
+            result = self._orch.tick(now, position_contexts=position_contexts or None)
         except Exception as exc:
             log.warning("tick() error: %s", exc)
             self._heartbeat(now, "feed_error", f"Feed error: {exc}")
