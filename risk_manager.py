@@ -27,7 +27,10 @@ NOT financial advice.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from regime_alignment import RASConfig, RASResult
 
 
 # --------------------------------------------------------------------------- #
@@ -130,6 +133,54 @@ class RiskManager:
             self._session = session_date
             self._positions.clear()
             self._daily_loss = 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Position-relative monitoring (RAS)                                           #
+# --------------------------------------------------------------------------- #
+@dataclass
+class PositionRiskConfig:
+    ras: "RASConfig" = field(default_factory=lambda: _default_ras_config())
+
+
+def _default_ras_config():
+    from regime_alignment import RASConfig
+    return RASConfig()
+
+
+@dataclass
+class PositionRiskAction:
+    action: str          # "ok" | "warning" | "tighten" | "exit"
+    reasons: list[str]
+    score: float = 0.0
+
+
+class PositionMonitor:
+    """Tracks open positions and evaluates RAS-driven health actions."""
+
+    def __init__(self, cfg: Optional[PositionRiskConfig] = None) -> None:
+        self._cfg = cfg or PositionRiskConfig()
+        self._registered: set[str] = set()
+
+    def register(self, position_id: str, entry_ctx: Optional[dict] = None) -> None:
+        self._registered.add(position_id)
+
+    def release(self, position_id: str) -> None:
+        self._registered.discard(position_id)
+
+    def evaluate(self, ras: "RASResult") -> PositionRiskAction:
+        from regime_alignment import RASConfig
+        cfg: RASConfig = self._cfg.ras
+        reasons = [
+            f"{c.name}={c.raw:+.2f} ({c.note})"
+            for c in ras.components
+            if c.raw < -0.3
+        ]
+        action = ras.action
+        if not cfg.exit_enabled and action == "exit":
+            action = "warning"
+            reasons.append("exit suppressed (ras.exit_enabled=False)")
+        return PositionRiskAction(action=action, reasons=reasons, score=ras.score)
 
 
 # --------------------------------------------------------------------------- #

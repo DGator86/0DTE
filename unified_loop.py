@@ -50,6 +50,9 @@ from resample import RawBars, build_mtf_input
 from mtf_matrix import build_matrix, regime_rows
 from decision_matrix import decide_from_matrix, TradeIntent
 from regime_classifier import RegimeClassifier, RegimeState, ClassifierContext, ClassifierConfig, ScaleBook
+from regime_alignment import (
+    PositionContext, RASConfig, RASResult, compute_ras, ras_to_signals,
+)
 from journal import Journal
 from market_dynamics import DynamicsWindow, session_open_from_bars
 from risk_manager import RiskManager
@@ -76,6 +79,7 @@ class TickResult:
     final_size_mult: float      # intent.size_mult, 0 if regime stand_down
     vetoes: list
     snapshot: Optional[TickSnapshot] = None   # live market data for paper marking
+    ras_results: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -98,6 +102,7 @@ class UnifiedOrchestrator:
     physical_pdf: Optional[Callable] = None     # callable(grid)->density for Track A
     risk_manager: Optional[RiskManager] = None
     state_path: Optional[str] = None            # persist adaptive scales across restarts
+    ras_cfg: Optional[RASConfig] = None
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
@@ -150,7 +155,40 @@ class UnifiedOrchestrator:
         except Exception:
             pass                                 # never let persistence break a tick
 
-    def tick(self, now: dt.datetime) -> Optional[TickResult]:
+    def _compute_ras(self, regime_state: RegimeState, intent: TradeIntent,
+                     market: MarketSnapshot,
+                     position_contexts: Optional[list]) -> list:
+        if not position_contexts:
+            return []
+        cfg = self.ras_cfg or RASConfig()
+        results: list[RASResult] = []
+        for ctx in position_contexts:
+            try:
+                results.append(compute_ras(
+                    regime_state, intent, market, ctx, cfg=cfg))
+            except Exception:
+                pass
+        return results
+
+    @staticmethod
+    def _signals_with_ras(signals: dict, ras_results: list) -> tuple[dict, Optional[str]]:
+        if not ras_results:
+            return signals, (json.dumps({k: round(v, 6) for k, v in signals.items()
+                                        if isinstance(v, (int, float))})
+                             if signals else None)
+        merged = dict(signals)
+        for ras in ras_results:
+            merged.update(ras_to_signals(ras))
+        signals_json = json.dumps(
+            {k: (v if isinstance(v, str) else round(v, 6))
+             for k, v in merged.items()
+             if isinstance(v, (int, float, str))}
+        ) if merged else None
+        return merged, signals_json
+
+    def tick(self, now: dt.datetime,
+             position_contexts: Optional[list[PositionContext]] = None
+             ) -> Optional[TickResult]:
         snap = self.feed.snapshot(now)
         if snap is None:
             return None
@@ -212,8 +250,7 @@ class UnifiedOrchestrator:
             if isinstance(v, (int, float)) and math.isfinite(v):
                 signals[k] = v
         snap_dict.update(signals)
-        signals_json = json.dumps({k: round(v, 6) for k, v in signals.items()
-                                   if isinstance(v, (int, float))}) if signals else None
+        # signals_json finalized after RAS merge below
 
         # ---- Track B: regime classifier ----
         clf_ctx = ClassifierContext(market=snap.market, rnd=rnd, edge=edge)
@@ -232,12 +269,17 @@ class UnifiedOrchestrator:
         regimes = regime_rows(mat_rows)
         intent = decide_from_matrix(mat_rows, regimes, vetoes=regime_state.vetoes)
 
+        ras_results = self._compute_ras(
+            regime_state, intent, snap.market, position_contexts)
+        signals, signals_json = self._signals_with_ras(signals, ras_results)
+
         # ---- Stand-down: regime unstable or NT cell ----
         if regime_state.stand_down or intent.decision.structure == "NT":
             result = TickResult(
                 ts=now, regime=regime_state, intent=intent,
                 decision=None, final_size_mult=0.0,
                 vetoes=regime_state.vetoes, snapshot=snap,
+                ras_results=ras_results,
             )
             if self.journal:
                 self.journal.log(_no_trade_row(snap.market, intent, regime_state,
@@ -301,6 +343,7 @@ class UnifiedOrchestrator:
             decision=decision,
             final_size_mult=round(final_size, 2),
             vetoes=regime_state.vetoes, snapshot=snap,
+            ras_results=ras_results,
         )
 
     def run_replay(self, timestamps: Sequence[dt.datetime]) -> list[TickResult]:

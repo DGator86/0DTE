@@ -19,6 +19,8 @@ import pytest
 from rnd_extractor import ChainQuote, ChainSnapshot
 from spread_selector import Leg
 from paper_broker import PaperBroker, PaperConfig
+from regime_alignment import RASComponent, RASResult, RASConfig
+from risk_manager import PositionMonitor, PositionRiskConfig
 
 ET = ZoneInfo("America/New_York")
 LEGS = (Leg(740.0, "P", -1), Leg(735.0, "P", 1))   # short 740P / long 735P
@@ -152,3 +154,28 @@ def test_equity_survives_restart(tmp_path):
     b2 = PaperBroker(db_path=db_path, cfg=PaperConfig())
     assert b2.cash == pytest.approx(closed_equity, abs=0.01)
     assert b2.open_positions == []   # open positions are still lost -- expected
+
+
+def test_ras_invalidate_exit(tmp_path):
+    cfg = PaperConfig(ras_exit_enabled=True)
+    monitor = PositionMonitor(PositionRiskConfig(
+        ras=RASConfig(exit_enabled=True, exit_threshold=-70.0)))
+    b = PaperBroker(
+        db_path=str(tmp_path / "paper.sqlite"),
+        cfg=cfg,
+        position_monitor=monitor,
+    )
+    b.on_tick(T0, _result(_chain(742, 1.50, 0.50)))
+    pos = b.open_positions[0]
+    ras = RASResult(
+        score=-85.0,
+        components=[RASComponent("gamma_alignment", -1.0, 1.5, -1.5, "hostile")],
+        action="exit",
+        position_id=pos.id,
+        ema_score=-85.0,
+    )
+    result = _result(_chain(742, 1.50, 0.50), trade=False)
+    result.ras_results = [ras]
+    b.on_tick(T1, result)
+    assert not b.open_positions
+    assert b.report()["by_exit_reason"] == {"ras_invalidate": 1}

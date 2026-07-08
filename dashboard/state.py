@@ -127,6 +127,29 @@ def serialize_tick_result(
         "intent_vetoes": list(intent.vetoes or []),
     }
 
+    ras_results = getattr(result, "ras_results", None) or []
+    if ras_results:
+        primary = ras_results[0]
+        why["position_health"] = {
+            "ras_score": primary.score,
+            "ras_action": primary.action,
+            "position_id": primary.position_id,
+            "components": [
+                {"name": c.name, "raw": c.raw, "contribution": c.contribution, "note": c.note}
+                for c in primary.components
+            ],
+        }
+    elif paper_summary and paper_summary.get("open"):
+        open_pos = paper_summary["open"][0]
+        ctx = (open_pos.get("entry_ctx") or {})
+        if ctx.get("ras_score") is not None:
+            why["position_health"] = {
+                "ras_score": ctx.get("ras_score"),
+                "ras_action": ctx.get("ras_action"),
+                "position_id": open_pos.get("id"),
+                "components": ctx.get("ras_components"),
+            }
+
     inputs = _market_inputs(market) if market else {}
 
     payload = {
