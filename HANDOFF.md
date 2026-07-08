@@ -94,6 +94,9 @@ structures, call `spread_selector.select_spreads` with a chain and return the re
 | `composite_feed.py` | Live `DataFeed` with provider failover (Tradier -> Tastytrade -> Massive); Yahoo backstops bars/settlement only. | `build_default_feed` | Works |
 | `chain_store.py` | Record live ticks (market+chain+incremental bars+settlements) to gzipped JSONL; replay them as a `DataFeed` — the missing piece for REAL-data walk-forward. `shadow_runner` records by default. | `ChainRecorder`, `RecordedFeed` | Validated (round-trip test) |
 | `synthetic_world.py` | COUPLED synthetic market: GEX regime drives price dynamics, chains reprice off the live path each tick, settlement = the path's close. Makes prediction measurable in backtests (the frozen-chain `SyntheticUnifiedFeed` cannot). | `CoupledSyntheticFeed`, `WorldConfig` | Validated |
+| `validation_pipeline.py` | Scheduled daily (light) + weekly (deep) validation: walk-forward on recorded ticks + journal health metrics + degradation flags, persisted to `validation_reports`; alerts via `notifier`. systemd timers in `deploy/zerodte-validate-*.timer`. | `run_daily_validation`, `run_weekly_validation`, CLI `--mode daily\|weekly` | Works |
+| `config_loader.py` | YAML run-config overlays for controlled experiments: `mtf.disabled_vars` + `gate./selector./rnd./classifier.` dot-path overrides. | `load_run_config`, `RunConfig`, `configs/*.yaml` | Works |
+| `scripts/feature_impact.py` | Standardized feature ON/OFF evaluation (backtest + walk-forward under two configs, Markdown report, journal logging). See `docs/feature_impact_workflow.md`. | `run_feature_impact`, CLI | Works |
 
 ### Dependency graph
 ```
@@ -130,6 +133,11 @@ regime_classifier  (standalone; same idea as decision_matrix's regime layer)
   forecast). The static `vol_risk_premium` haircut inside `compute_edge` is a
   last-resort fallback only — with it, the variance ratio (and thus `richness`)
   is a constant by construction, so never rely on it in a live path.
+- **New matrix features go through the impact workflow.** Any new or modified
+  `mtf_matrix.py` variable is evaluated with `scripts/feature_impact.py`
+  (baseline vs variant configs, backtest + walk-forward, journaled report)
+  BEFORE it earns a `_REGIME_DEF` weight or veto power. Process:
+  `docs/feature_impact_workflow.md`.
 - **Adaptive scales (TODO, important).** Most `*_scale` constants in `mtf_matrix.py`
   and `decision_matrix`/`resample` are fixed priors. They should be sourced from
   `regime_classifier.ScaleBook` (trailing distributions) so a feature reads ~50 at
