@@ -91,17 +91,26 @@
           <div id="regime-bars"><p class="empty">No regime data</p></div>
         </section>
 
+        <section class="panel" id="quad-panel">
+          <h2>Four-way matrix <span class="h2-right" id="quad-label">—</span></h2>
+          <div class="quad-wrap"><canvas id="quad"></canvas></div>
+        </section>
+
       </div>
 
       <!-- ---------- MIDDLE: chart + why ---------- -->
       <div class="col col-mid">
 
-        <section class="panel">
+        <section class="panel" id="chart-panel">
           <h2>Price · levels · projection
             <span class="chart-zoom">
+              <button id="zoom-1x" type="button" title="Full session">1×</button>
+              <button id="zoom-5x" type="button" title="Hour detail">5×</button>
+              <button id="zoom-15x" type="button" title="Minute detail">15×</button>
               <button id="zoom-out" type="button" title="Zoom out">−</button>
               <button id="zoom-in" type="button" title="Zoom in">+</button>
               <button id="zoom-reset" type="button" title="Reset zoom">⟲</button>
+              <button id="chart-fs" type="button" title="Full screen (F)">⛶</button>
             </span>
             <span class="h2-right" id="chart-sub">intraday</span>
           </h2>
@@ -119,6 +128,7 @@
             <span><i class="dot" style="background:#2ec785"></i>Signal ▲call ▼put</span>
             <span><i class="dot" style="background:#34d5e0"></i>Paper entry</span>
             <span><i class="dot" style="background:#ffb648"></i>Paper exit</span>
+            <span><i class="swatch-grad"></i>Regime tint (bull/bear)</span>
           </div>
           <div class="reason" id="reason">Awaiting decision engine…</div>
         </section>

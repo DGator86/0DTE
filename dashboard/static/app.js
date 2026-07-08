@@ -583,12 +583,190 @@
       const detail = trade
         ? `${esc(fam)} <small>gate ${fmt(t.gate_score, 0)} · EV ${money(t.ev, 0)}</small>`
         : `<small>${esc((t.no_trade_reason || t.gex_regime || "no trade").replace(/_/g, " "))}</small>`;
-      return `<div class="tl-item${trade ? " is-trade" : ""}">
+      const tint = t.regime_direction === "call" ? " tl-call"
+                 : t.regime_direction === "put" ? " tl-put" : "";
+      return `<div class="tl-item${trade ? " is-trade" : ""}${tint}">
         <span class="t">${etTime(t.ts)}</span>
         <span class="m">${detail} <small>· ${fmt(t.spot, 2)}</small></span>
         <span class="d ${trade ? "trade" : "no"}">${trade ? "TRADE" : "—"}</span>
       </div>`;
     }).join("");
+  }
+
+  /* ============================================================
+     REGIME FIELD — continuous bias/gamma readings per journal tick
+     ============================================================ */
+  function tickSignals(t) {
+    let s = t.signals_json;
+    if (typeof s === "string") {           // older backends serve the raw JSON string
+      try { s = JSON.parse(s); } catch (_) { s = null; }
+    }
+    return s && typeof s === "object" ? s : null;
+  }
+
+  // Direction bias in [-1, +1] (+1 bull). Prefers the continuous matrix bias
+  // value journaled in signals_json; falls back to the resolved direction word.
+  function tickBias(t) {
+    const s = tickSignals(t);
+    const bv = s ? num(s.regime_bias_value) : null;
+    if (bv != null) return Math.max(-1, Math.min(1, (bv - 50) / 50));
+    if (t.regime_direction === "call") return 0.6;
+    if (t.regime_direction === "put") return -0.6;
+    return 0;
+  }
+
+  // Dominant-regime confidence in [0, 1]; neutral default when not journaled.
+  function tickConf(t) {
+    const s = tickSignals(t);
+    const c = s ? num(s.regime_dominant_conf) : null;
+    return c != null ? Math.max(0, Math.min(1, c / 100)) : 0.6;
+  }
+
+  // Gamma favorability in [-1, +1] (+1 = long gamma, well above the flip).
+  function gammaFavor(netGex, zgPct) {
+    const gexSign = num(netGex) != null ? (netGex >= 0 ? 1 : -1) : 0;
+    const prox = num(zgPct) != null ? Math.tanh(zgPct / 0.004) : 0;
+    return Math.max(-1, Math.min(1, 0.55 * prox + 0.45 * gexSign));
+  }
+
+  function tickGamma(t) { return gammaFavor(t.net_gex, t.zero_gamma_dist_pct); }
+
+  // Smooth, non-discretized background shading behind the price line: per-tick
+  // bias values are EMA-smoothed, then each segment is filled with a horizontal
+  // gradient between neighboring colors so regime transitions blend like a
+  // gauge field instead of snapping in vertical blocks.
+  function drawRegimeZones(ctx, ticks, X, padT, plotH) {
+    const rows = ticks
+      .map((t) => ({ ts: new Date(t.ts).getTime(), b: tickBias(t), c: tickConf(t) }))
+      .filter((r) => isFinite(r.ts));
+    if (rows.length < 2) return;
+
+    // EMA over ticks (~1/min): reacts inside a few minutes, ignores one-tick noise
+    const alpha = 0.22;
+    let ema = rows[0].b * rows[0].c;
+    const smooth = rows.map((r, i) => {
+      const v = r.b * (0.35 + 0.65 * r.c);   // confidence scales intensity
+      ema = i === 0 ? v : alpha * v + (1 - alpha) * ema;
+      return { ts: r.ts, v: ema };
+    });
+
+    const color = (v) => {
+      const a = Math.min(0.16, Math.abs(v) * 0.22);
+      if (a < 0.008) return "rgba(0,0,0,0)";
+      return v > 0 ? `rgba(46,199,133,${a.toFixed(3)})` : `rgba(255,84,112,${a.toFixed(3)})`;
+    };
+
+    for (let i = 1; i < smooth.length; i++) {
+      const x0 = X(smooth[i - 1].ts), x1 = X(smooth[i].ts);
+      if (x1 <= x0) continue;
+      const g = ctx.createLinearGradient(x0, 0, x1, 0);
+      g.addColorStop(0, color(smooth[i - 1].v));
+      g.addColorStop(1, color(smooth[i].v));
+      ctx.fillStyle = g;
+      ctx.fillRect(x0, padT, x1 - x0, plotH);
+    }
+  }
+
+  /* ============================================================
+     FOUR-WAY MATRIX — 2x2 quadrant: direction bias x gamma favorability.
+     Dot = current state, fading trail = recent ticks, background
+     intensity keyed to VIX.
+     ============================================================ */
+  function drawQuadrant() {
+    const cv = $("quad");
+    if (!cv || !lastChartData) return;
+    const { ticks, live } = lastChartData;
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = cv.clientHeight;
+    if (!W || !H) return;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const ctx = cv.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const pad = 8;
+    const cx = W / 2, cy = H / 2;
+    const px = (b) => cx + b * (W / 2 - pad);          // bias -1..+1 → x
+    const py = (g) => cy - g * (H / 2 - pad);          // gamma -1..+1 → y (up = favorable)
+
+    // current state from the live payload, falling back to the newest tick
+    const doing = live && live.doing ? live.doing : {};
+    const inputs = live && live.inputs ? live.inputs : {};
+    const latest = ticks && ticks.length ? ticks[ticks.length - 1] : null;
+    let bias = num(doing.bias_value) != null
+      ? Math.max(-1, Math.min(1, (doing.bias_value - 50) / 50))
+      : (latest ? tickBias(latest) : 0);
+    let gamma = (num(inputs.net_gex) != null || num(inputs.zero_gamma_dist_pct) != null)
+      ? gammaFavor(inputs.net_gex, inputs.zero_gamma_dist_pct)
+      : (latest ? tickGamma(latest) : 0);
+
+    // VIX drives background intensity: calm ≈ faint, stressed ≈ saturated
+    const vix = num(inputs.vix) != null ? inputs.vix : (latest ? num(latest.vix) : null);
+    const heat = vix == null ? 0.10 : Math.max(0.06, Math.min(0.26, (vix - 11) / 60));
+
+    // quadrant tints: bull side green, bear side red; short-gamma half darker
+    const tints = [
+      { x0: cx, y0: pad, c: `rgba(46,199,133,${heat})` },              // bull + long γ
+      { x0: pad, y0: pad, c: `rgba(255,84,112,${(heat * 0.75).toFixed(3)})` },   // bear + long γ
+      { x0: cx, y0: cy, c: `rgba(46,199,133,${(heat * 0.55).toFixed(3)})` },     // bull + short γ
+      { x0: pad, y0: cy, c: `rgba(255,84,112,${heat})` },              // bear + short γ
+    ];
+    tints.forEach((q) => {
+      const g = ctx.createRadialGradient(
+        q.x0 === pad ? pad : W - pad, q.y0 === pad ? pad : H - pad, 8,
+        cx, cy, Math.max(W, H) / 1.4);
+      g.addColorStop(0, q.c);
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(q.x0, q.y0, cx - pad, cy - pad);
+    });
+
+    // axes
+    ctx.strokeStyle = "rgba(133,149,176,0.35)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad, cy); ctx.lineTo(W - pad, cy);
+    ctx.moveTo(cx, pad); ctx.lineTo(cx, H - pad);
+    ctx.stroke();
+
+    // corner labels
+    ctx.font = "600 9px 'SF Mono', ui-monospace, monospace";
+    ctx.fillStyle = "#8595b0";
+    ctx.textAlign = "left";
+    ctx.fillText("BEAR · LONG γ", pad + 4, pad + 12);
+    ctx.fillText("BEAR · SHORT γ", pad + 4, H - pad - 5);
+    ctx.textAlign = "right";
+    ctx.fillText("BULL · LONG γ", W - pad - 4, pad + 12);
+    ctx.fillText("BULL · SHORT γ", W - pad - 4, H - pad - 5);
+
+    // trail: last 30 ticks, oldest faintest
+    const trail = (ticks || []).slice(-30);
+    trail.forEach((t, i) => {
+      const a = 0.06 + 0.5 * (i / Math.max(1, trail.length - 1));
+      ctx.fillStyle = `rgba(74,168,255,${a.toFixed(3)})`;
+      ctx.beginPath();
+      ctx.arc(px(tickBias(t)), py(tickGamma(t)), 2.2, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // current-state dot
+    const dotX = px(bias), dotY = py(gamma);
+    ctx.fillStyle = "#4aa8ff";
+    ctx.strokeStyle = "#e6edf7";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(dotX, dotY, 5.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // header label: plain-language read of the current quadrant
+    const lbl = $("quad-label");
+    if (lbl) {
+      const side = bias > 0.12 ? "bull" : bias < -0.12 ? "bear" : "neutral";
+      const gq = gamma > 0.12 ? "favorable γ" : gamma < -0.12 ? "hostile γ" : "flat γ";
+      const vtxt = vix != null ? ` · VIX ${vix.toFixed(1)}` : "";
+      lbl.textContent = `${side} · ${gq}${vtxt}`;
+    }
   }
 
   /* ============================================================
@@ -702,17 +880,19 @@
       const ts = Math.max(t0, Math.min(tEnd, Tof(x)));
       ctx.fillText(new Date(ts).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" }), x, H - 6);
     }
-    if (zv > 1.001) {
-      ctx.textAlign = "right";
-      ctx.fillStyle = "#8595b0";
-      ctx.fillText(`${zv.toFixed(1)}×`, padL + plotW, padT + 9);
-    }
+    // explicit zoom level indicator (always visible)
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#8595b0";
+    ctx.fillText(zv > 1.001 ? `${zv.toFixed(1)}×` : "1× full session", padL + plotW, padT + 9);
 
     // clip everything time-positioned to the plot area while zoomed/panned
     ctx.save();
     ctx.beginPath();
     ctx.rect(padL, padT, plotW, plotH);
     ctx.clip();
+
+    // --- regime gauge field (drawn first: everything else sits on top) ---
+    drawRegimeZones(ctx, ticks, X, padT, plotH);
 
     // --- "now" divider ---
     ctx.strokeStyle = "rgba(157,123,255,0.35)";
@@ -1128,9 +1308,52 @@
 
       lastChartData = { ticks, live, market, trades };
       drawChart();
+      drawQuadrant();
     } catch (e) {
       if (e.message !== "Unauthorized") console.warn("refresh", e);
     }
+  }
+
+  /* ---------------- full-screen mode ---------------- */
+  function chartIsFullscreen() {
+    const panel = $("chart-panel");
+    return document.fullscreenElement === panel || panel.classList.contains("fs-fallback");
+  }
+
+  function toggleChartFullscreen() {
+    const panel = $("chart-panel");
+    if (chartIsFullscreen()) {
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      panel.classList.remove("fs-fallback");
+      requestAnimationFrame(drawChart);
+      return;
+    }
+    if (panel.requestFullscreen) {
+      // fixed-overlay fallback if the browser refuses (e.g. iframe sandbox)
+      panel.requestFullscreen().catch(() => {
+        panel.classList.add("fs-fallback");
+        requestAnimationFrame(drawChart);
+      });
+    } else {
+      panel.classList.add("fs-fallback");   // iOS Safari: no element fullscreen
+      requestAnimationFrame(drawChart);
+    }
+  }
+
+  /* ---------------- zoom presets ---------------- */
+  function setZoomPreset(z) {
+    // keep the view centered while jumping between preset magnifications
+    const center = CH_PADL + chartPlotW() / 2;
+    if (z <= 1) { chartView.z = 1; chartView.pan = 0; drawChart(); }
+    else chartZoomAt(center, z / chartView.z);
+    updateZoomButtons();
+  }
+
+  function updateZoomButtons() {
+    [["zoom-1x", 1], ["zoom-5x", 5], ["zoom-15x", 15]].forEach(([id, z]) => {
+      const b = $(id);
+      if (b) b.classList.toggle("active", Math.abs(chartView.z - z) < 0.25);
+    });
   }
 
   /* ---------------- chart zoom / pan / tooltip wiring ---------------- */
@@ -1139,17 +1362,37 @@
     const tip = $("chart-tip");
     if (!cv) return;
 
-    $("zoom-in").addEventListener("click", () => chartZoomAt(CH_PADL + chartPlotW() / 2, 1.5));
-    $("zoom-out").addEventListener("click", () => chartZoomAt(CH_PADL + chartPlotW() / 2, 1 / 1.5));
+    $("zoom-in").addEventListener("click", () => { chartZoomAt(CH_PADL + chartPlotW() / 2, 1.5); updateZoomButtons(); });
+    $("zoom-out").addEventListener("click", () => { chartZoomAt(CH_PADL + chartPlotW() / 2, 1 / 1.5); updateZoomButtons(); });
     $("zoom-reset").addEventListener("click", () => {
-      chartView.z = 1; chartView.pan = 0; drawChart();
+      chartView.z = 1; chartView.pan = 0; drawChart(); updateZoomButtons();
+    });
+    $("zoom-1x").addEventListener("click", () => setZoomPreset(1));
+    $("zoom-5x").addEventListener("click", () => setZoomPreset(5));
+    $("zoom-15x").addEventListener("click", () => setZoomPreset(15));
+    $("chart-fs").addEventListener("click", toggleChartFullscreen);
+
+    document.addEventListener("fullscreenchange", () => requestAnimationFrame(drawChart));
+    document.addEventListener("keydown", (e) => {
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test((e.target || {}).tagName || "")) return;
+      if (e.key === "f" || e.key === "F") toggleChartFullscreen();
+      else if (e.key === "Escape" && $("chart-panel").classList.contains("fs-fallback")) {
+        $("chart-panel").classList.remove("fs-fallback");
+        requestAnimationFrame(drawChart);
+      }
     });
 
     cv.addEventListener("wheel", (e) => {
       e.preventDefault();
       const x = e.offsetX;
       chartZoomAt(x, e.deltaY < 0 ? 1.2 : 1 / 1.2);
+      updateZoomButtons();
     }, { passive: false });
+
+    cv.addEventListener("dblclick", (e) => {
+      chartZoomAt(e.offsetX, 2);              // double-click: zoom in at cursor
+      updateZoomButtons();
+    });
 
     // drag to pan (only meaningful when zoomed)
     let drag = null;
@@ -1242,7 +1485,7 @@
   let resizeRAF = null;
   window.addEventListener("resize", () => {
     if (resizeRAF) cancelAnimationFrame(resizeRAF);
-    resizeRAF = requestAnimationFrame(drawChart);
+    resizeRAF = requestAnimationFrame(() => { drawChart(); drawQuadrant(); });
   });
 
   async function init() {

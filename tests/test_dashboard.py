@@ -81,6 +81,9 @@ def test_serialize_tick_result_sections():
     assert payload["inputs"]["spot"] == 600.0
     assert payload["why"]["matrix_cell"] == ["compression", "compression", "neutral"]
     assert payload["feed_source"] == "Tradier"
+    # continuous direction bias for the four-way quadrant / regime shading
+    assert payload["doing"]["direction_bias"] == "neutral"
+    assert payload["doing"]["bias_value"] == 0.0
 
 
 def test_write_read_live_state():
@@ -141,6 +144,32 @@ def test_api_market_status(client):
 def test_post_returns_405(client):
     r = client.post("/api/live", headers={"Authorization": "Bearer test-secret-token"})
     assert r.status_code == 405
+
+
+def test_journal_fetch_decodes_signals_json(tmp_path):
+    """The ticks query hands the frontend a decoded signals dict (regime
+    shading + quadrant read regime_bias_value / regime_dominant_conf)."""
+    from dashboard.queries import journal_fetch
+    from journal import COLUMNS, Journal
+
+    db = str(tmp_path / "shadow.db")
+    jrn = Journal(db)
+    row = {c: None for c in COLUMNS}
+    row.update({
+        "ts": "2026-07-08T10:30:00-04:00", "session_date": "2026-07-08",
+        "decision": "NO_TRADE", "spot": 600.0,
+        "signals_json": json.dumps({"regime_bias_value": 63.4,
+                                    "regime_dominant_conf": 71.0}),
+    })
+    jrn.log(row)
+    jrn.close()
+
+    ticks = journal_fetch(db, limit=5)
+    assert len(ticks) == 1
+    sig = ticks[0]["signals_json"]
+    assert isinstance(sig, dict)
+    assert sig["regime_bias_value"] == 63.4
+    assert sig["regime_dominant_conf"] == 71.0
 
 
 def test_api_ras_history(monkeypatch, tmp_path):

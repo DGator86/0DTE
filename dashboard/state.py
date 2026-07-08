@@ -71,6 +71,10 @@ def serialize_tick_result(
         "conviction": intent.decision.conviction,
         "size_mult": intent.size_mult,
         "final_size_mult": result.final_size_mult,
+        # continuous direction bias (0-100, 50 = neutral) + its label, for the
+        # four-way quadrant and regime shading on the chart
+        "direction_bias": intent.direction_bias,
+        "bias_value": intent.bias_value,
     }
 
     if dec is not None:
