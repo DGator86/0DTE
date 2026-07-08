@@ -361,6 +361,61 @@ html, body {
 .op-metrics .k { color: var(--muted); font-size: 10px; text-transform: uppercase; }
 .op-metrics .v { font-family: var(--mono); color: var(--ink); }
 
+/* ---------------- RAS (regime alignment) health ---------------- */
+.ras-block {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+}
+.ras-block.ok   { border-left-color: var(--green); }
+.ras-block.warn { border-left-color: var(--amber); }
+.ras-block.bad  { border-left-color: var(--red); }
+.ras-head { display: flex; align-items: baseline; gap: 8px; }
+.ras-title {
+  font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.08em;
+  margin-right: auto;
+}
+.ras-score { font-size: 15px; font-weight: 800; }
+.ras-score.ok   { color: var(--green); }
+.ras-score.warn { color: var(--amber); }
+.ras-score.bad  { color: var(--red); }
+.ras-badge {
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  padding: 2px 8px; border-radius: 999px;
+  letter-spacing: 0.05em; text-transform: uppercase;
+  background: var(--panel-2); border: 1px solid var(--border-2);
+  color: var(--muted);
+}
+.ras-badge.ok      { color: var(--green); border-color: var(--green-dim); background: rgba(46,199,133,0.08); }
+.ras-badge.warning { color: var(--amber); border-color: var(--amber-dim); background: rgba(255,182,72,0.08); }
+.ras-badge.tighten { color: var(--amber); border-color: var(--amber-dim); background: rgba(255,182,72,0.14); }
+.ras-badge.exit    { color: var(--red);   border-color: var(--red-dim);   background: rgba(255,84,112,0.12); }
+.ras-comp {
+  display: flex; align-items: baseline; gap: 7px;
+  font-size: 11px; color: var(--ink);
+  padding: 3px 0 0;
+  min-width: 0;
+}
+.ras-comp .mono { flex: 0 0 auto; font-size: 11px; font-weight: 700; }
+.ras-comp .mono.neg { color: var(--red); }
+.ras-comp .mono.pos { color: var(--green); }
+.ras-comp-name { flex: 0 0 auto; }
+.ras-comp small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ras-details { margin-top: 6px; }
+.ras-details summary {
+  font-size: 10px; color: var(--muted-2); cursor: pointer;
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.ras-details summary:hover { color: var(--muted); }
+.ras-exit-line.ok   { color: var(--green); }
+.ras-exit-line.warn { color: var(--amber); }
+.ras-exit-line.bad  { color: var(--red); }
+.tj-reason.warn { color: var(--amber); border-color: var(--amber-dim, var(--amber)); }
+
 /* ---------------- Readiness checklist ---------------- */
 .readiness-badge {
   font-family: var(--mono);

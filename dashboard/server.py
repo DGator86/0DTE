@@ -24,6 +24,7 @@ from dashboard.queries import (
     journal_row,
     paper_summary,
     paper_trades_journal,
+    ras_history,
     readiness_summary,
     report_summary,
 )
@@ -114,6 +115,25 @@ async def api_trades(limit: int = 200):
         _config.get("live_state", "live_state.json"),
         limit=max(1, min(limit, 500)),
     )
+
+
+@app.get("/api/ras")
+async def api_ras(
+    position_id: Optional[str] = Query(None),
+    session_date: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=2000),
+):
+    """Regime Alignment Score history: per-position score/action timeline
+    with the full component breakdown for every evaluation."""
+    db = _config.get("db", "shadow.db")
+    if not os.path.isfile(db):
+        return {"evaluations": [], "note": "journal database not found"}
+    return {
+        "position_id": position_id,
+        "session_date": session_date,
+        "evaluations": ras_history(db, position_id=position_id,
+                                   session_date=session_date, limit=limit),
+    }
 
 
 @app.get("/api/report")

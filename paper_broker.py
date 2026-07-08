@@ -102,7 +102,11 @@ class PaperConfig:
     slippage_frac: float = 0.50           # fraction of each leg's bid-ask half-spread paid per side
 
     # --- regime alignment (RAS) ---
-    ras_exit_enabled: bool = False        # off until calibrated; mirrors RASConfig.exit_enabled
+    # True: an "exit" action from the position monitor closes the paper
+    # position (exit reason "ras_invalidate"). Mirrors RASConfig.exit_enabled;
+    # BOTH must be on for an automated exit. shadow_runner --no-ras-exit
+    # turns both off for observation-only sessions.
+    ras_exit_enabled: bool = True
 
 
 # --------------------------------------------------------------------------- #
@@ -368,6 +372,7 @@ class PaperBroker:
 
         self._ras_trail_mult = 1.0
         ras_exit = False
+        ras_event = None
         if result is not None:
             ras_list = getattr(result, "ras_results", None) or []
             ras = next((r for r in ras_list if r.position_id == pos.id), None)
@@ -375,6 +380,9 @@ class PaperBroker:
                 action = self.position_monitor.evaluate(ras)
                 if pos.entry_ctx.get("ras_at_entry") is None:
                     pos.entry_ctx["ras_at_entry"] = ras.score
+                prev_worst = pos.entry_ctx.get("ras_worst")
+                pos.entry_ctx["ras_worst"] = (ras.ema_score if prev_worst is None
+                                              else min(prev_worst, ras.ema_score))
                 pos.entry_ctx["ras_score"] = ras.score
                 pos.entry_ctx["ras_action"] = ras.action
                 pos.entry_ctx["ras_ema_score"] = ras.ema_score
@@ -388,10 +396,17 @@ class PaperBroker:
                     self._ras_trail_mult = 0.75
                 elif action.action == "exit" and self.cfg.ras_exit_enabled:
                     ras_exit = True
+                # Surface action transitions in the session log so escalation
+                # is visible as it happens, not only at exit.
+                if action.action != pos.entry_ctx.get("ras_last_action"):
+                    pos.entry_ctx["ras_last_action"] = action.action
+                    if action.action != "ok":
+                        ras_event = (f"RAS {action.action.upper()} {pos.family} "
+                                     f"{pos.strikes_str()} score={ras.ema_score:+.1f}")
 
         reason = self._exit_reason(pos, now, pnl_ps, ras_exit=ras_exit)
         if reason is None:
-            return None
+            return ras_event
 
         slip_exit = self._slippage_ps(pos.legs, spr)
         net_ps = pnl_ps - slip_exit

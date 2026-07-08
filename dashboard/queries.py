@@ -73,6 +73,45 @@ def journal_max_id(db_path: str) -> int:
         conn.close()
 
 
+def ras_history(db_path: str, position_id: Optional[str] = None,
+                session_date: Optional[str] = None, limit: int = 500) -> list[dict]:
+    """RAS evaluation history (newest last) from journal.ras_evaluations,
+    with the component breakdown decoded per row. Read-only."""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return []
+    try:
+        sql = "SELECT * FROM ras_evaluations"
+        clauses, args = [], []
+        if position_id:
+            clauses.append("position_id = ?")
+            args.append(position_id)
+        if session_date:
+            clauses.append("session_date = ?")
+            args.append(session_date)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        rows = conn.execute(sql, args).fetchall()
+    except sqlite3.Error:
+        return []                        # table absent on pre-RAS journals
+    finally:
+        conn.close()
+
+    out = []
+    for r in reversed(rows):
+        d = dict(r)
+        try:
+            d["components"] = json.loads(d.pop("components_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            d["components"] = []
+        out.append(d)
+    return out
+
+
 def report_summary(db_path: str) -> dict:
     jrn = Journal(db_path)
     try:

@@ -141,3 +141,46 @@ def test_api_market_status(client):
 def test_post_returns_405(client):
     r = client.post("/api/live", headers={"Authorization": "Bearer test-secret-token"})
     assert r.status_code == 405
+
+
+def test_api_ras_history(monkeypatch, tmp_path):
+    """/api/ras serves the per-position RAS timeline with full components."""
+    from journal import Journal
+    from regime_alignment import RASComponent, RASResult
+
+    monkeypatch.setenv("DASHBOARD_TOKEN", "test-secret-token")
+    db = str(tmp_path / "shadow.db")
+    jrn = Journal(db)
+    for i, (score, action) in enumerate([(20.0, "ok"), (-35.0, "warning"),
+                                         (-75.0, "exit")]):
+        jrn.log_ras(
+            f"2026-07-08T10:3{i}:00-04:00", "2026-07-08",
+            RASResult(
+                score=score,
+                components=[RASComponent("gamma_alignment", -0.5, 1.5, -0.75,
+                                         "below flip")],
+                action=action, position_id="posX", ema_score=score,
+            ))
+    jrn.close()
+    _configure(db, str(tmp_path / "paper.sqlite"), str(tmp_path / "live.json"))
+
+    c = TestClient(app)
+    hdrs = {"Authorization": "Bearer test-secret-token"}
+    r = c.get("/api/ras?position_id=posX", headers=hdrs)
+    assert r.status_code == 200
+    evals = r.json()["evaluations"]
+    assert len(evals) == 3
+    assert evals[-1]["action"] == "exit"
+    assert evals[-1]["score"] == -75.0
+    assert evals[0]["components"][0]["note"] == "below flip"
+
+    # filters
+    r = c.get("/api/ras?position_id=nope", headers=hdrs)
+    assert r.json()["evaluations"] == []
+
+    # missing / legacy DB degrades gracefully
+    _configure(str(tmp_path / "absent.db"), str(tmp_path / "p.sqlite"),
+               str(tmp_path / "live.json"))
+    r = c.get("/api/ras", headers=hdrs)
+    assert r.status_code == 200
+    assert r.json()["evaluations"] == []

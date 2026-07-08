@@ -235,6 +235,22 @@ def test_exit_action_suppressed_when_disabled():
     assert ras.action == "warning"
 
 
+def test_exit_action_active_with_default_config():
+    """Full activation: with library defaults (exit_enabled=True) a deeply
+    negative score must surface as an actual exit action, not a warning."""
+    assert RASConfig().exit_enabled is True
+    cfg = RASConfig(exit_threshold=-10.0)
+    entry = _entry(structure="LPS", direction_bias="bear")
+    regime = _regime(vetoes=["catalyst:FOMC"])
+    intent = _intent(structure="LPS", direction="put",
+                     direction_bias="bull", bias_value=70.0)
+    market = _market(net_gex=-5e9, spot=605.0, gamma_flip=600.0)
+    ctx = PositionContext("p5b", "put", "bear", entry)
+    ras = compute_ras(regime, intent, market, ctx, cfg=cfg)
+    assert ras.score < cfg.exit_threshold
+    assert ras.action == "exit"
+
+
 def test_compute_regime_alignment_alias_matches_compute_ras():
     """The handoff-specified public name must produce the same result."""
     regime = _regime()

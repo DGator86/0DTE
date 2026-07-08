@@ -156,6 +156,22 @@ def test_equity_survives_restart(tmp_path):
     assert b2.open_positions == []   # open positions are still lost -- expected
 
 
+def _ras(pos_id, ema, action, name="gamma_alignment", note="hostile"):
+    return RASResult(
+        score=ema,
+        components=[RASComponent(name, -1.0, 1.5, -1.5, note)],
+        action=action,
+        position_id=pos_id,
+        ema_score=ema,
+    )
+
+
+def _ras_tick(chain, pos_id, ema, action):
+    result = _result(chain, trade=False)
+    result.ras_results = [_ras(pos_id, ema, action)]
+    return result
+
+
 def test_ras_invalidate_exit(tmp_path):
     cfg = PaperConfig(ras_exit_enabled=True)
     monitor = PositionMonitor(PositionRiskConfig(
@@ -167,15 +183,55 @@ def test_ras_invalidate_exit(tmp_path):
     )
     b.on_tick(T0, _result(_chain(742, 1.50, 0.50)))
     pos = b.open_positions[0]
-    ras = RASResult(
-        score=-85.0,
-        components=[RASComponent("gamma_alignment", -1.0, 1.5, -1.5, "hostile")],
-        action="exit",
-        position_id=pos.id,
-        ema_score=-85.0,
-    )
-    result = _result(_chain(742, 1.50, 0.50), trade=False)
-    result.ras_results = [ras]
-    b.on_tick(T1, result)
+    b.on_tick(T1, _ras_tick(_chain(742, 1.50, 0.50), pos.id, -85.0, "exit"))
     assert not b.open_positions
     assert b.report()["by_exit_reason"] == {"ras_invalidate": 1}
+
+
+def test_ras_exit_active_by_default(tmp_path):
+    """Full activation: a default-constructed broker (no explicit configs)
+    must honor an RAS exit action on a paper position."""
+    assert PaperConfig().ras_exit_enabled is True
+    assert RASConfig().exit_enabled is True
+    b = _broker(tmp_path)                      # all defaults
+    b.on_tick(T0, _result(_chain(742, 1.50, 0.50)))
+    pos = b.open_positions[0]
+    b.on_tick(T1, _ras_tick(_chain(742, 1.50, 0.50), pos.id, -85.0, "exit"))
+    assert not b.open_positions
+    assert b.report()["by_exit_reason"] == {"ras_invalidate": 1}
+
+
+def test_no_ras_exit_flag_observation_only(tmp_path):
+    """The --no-ras-exit escape hatch: broker-level flag alone must block the
+    close even when the RASResult carries an exit action."""
+    b = _broker(tmp_path, ras_exit_enabled=False)
+    b.on_tick(T0, _result(_chain(742, 1.50, 0.50)))
+    pos = b.open_positions[0]
+    b.on_tick(T1, _ras_tick(_chain(742, 1.50, 0.50), pos.id, -85.0, "exit"))
+    assert len(b.open_positions) == 1          # still open; observation only
+    assert pos.entry_ctx["ras_score"] == -85.0
+
+
+def test_ras_worst_and_entry_tracked(tmp_path):
+    b = _broker(tmp_path)
+    b.on_tick(T0, _result(_chain(742, 1.50, 0.50)))
+    pos = b.open_positions[0]
+    b.on_tick(T1, _ras_tick(_chain(742, 1.50, 0.50), pos.id, 25.0, "ok"))
+    assert pos.entry_ctx["ras_at_entry"] == 25.0
+    assert pos.entry_ctx["ras_worst"] == 25.0
+    b.on_tick(T1, _ras_tick(_chain(742, 1.50, 0.50), pos.id, -35.0, "warning"))
+    assert pos.entry_ctx["ras_worst"] == -35.0
+    b.on_tick(T1, _ras_tick(_chain(742, 1.50, 0.50), pos.id, -10.0, "ok"))
+    assert pos.entry_ctx["ras_worst"] == -35.0   # worst is sticky
+    assert pos.entry_ctx["ras_at_entry"] == 25.0  # first evaluation is sticky
+
+
+def test_ras_action_change_emits_event(tmp_path):
+    b = _broker(tmp_path)
+    b.on_tick(T0, _result(_chain(742, 1.50, 0.50)))
+    pos = b.open_positions[0]
+    ev1 = b.on_tick(T1, _ras_tick(_chain(742, 1.50, 0.50), pos.id, -55.0, "tighten"))
+    assert any("RAS TIGHTEN" in e for e in ev1)
+    # same action again: no duplicate event spam
+    ev2 = b.on_tick(T1, _ras_tick(_chain(742, 1.50, 0.50), pos.id, -56.0, "tighten"))
+    assert not any("RAS" in e for e in ev2)
