@@ -10,7 +10,11 @@ table run on real data instead of a hand-built dict.
 What it produces (per timeframe), matching mtf_matrix's NATIVE variables:
     dist_to_vwap, vwap_slope, range_position, realized_vol, rv_expansion,
     adx_strength, di_spread, ema_slope, rsi, bb_compression,
-    trend_cleanliness, cvd_persistence, tick_two_sided
+    trend_cleanliness, cvd_persistence, tick_two_sided,
+    plus the volatility-channel block (see _channel_features):
+    bb_width, bb_position, bb_squeeze, bb_expansion,
+    keltner_width, keltner_position, keltner_trend_strength,
+    donchian_width, donchian_position, donchian_breakout_up/down
 
 Honest degradation:
   * Higher timeframes need history. A 14-period ADX on the 1d bar needs ~14
@@ -47,6 +51,21 @@ RV_W = 20             # realized-vol window
 R2_W = 20             # trend-cleanliness window
 VWAP_W = 20           # rolling VWAP window (per TF)
 RV_RANK_W = 100       # window to percentile-rank realized vol
+
+# --- volatility-channel parameters (Bollinger / Keltner / Donchian) ---------
+BB_SD = 2.0           # Bollinger band width in sigmas (upper-lower = 2*BB_SD*sd)
+KC_P = 20             # Keltner EMA basis + Wilder ATR period (TTM convention)
+KC_MULT = 1.5         # Keltner half-width in ATRs (TTM convention)
+KC_TREND_LB = 10      # bars of keltner_position persistence -> trend strength
+DONCH_P = 20          # Donchian channel lookback (highest high / lowest low)
+BB_EXP_LB = 5         # bars back to measure Bollinger width expansion rate
+CHAN_RANK_W = RV_RANK_W  # trailing window for channel-width percentile ranks
+# TTM squeeze grading on ratio = bollinger_width / keltner_width:
+#   ratio >= SQUEEZE_ON   -> 0 (Bollinger at/outside Keltner: no squeeze)
+#   ratio <= SQUEEZE_FULL -> 1 (Bollinger deep inside Keltner: full squeeze)
+#   linear in between
+SQUEEZE_ON = 1.0
+SQUEEZE_FULL = 0.6
 
 
 # --------------------------------------------------------------------------- #
@@ -101,6 +120,18 @@ def _wilder_rma(x: np.ndarray, p: int) -> np.ndarray:
     return out
 
 
+def _true_range(h, l, c) -> np.ndarray:
+    """True range per bar (length n-1, aligned to bars 1..n-1)."""
+    return np.maximum.reduce([h[1:] - l[1:], np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])])
+
+
+def _atr_series(h, l, c, p=ATR_P) -> Optional[np.ndarray]:
+    """Wilder ATR series (length n-1, aligned to bars 1..n-1); None if too short."""
+    if len(c) < p + 1:
+        return None
+    return _wilder_rma(_true_range(h, l, c), p)
+
+
 def _adx_di(h, l, c, p=ADX_P):
     n = len(c)
     if n < 2 * p:
@@ -109,8 +140,7 @@ def _adx_di(h, l, c, p=ADX_P):
     dn = l[:-1] - l[1:]
     plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
     minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    tr = np.maximum.reduce([h[1:] - l[1:], np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])])
-    atr = _wilder_rma(tr, p)
+    atr = _wilder_rma(_true_range(h, l, c), p)
     pdi = 100 * _wilder_rma(plus_dm, p) / atr
     mdi = 100 * _wilder_rma(minus_dm, p) / atr
     dx = 100 * np.abs(pdi - mdi) / (pdi + mdi)
@@ -255,6 +285,122 @@ def _tick_two_sided(tick):
 
 
 # --------------------------------------------------------------------------- #
+# Volatility channels: Bollinger / Keltner / Donchian                          #
+# --------------------------------------------------------------------------- #
+CHANNEL_KEYS = ["bb_width", "bb_position", "bb_squeeze", "bb_expansion",
+                "keltner_width", "keltner_position", "keltner_trend_strength",
+                "donchian_width", "donchian_position",
+                "donchian_breakout_up", "donchian_breakout_down"]
+
+
+def _pct_rank(series: pd.Series, rank_w: int = CHAN_RANK_W) -> Optional[float]:
+    """Percentile rank (0..1) of the last value vs its trailing rank_w history."""
+    w = series.dropna()
+    if len(w) < 2 or not np.isfinite(w.iloc[-1]):
+        return None
+    recent = w.iloc[-rank_w:]
+    return float((recent < w.iloc[-1]).mean())
+
+
+def _channel_features(h, l, c) -> dict:
+    """Bollinger / Keltner / Donchian channel features (last-bar values).
+
+    Every key in CHANNEL_KEYS is always present; a key is None when history is
+    too short for that indicator at this timeframe (honest degradation, same
+    contract as the other native features).
+
+    Definitions (all periods/thresholds are module constants above):
+      * Bollinger:  SMA(BB_P) +/- BB_SD * rolling std (ddof=0).
+      * Keltner:    EMA(KC_P) +/- KC_MULT * Wilder ATR(KC_P)  (TTM convention).
+      * Donchian:   highest high / lowest low over DONCH_P bars.
+      * *_width:    percentile rank (0..1) of the normalized channel width vs
+                    its own trailing CHAN_RANK_W history -> P() downstream.
+      * *_position: where the close sits inside the channel, 0=lower band,
+                    1=upper band (may exceed [0,1] outside; clipped downstream).
+      * bb_expansion: rate of Bollinger width change over BB_EXP_LB bars
+                    (width_now / width_then - 1; >0 = expanding) -> S().
+      * bb_squeeze: graded TTM squeeze from ratio = bb_width / keltner_width;
+                    0 at ratio>=SQUEEZE_ON, 1 at ratio<=SQUEEZE_FULL, linear
+                    between -> P().
+      * keltner_trend_strength: mean of (keltner_position - 0.5) over the last
+                    KC_TREND_LB bars; signed persistence above/below the
+                    midline (>0 = riding upper half) -> S().
+      * donchian_breakout_up/down: close penetration beyond the PRIOR bar's
+                    channel extreme, in ATRs (0 inside the channel; graded
+                    strength beyond it) -> S(), so no-breakout scores 50.
+    """
+    out: dict = {k: None for k in CHANNEL_KEYS}
+    n = len(c)
+
+    # --- Bollinger ---------------------------------------------------------
+    bb_w_last = None
+    if n >= BB_P:
+        s = pd.Series(c)
+        mid = s.rolling(BB_P).mean()
+        sd = s.rolling(BB_P).std(ddof=0)
+        bb_up = mid + BB_SD * sd
+        bb_lo = mid - BB_SD * sd
+        bb_w = (bb_up - bb_lo) / mid                 # normalized width series
+        if np.isfinite(bb_w.iloc[-1]) and mid.iloc[-1] > 0:
+            bb_w_last = float(bb_w.iloc[-1])
+            out["bb_width"] = _pct_rank(bb_w)
+            rng = float(bb_up.iloc[-1] - bb_lo.iloc[-1])
+            if rng > 0:
+                out["bb_position"] = float((c[-1] - bb_lo.iloc[-1]) / rng)
+            if n >= BB_P + BB_EXP_LB:
+                prev = bb_w.iloc[-1 - BB_EXP_LB]
+                if np.isfinite(prev) and prev > 0:
+                    out["bb_expansion"] = float(bb_w.iloc[-1] / prev - 1.0)
+
+    # --- Keltner (EMA basis, ATR bands) -------------------------------------
+    atr = _atr_series(h, l, c, KC_P)
+    atr_last = (float(atr[-1]) if atr is not None and np.isfinite(atr[-1]) and atr[-1] > 0
+                else None)
+    if atr_last is not None and n >= KC_P:
+        kc_mid = _ema_series(c, KC_P)[1:]            # align with atr (bars 1..n-1)
+        kc_half = KC_MULT * atr
+        kc_up = kc_mid + kc_half
+        kc_lo = kc_mid - kc_half
+        kc_w_last = float(2 * kc_half[-1] / kc_mid[-1]) if kc_mid[-1] > 0 else None
+        with np.errstate(invalid="ignore", divide="ignore"):
+            kc_w = np.where(kc_mid > 0, 2 * kc_half / kc_mid, np.nan)
+        out["keltner_width"] = _pct_rank(pd.Series(kc_w))
+        rng = float(kc_up[-1] - kc_lo[-1])
+        if rng > 0:
+            out["keltner_position"] = float((c[-1] - kc_lo[-1]) / rng)
+        # signed persistence of position vs midline over the last KC_TREND_LB bars
+        m = min(KC_TREND_LB, len(kc_up))
+        span = kc_up[-m:] - kc_lo[-m:]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            pos = np.where(span > 0, (c[-m:] - kc_lo[-m:]) / span, np.nan)
+        pos = pos[np.isfinite(pos)]
+        if len(pos):
+            out["keltner_trend_strength"] = float(np.mean(pos - 0.5))
+        # graded TTM squeeze: Bollinger width relative to Keltner width
+        if bb_w_last is not None and kc_w_last and kc_w_last > 0:
+            ratio = bb_w_last / kc_w_last
+            out["bb_squeeze"] = float(
+                np.clip((SQUEEZE_ON - ratio) / (SQUEEZE_ON - SQUEEZE_FULL), 0.0, 1.0))
+
+    # --- Donchian ------------------------------------------------------------
+    if n >= DONCH_P + 1:
+        hh = pd.Series(h).rolling(DONCH_P).max()
+        ll = pd.Series(l).rolling(DONCH_P).min()
+        rng = float(hh.iloc[-1] - ll.iloc[-1])
+        if rng > 0 and c[-1] > 0:
+            out["donchian_width"] = _pct_rank((hh - ll) / pd.Series(c))
+            out["donchian_position"] = float((c[-1] - ll.iloc[-1]) / rng)
+        # breakout vs the PRIOR bar's channel (current bar excluded so a new
+        # extreme registers as penetration), measured in ATRs
+        prior_hh, prior_ll = float(hh.iloc[-2]), float(ll.iloc[-2])
+        if atr_last is not None and np.isfinite(prior_hh) and np.isfinite(prior_ll):
+            out["donchian_breakout_up"] = max(0.0, float((c[-1] - prior_hh) / atr_last))
+            out["donchian_breakout_down"] = max(0.0, float((prior_ll - c[-1]) / atr_last))
+
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Per-timeframe feature computation                                            #
 # --------------------------------------------------------------------------- #
 def compute_tf_features(rs: pd.DataFrame) -> dict:
@@ -268,7 +414,7 @@ def compute_tf_features(rs: pd.DataFrame) -> dict:
     adx, pdi, mdi = _adx_di(h, l, c)
     dist_vwap, vwap_slope = _vwap_roll(c, v)
 
-    return {
+    feats = {
         "dist_to_vwap": dist_vwap,
         "vwap_slope": vwap_slope,
         "range_position": _range_position(h, l, c),
@@ -283,11 +429,14 @@ def compute_tf_features(rs: pd.DataFrame) -> dict:
         "cvd_persistence": _cvd_slope(sv, v),
         "tick_two_sided": _tick_two_sided(tick),
     }
+    feats.update(_channel_features(h, l, c))
+    return feats
 
 
 NATIVE_KEYS = ["dist_to_vwap", "vwap_slope", "range_position", "realized_vol",
                "rv_expansion", "adx_strength", "di_spread", "ema_slope", "rsi",
-               "bb_compression", "trend_cleanliness", "cvd_persistence", "tick_two_sided"]
+               "bb_compression", "trend_cleanliness", "cvd_persistence",
+               "tick_two_sided"] + CHANNEL_KEYS
 
 
 def build_mtf_input(raw: RawBars, snapshot: dict) -> MTFInput:
