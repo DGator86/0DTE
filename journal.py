@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS evaluations (
 );
 CREATE INDEX IF NOT EXISTS ix_session ON evaluations(session_date);
 CREATE INDEX IF NOT EXISTS ix_settled ON evaluations(settled);
+
+CREATE TABLE IF NOT EXISTS ras_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_date TEXT, ts TEXT, position_id TEXT,
+    score REAL, ema_score REAL, action TEXT,
+    components_json TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_ras_position ON ras_evaluations(position_id);
+CREATE INDEX IF NOT EXISTS ix_ras_session ON ras_evaluations(session_date);
 """
 
 
@@ -112,6 +121,54 @@ class Journal:
         cur = self.conn.execute(sql, [row[c] for c in COLUMNS])
         self.conn.commit()
         return cur.lastrowid
+
+    def log_ras(self, ts: str, session_date: str, ras) -> int:
+        """
+        Record one Regime Alignment Score evaluation for an open position.
+        `ras` is a regime_alignment.RASResult (duck-typed: position_id, score,
+        ema_score, action, components with name/raw/weight/contribution/note).
+        Full component breakdown is stored so every score move is explainable
+        after the fact — the observability contract of paper-trading RAS.
+        """
+        components = [
+            {"name": c.name, "raw": c.raw, "weight": c.weight,
+             "contribution": c.contribution, "note": c.note}
+            for c in (ras.components or [])
+        ]
+        cur = self.conn.execute(
+            "INSERT INTO ras_evaluations "
+            "(session_date, ts, position_id, score, ema_score, action, components_json) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (session_date, ts, ras.position_id, ras.score, ras.ema_score,
+             ras.action, json.dumps(components)),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_ras(self, position_id: Optional[str] = None,
+                  session_date: Optional[str] = None) -> list[dict]:
+        """RAS evaluation history, optionally filtered by position or session.
+        components_json is decoded into a `components` list per row."""
+        sql = "SELECT * FROM ras_evaluations"
+        clauses, args = [], []
+        if position_id:
+            clauses.append("position_id=?")
+            args.append(position_id)
+        if session_date:
+            clauses.append("session_date=?")
+            args.append(session_date)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["components"] = json.loads(row.pop("components_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                row["components"] = []
+            out.append(row)
+        return out
 
     # ---- settle ----
     def settle_session(self, session_date: str, settle_price: float) -> int:

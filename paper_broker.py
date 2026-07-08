@@ -329,7 +329,9 @@ class PaperBroker:
             "equity_at_entry": round(self.cash, 2),
             "entry_snapshot": (entry_snapshot_to_dict(entry_snapshot)
                                if entry_snapshot is not None else None),
-            "ras_at_entry": 0.0,
+            # Filled from the first RAS evaluation after entry (RAS needs a
+            # registered position context, so it cannot exist at open time).
+            "ras_at_entry": None,
         }
 
         pos = PaperPosition(
@@ -371,6 +373,8 @@ class PaperBroker:
             ras = next((r for r in ras_list if r.position_id == pos.id), None)
             if ras is not None:
                 action = self.position_monitor.evaluate(ras)
+                if pos.entry_ctx.get("ras_at_entry") is None:
+                    pos.entry_ctx["ras_at_entry"] = ras.score
                 pos.entry_ctx["ras_score"] = ras.score
                 pos.entry_ctx["ras_action"] = ras.action
                 pos.entry_ctx["ras_ema_score"] = ras.ema_score
