@@ -80,6 +80,19 @@ CREATE TABLE IF NOT EXISTS ras_evaluations (
 );
 CREATE INDEX IF NOT EXISTS ix_ras_position ON ras_evaluations(position_id);
 CREATE INDEX IF NOT EXISTS ix_ras_session ON ras_evaluations(session_date);
+
+CREATE TABLE IF NOT EXISTS validation_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_date TEXT NOT NULL,
+    report_type TEXT NOT NULL,           -- 'daily' | 'weekly' | 'feature_impact'
+    generated_at TEXT,
+    metrics_json TEXT,                   -- all key metrics (JSON)
+    summary TEXT,                        -- human-readable summary
+    flags_json TEXT,                     -- alerts / degradation flags (JSON list)
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_vr_date ON validation_reports(report_date);
+CREATE INDEX IF NOT EXISTS ix_vr_type ON validation_reports(report_type);
 """
 
 
@@ -167,6 +180,63 @@ class Journal:
                 row["components"] = json.loads(row.pop("components_json") or "[]")
             except (json.JSONDecodeError, TypeError):
                 row["components"] = []
+            out.append(row)
+        return out
+
+    # ---- validation reports -------------------------------------------------
+    # Persistent record of the scheduled validation pipeline (daily/weekly)
+    # and the feature-impact workflow. One row per generated report; metrics
+    # and flags are flexible JSON so new metrics never need a migration.
+    def log_validation_report(self, report_date: str, report_type: str,
+                              metrics: dict, summary: str,
+                              flags: Optional[list] = None,
+                              notes: Optional[str] = None) -> int:
+        """
+        Persist one validation report.
+          report_date  — session/report date, YYYY-MM-DD
+          report_type  — 'daily' | 'weekly' | 'feature_impact'
+          metrics      — dict of all key metrics (JSON-serialized)
+          summary      — human-readable summary text
+          flags        — list of alert/degradation flags (each a dict or str)
+          notes        — optional freeform notes
+        """
+        cur = self.conn.execute(
+            "INSERT INTO validation_reports "
+            "(report_date, report_type, generated_at, metrics_json, summary, "
+            "flags_json, notes) VALUES (?,?,?,?,?,?,?)",
+            (report_date, report_type,
+             dt.datetime.now(dt.timezone.utc).isoformat(),
+             json.dumps(metrics or {}), summary,
+             json.dumps(flags or []), notes),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_validation_reports(self, report_type: Optional[str] = None,
+                                 limit: int = 50,
+                                 since: Optional[str] = None) -> list[dict]:
+        """Validation report history, newest first. metrics_json/flags_json are
+        decoded into `metrics` / `flags` per row."""
+        sql = "SELECT * FROM validation_reports"
+        clauses, args = [], []
+        if report_type:
+            clauses.append("report_type=?")
+            args.append(report_type)
+        if since:
+            clauses.append("report_date>=?")
+            args.append(since)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY report_date DESC, id DESC LIMIT ?"
+        args.append(limit)
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            for src, dest in (("metrics_json", "metrics"), ("flags_json", "flags")):
+                try:
+                    row[dest] = json.loads(row.pop(src) or "null") or ({} if dest == "metrics" else [])
+                except (json.JSONDecodeError, TypeError):
+                    row[dest] = {} if dest == "metrics" else []
             out.append(row)
         return out
 
