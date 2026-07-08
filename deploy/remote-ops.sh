@@ -83,6 +83,16 @@ case "$CMD" in
     as_svc "$PY" "$APP/shadow_runner.py" --settle "$ARG" --db "$DB"
     ;;
 
+  validate)
+    # Run the validation pipeline on demand (ARG: daily | weekly; default daily).
+    # Same run the scheduled timers perform; the report lands in
+    # validation_reports and shows up in the dashboard's Validation tab.
+    mode="${ARG:-daily}"
+    case "$mode" in daily|weekly) ;; *) echo "validate arg must be 'daily' or 'weekly'"; exit 2 ;; esac
+    as_svc "$PY" "$APP/validation_pipeline.py" --mode "$mode" \
+        --db "$DB" --record-dir /var/lib/zerodte/ticks
+    ;;
+
   test-notify)
     # Send a test push through the SAME ntfy path real trade signals use, reading
     # the topic from the 0600 env file (as root). The topic is never printed —
@@ -111,7 +121,7 @@ PYEOF
 
   *)
     echo "Unknown command: $CMD" >&2
-    echo "Valid: status | logs | report | paper-report | diagnose-tradier | diagnose-tastytrade | restart | settle | test-notify" >&2
+    echo "Valid: status | logs | report | paper-report | diagnose-tradier | diagnose-tastytrade | restart | settle | validate | test-notify" >&2
     exit 2
     ;;
 esac

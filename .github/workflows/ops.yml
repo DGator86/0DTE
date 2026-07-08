@@ -7,7 +7,7 @@ name: VPS Ops
 # the result in the job log.
 #
 # Commands (see deploy/remote-ops.sh): status, logs, report,
-# diagnose-tradier, diagnose-tastytrade, restart, settle.
+# diagnose-tradier, diagnose-tastytrade, restart, settle, validate.
 # Everything is read/observe except `restart` and `settle`; nothing places an
 # order (the service is shadow-mode only).
 
@@ -28,9 +28,10 @@ on:
           - diagnose-tastytrade
           - restart
           - settle
+          - validate
           - test-notify
       arg:
-        description: "Optional arg: log line count, a symbol for diagnose, or YYYY-MM-DD for settle"
+        description: "Optional arg: log line count, a symbol for diagnose, YYYY-MM-DD for settle, or daily/weekly for validate"
         required: false
         default: ""
 
