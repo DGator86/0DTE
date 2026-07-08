@@ -161,7 +161,29 @@ class MatrixRow:
     scores: dict          # tf -> 0..100 or None
 
 
-def build_matrix(inp: MTFInput, scale_book=None) -> list[MatrixRow]:
+# --------------------------------------------------------------------------- #
+# Feature toggles (the feature-impact workflow's ON/OFF switch)                #
+# --------------------------------------------------------------------------- #
+# Names in this set are excluded from the matrix AND from every _REGIME_DEF
+# blend, giving a clean controlled comparison without touching the registry.
+# Set process-wide via set_disabled_vars() (scripts/feature_impact.py does
+# this from a config's mtf.disabled_vars) or per call via the disabled_vars
+# parameter on build_matrix()/regime_rows().
+_DISABLED_VARS: frozenset[str] = frozenset()
+
+
+def set_disabled_vars(names) -> None:
+    """Disable matrix variables process-wide (None/empty re-enables all)."""
+    global _DISABLED_VARS
+    _DISABLED_VARS = frozenset(names or ())
+
+
+def get_disabled_vars() -> frozenset[str]:
+    return _DISABLED_VARS
+
+
+def build_matrix(inp: MTFInput, scale_book=None,
+                 disabled_vars: Optional[set] = None) -> list[MatrixRow]:
     """
     Build the scored matrix from inp.
 
@@ -170,9 +192,15 @@ def build_matrix(inp: MTFInput, scale_book=None) -> list[MatrixRow]:
     the fixed prior_scale for S/N variables once enough samples accumulate.
     Snapshot variables are updated once per tick (not once per TF) to avoid
     inflating the sample count.
+
+    disabled_vars: variable names to exclude (feature-impact ON/OFF testing);
+    defaults to the process-wide set from set_disabled_vars().
     """
+    off = _DISABLED_VARS if disabled_vars is None else frozenset(disabled_vars)
     rows = []
     for v in VARS:
+        if v.name in off:
+            continue
         scores = {}
         sb_updated = False   # prevent 7x updates for broadcast snapshot values
         for tf in TIMEFRAMES:
@@ -225,7 +253,12 @@ _REGIME_DEF = {
 }
 
 
-def regime_rows(rows: list[MatrixRow]) -> dict:
+def regime_rows(rows: list[MatrixRow], disabled_vars: Optional[set] = None) -> dict:
+    """Blend matrix rows into per-TF regime confidences. Disabled variables
+    (parameter, or the process-wide set) contribute nothing: rows filtered out
+    of build_matrix() are already absent, and the blend skips them explicitly
+    in case a caller passes unfiltered rows."""
+    off = _DISABLED_VARS if disabled_vars is None else frozenset(disabled_vars)
     by_name = {r.variable: r for r in rows}
     out = {}
     for regime, weights in _REGIME_DEF.items():
@@ -235,6 +268,8 @@ def regime_rows(rows: list[MatrixRow]) -> dict:
             for spec in weights:
                 vname, w, invert = spec[0], spec[1], spec[2]
                 fold = len(spec) > 3 and spec[3] == "fold"
+                if vname in off:
+                    continue
                 r = by_name.get(vname)
                 if not r:
                     continue

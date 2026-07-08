@@ -1,0 +1,14 @@
+# Variant for feature-impact comparisons: everything enabled, i.e. the
+# volatility-channel variables (Bollinger/Keltner/Donchian) participate in the
+# matrix and the compression/trend/breakout regime blends exactly as in
+# production. Compare against baseline.yaml:
+#
+#   python scripts/feature_impact.py \
+#     --feature bollinger_keltner_donchian_v1 \
+#     --baseline-config configs/baseline.yaml \
+#     --new-config configs/with_channels.yaml
+name: with_channels
+description: >
+  Default configuration with all volatility-channel matrix variables enabled
+  (production behavior). Variant side of the channel feature-impact
+  evaluation.
