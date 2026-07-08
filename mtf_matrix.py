@@ -93,6 +93,23 @@ VARS: list[MTFVar] = [
     # Order flow (NATIVE, windowed)
     MTFVar("flow", "cvd_persistence", NATIVE,  lambda x: S(x, 0.4),            S,    0.40),
     MTFVar("flow", "tick_two_sided", NATIVE,   lambda x: N(x, 600.0),          N,  600.0),
+    # Volatility channels (NATIVE; raw values from resample._channel_features,
+    # which documents all periods/thresholds). Width ranks and squeeze are
+    # already 0..1 percentiles/grades -> P(). Positions are 0..1 in-channel
+    # -> clip100. Signed rates use S(); breakouts are 0-when-inside ATR
+    # penetrations with a fixed prior so 50 = "no breakout" is deterministic
+    # for downstream threshold logic (no ScaleBook adaptation).
+    MTFVar("channel", "bb_width", NATIVE,           lambda x: P(x)),
+    MTFVar("channel", "bb_position", NATIVE,        lambda x: clip100(100 * x)),
+    MTFVar("channel", "bb_squeeze", NATIVE,         lambda x: P(x)),
+    MTFVar("channel", "bb_expansion", NATIVE,       lambda x: S(x, 0.25),      S,    0.25),
+    MTFVar("channel", "keltner_width", NATIVE,      lambda x: P(x)),
+    MTFVar("channel", "keltner_position", NATIVE,   lambda x: clip100(100 * x)),
+    MTFVar("channel", "keltner_trend_strength", NATIVE, lambda x: S(x, 0.25),  S,    0.25),
+    MTFVar("channel", "donchian_width", NATIVE,     lambda x: P(x)),
+    MTFVar("channel", "donchian_position", NATIVE,  lambda x: clip100(100 * x)),
+    MTFVar("channel", "donchian_breakout_up", NATIVE,   lambda x: S(x, 0.5)),
+    MTFVar("channel", "donchian_breakout_down", NATIVE, lambda x: S(x, 0.5)),
     # ------------------------------------------------------------------
     # OBSERVATION-ONLY signal domains (see journal.py's admission rule).
     # These rows render in the matrix and journal via signals_json, but no
@@ -178,17 +195,33 @@ def build_matrix(inp: MTFInput, scale_book=None) -> list[MatrixRow]:
 # --------------------------------------------------------------------------- #
 # Per-timeframe regime confidence (the decision rows)                          #
 # --------------------------------------------------------------------------- #
-# (variable, weight, invert) — reuse the standardized cells
+# (variable, weight, invert[, "fold"]) — reuse the standardized cells.
+# "fold" scores the magnitude of deviation from the 50-neutral (|v-50|*2),
+# for signed variables where either direction is evidence (e.g. a strong
+# Keltner ride up OR down both mean "trending").
+# Channel contributions enter at modest weights (0.6-0.8, below the
+# incumbents) to limit blast radius while they prove out:
+#   compression: TTM squeeze on + narrow Donchian range = coiling
+#   trend:       persistent ride of the Keltner upper/lower half (folded,
+#                direction-agnostic); squeeze off
+#   breakout:    Donchian penetration (either leg lifts off its 50-neutral) +
+#                Bollinger width expanding
 _REGIME_DEF = {
     "compression": [("adx_strength", 1.3, True), ("bb_compression", 1.0, False),
                     ("rv_expansion", 1.0, True), ("tick_two_sided", 0.8, False),
-                    ("gamma_sign", 1.2, False), ("channel_tightness", 1.0, False)],
+                    ("gamma_sign", 1.2, False), ("channel_tightness", 1.0, False),
+                    ("bb_squeeze", 0.8, False), ("donchian_width", 0.8, True)],
     "trend": [("adx_strength", 1.5, False), ("di_spread", 0.8, False),
               ("ema_slope", 0.8, False), ("rv_expansion", 0.8, False),
-              ("bb_compression", 1.0, True), ("trend_cleanliness", 0.8, False)],
+              ("bb_compression", 1.0, True), ("trend_cleanliness", 0.8, False),
+              ("keltner_trend_strength", 0.8, False, "fold"),
+              ("bb_squeeze", 0.6, True)],
     "breakout": [("adx_strength", 1.0, False), ("rv_expansion", 1.0, False),
                  ("tick_two_sided", 0.8, True), ("gamma_sign", 1.2, True),
-                 ("vvix_elevation", 0.8, False)],
+                 ("vvix_elevation", 0.8, False),
+                 ("donchian_breakout_up", 0.6, False),
+                 ("donchian_breakout_down", 0.6, False),
+                 ("bb_expansion", 0.8, False)],
 }
 
 
@@ -199,14 +232,21 @@ def regime_rows(rows: list[MatrixRow]) -> dict:
         tf_scores = {}
         for tf in TIMEFRAMES:
             num = den = 0.0
-            for vname, w, invert in weights:
+            for spec in weights:
+                vname, w, invert = spec[0], spec[1], spec[2]
+                fold = len(spec) > 3 and spec[3] == "fold"
                 r = by_name.get(vname)
                 if not r:
                     continue
                 val = r.scores.get(tf)
                 if val is None:
                     continue
-                vv = (100.0 - val) if invert else val
+                if fold:
+                    vv = clip100(abs(val - 50.0) * 2.0)
+                elif invert:
+                    vv = 100.0 - val
+                else:
+                    vv = val
                 num += w * vv
                 den += w
             tf_scores[tf] = round(num / den, 1) if den > 0 else None

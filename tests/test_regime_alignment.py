@@ -317,6 +317,113 @@ def test_score_deteriorates_as_regime_turns_hostile():
 
 
 # --------------------------------------------------------------------------- #
+# channel_break component (Bollinger / Keltner / Donchian deterioration)       #
+# --------------------------------------------------------------------------- #
+def _chan_std(**kw) -> dict:
+    """Standardized dict with channel features (values are 0..100 cells)."""
+    base = {
+        "flip_cushion": (60.0, 1.0),
+        "flip_proximity": (30.0, 1.0),
+        "gamma_sign": (65.0, 1.0),
+        "donchian_breakout_up": (kw.get("up", 50.0), 1.0),
+        "donchian_breakout_down": (kw.get("dn", 50.0), 1.0),
+        "keltner_position": (kw.get("kpos", 50.0), 1.0),
+        "bb_expansion": (kw.get("exp", 50.0), 1.0),
+    }
+    return base
+
+
+def _channel_component(regime, bias, structure="LCS",
+                       structure_class="directional"):
+    entry = _entry(structure=structure, structure_class=structure_class)
+    ctx = PositionContext("pc", "call", bias, entry)
+    intent = _intent(structure=structure, direction_bias=bias if bias in ("bull", "bear") else "neutral",
+                     bias_value=50.0 if bias not in ("bull", "bear") else (65.0 if bias == "bull" else 35.0))
+    ras = compute_ras(regime, intent, _market(), ctx)
+    return next(c for c in ras.components if c.name == "channel_break")
+
+
+def test_channel_break_unavailable_is_neutral():
+    comp = _channel_component(_regime(), "bull")
+    assert comp.raw == 0.0
+    assert "unavailable" in comp.note
+
+
+def test_channel_break_strong_hostile_breakout():
+    # bull position, strong downside Donchian break -> full -1.0
+    regime = _regime(standardized=_chan_std(dn=90.0))
+    comp = _channel_component(regime, "bull")
+    assert comp.raw == -1.0
+    assert "down" in comp.note
+
+
+def test_channel_break_building_breakout_warns():
+    regime = _regime(standardized=_chan_std(dn=70.0))
+    comp = _channel_component(regime, "bull")
+    assert comp.raw == -0.5
+
+
+def test_channel_break_supportive_breakout_positive():
+    regime = _regime(standardized=_chan_std(up=75.0))
+    comp = _channel_component(regime, "bull")
+    assert comp.raw == pytest.approx(0.3)
+
+
+def test_channel_break_neutral_premium_hit_either_side():
+    regime_up = _regime(standardized=_chan_std(up=90.0))
+    comp = _channel_component(regime_up, "neutral", structure="IC",
+                              structure_class="premium")
+    assert comp.raw == -1.0
+    regime_dn = _regime(standardized=_chan_std(dn=90.0))
+    comp = _channel_component(regime_dn, "neutral", structure="IC",
+                              structure_class="premium")
+    assert comp.raw == -1.0
+
+
+def test_channel_break_keltner_pin_with_expansion():
+    # bull position pinned at lower Keltner band while Bollinger expands
+    regime = _regime(standardized=_chan_std(kpos=10.0, exp=70.0))
+    comp = _channel_component(regime, "bull")
+    assert comp.raw == -0.5
+    assert "keltner" in comp.note.lower()
+    # pin without expansion stays quiet
+    regime2 = _regime(standardized=_chan_std(kpos=10.0, exp=50.0))
+    comp2 = _channel_component(regime2, "bull")
+    assert comp2.raw == 0.0
+
+
+def test_channel_break_stacks_break_and_pin():
+    regime = _regime(standardized=_chan_std(dn=90.0, kpos=5.0, exp=80.0))
+    comp = _channel_component(regime, "bull")
+    assert comp.raw == -1.0                      # clipped at the unit bound
+
+
+def test_channel_break_vol_position_likes_breaks():
+    regime = _regime(standardized=_chan_std(up=80.0))
+    comp = _channel_component(regime, "vol", structure="STG")
+    assert comp.raw == pytest.approx(0.5)
+
+
+def test_channel_break_drives_exit_action():
+    """A hostile break plus the other deteriorating components must reach the
+    tighten/exit band through the standard scoring path."""
+    cfg = RASConfig(exit_threshold=-40.0)
+    entry = _entry(structure="LCS", structure_class="directional",
+                   direction_bias="bull")
+    regime = _regime(vetoes=["catalyst:FOMC"],
+                     standardized=_chan_std(dn=95.0, kpos=5.0, exp=80.0))
+    intent = _intent(structure="LCS", direction="call",
+                     exec_regime="compression", context_regime="compression",
+                     direction_bias="bear", bias_value=30.0)
+    market = _market(net_gex=-3e9, spot=594.0, gamma_flip=600.0)
+    ctx = PositionContext("p8", "call", "bull", entry)
+    ras = compute_ras(regime, intent, market, ctx, cfg=cfg)
+    chan = next(c for c in ras.components if c.name == "channel_break")
+    assert chan.raw == -1.0
+    assert ras.action == "exit"
+
+
+# --------------------------------------------------------------------------- #
 # Journal RAS logging                                                          #
 # --------------------------------------------------------------------------- #
 def _ras_result(position_id="pos1", score=-42.0, action="warning") -> RASResult:
