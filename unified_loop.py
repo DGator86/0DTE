@@ -32,6 +32,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import logging
 import math
 import time
 from dataclasses import dataclass, field
@@ -58,6 +59,8 @@ from market_dynamics import DynamicsWindow, session_open_from_bars
 from risk_manager import RiskManager
 
 ET = ZoneInfo("America/New_York")
+
+log = logging.getLogger("unified_loop")
 
 
 # --------------------------------------------------------------------------- #
@@ -166,9 +169,25 @@ class UnifiedOrchestrator:
             try:
                 results.append(compute_ras(
                     regime_state, intent, market, ctx, cfg=cfg))
-            except Exception:
-                pass
+            except Exception as exc:
+                # Broken evaluations must be visible, not silent: an
+                # unmonitored position looks exactly like a healthy one.
+                log.warning("RAS evaluation failed for position %s: %s",
+                            ctx.position_id, exc)
         return results
+
+    def _journal_ras(self, now: dt.datetime, ras_results: list) -> None:
+        """One ras_evaluations row per open position per tick. Best-effort:
+        journaling must never break a tick."""
+        if self.journal is None or not ras_results:
+            return
+        session_date = now.astimezone(ET).date().isoformat()
+        for ras in ras_results:
+            try:
+                self.journal.log_ras(now.isoformat(), session_date, ras)
+            except Exception as exc:
+                log.warning("RAS journaling failed for position %s: %s",
+                            ras.position_id, exc)
 
     @staticmethod
     def _signals_with_ras(signals: dict, ras_results: list) -> tuple[dict, Optional[str]]:
@@ -177,8 +196,12 @@ class UnifiedOrchestrator:
                                         if isinstance(v, (int, float))})
                              if signals else None)
         merged = dict(signals)
-        for ras in ras_results:
-            merged.update(ras_to_signals(ras))
+        # Flatten only the WORST-scoring position: with several open positions
+        # the ras_* keys would otherwise overwrite each other arbitrarily, and
+        # the minimum score is the correlation-relevant health signal anyway.
+        # Full per-position detail lands in journal.ras_evaluations.
+        worst = min(ras_results, key=lambda r: r.score)
+        merged.update(ras_to_signals(worst))
         signals_json = json.dumps(
             {k: (v if isinstance(v, str) else round(v, 6))
              for k, v in merged.items()
@@ -271,6 +294,7 @@ class UnifiedOrchestrator:
 
         ras_results = self._compute_ras(
             regime_state, intent, snap.market, position_contexts)
+        self._journal_ras(now, ras_results)
         signals, signals_json = self._signals_with_ras(signals, ras_results)
 
         # ---- Stand-down: regime unstable or NT cell ----

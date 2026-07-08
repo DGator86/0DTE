@@ -5,7 +5,48 @@ Position-relative Regime Alignment Score (RAS).
 
 Consumes absolute regime output (RegimeState + TradeIntent) and evaluates
 whether the current market environment still cooperates with an open position's
-thesis. Does not re-implement regime classification.
+thesis. Does not re-implement regime classification — regime_classifier.py and
+mtf_matrix.py stay the single source of absolute regime truth; THIS module is
+the single source of position-RELATIVE alignment.
+
+Public API
+----------
+compute_regime_alignment(regime, intent, market, position_ctx, cfg) -> RASResult
+    The main entry point: score how well the environment still supports an
+    open position. (`compute_ras` is the same function; both names are kept.)
+build_entry_snapshot(regime, intent, market, structure_class, structure)
+    Freeze the regime/dealer state at trade entry into an EntrySnapshot.
+entry_snapshot_to_dict / entry_snapshot_from_dict
+    JSON-safe round-trip for persisting the snapshot in a position's entry_ctx.
+position_context_from_entry_ctx(position_id, entry_ctx) -> PositionContext
+    Rebuild the PositionContext (entry snapshot + bias + previous EMA score)
+    from a stored entry_ctx dict.
+
+Score semantics
+---------------
+Each component scorer returns a raw value in [-1, +1] plus a human-readable
+note (every RASResult carries the full breakdown for journaling):
+
+  direction_alignment   Is the matrix direction bias still with the position?
+  matrix_alignment      Has the exec/context matrix cell moved for/against it?
+  gamma_alignment       Dealer gamma surface (flip, net GEX) vs the thesis.
+  veto_escalation       New vetoes since entry that undermine this structure.
+  confidence_erosion    Has the structure-relevant regime confidence decayed?
+  regime_flip           Permitted engine / dominant regime turned hostile.
+
+The weighted mean of the components maps to a score in [-100, +100], smoothed
+by an EMA (RASConfig.ema_alpha) so one noisy tick cannot trigger an action.
+Actions from the EMA score: ok > warning (<= warning_threshold, default -30)
+> tighten (<= tighten_threshold, default -50) > exit (<= exit_threshold,
+default -70).
+
+Paper-trading safety
+--------------------
+RASConfig.exit_enabled defaults to False: an "exit" action is downgraded to
+"warning" both here and in risk_manager.PositionMonitor.evaluate. Until the
+user explicitly enables it after reviewing logged evaluations, RAS is
+observation-only — every evaluation is journaled (journal.Journal.log_ras)
+with the full component breakdown so score moves are explainable.
 
 NOT financial advice.
 """
@@ -519,6 +560,18 @@ def compute_ras(regime: RegimeState, intent: Optional[TradeIntent],
         position_id=ctx.position_id,
         ema_score=round(ema, 1),
     )
+
+
+def compute_regime_alignment(regime: RegimeState, intent: Optional[TradeIntent],
+                             market: Optional[MarketSnapshot],
+                             position_ctx: PositionContext,
+                             cfg: Optional[RASConfig] = None) -> RASResult:
+    """Public entry point for position-relative regime alignment.
+
+    Identical to compute_ras; this is the canonical documented name. See the
+    module docstring for component semantics and paper-safety behavior.
+    """
+    return compute_ras(regime, intent, market, position_ctx, cfg=cfg)
 
 
 def ras_to_signals(ras: RASResult) -> dict:

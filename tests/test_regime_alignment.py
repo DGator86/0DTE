@@ -16,9 +16,12 @@ from regime_classifier import RegimeState
 from regime_alignment import (
     EntrySnapshot,
     PositionContext,
+    RASComponent,
     RASConfig,
+    RASResult,
     build_entry_snapshot,
     compute_ras,
+    compute_regime_alignment,
     derive_position_bias,
     entry_snapshot_from_dict,
     entry_snapshot_to_dict,
@@ -230,3 +233,187 @@ def test_exit_action_suppressed_when_disabled():
     ras = compute_ras(regime, intent, market, ctx, cfg=cfg)
     assert ras.score < cfg.exit_threshold
     assert ras.action == "warning"
+
+
+def test_compute_regime_alignment_alias_matches_compute_ras():
+    """The handoff-specified public name must produce the same result."""
+    regime = _regime()
+    intent = _intent(structure="LCS", direction="call")
+    market = _market()
+    entry = build_entry_snapshot(regime, intent, market, "directional", "LCS")
+    ctx1 = PositionContext("p6", "call", "bull", entry)
+    ctx2 = PositionContext("p6", "call", "bull", entry)
+    a = compute_regime_alignment(regime, intent, market, ctx1)
+    b = compute_ras(regime, intent, market, ctx2)
+    assert a.score == b.score
+    assert a.action == b.action
+    assert [c.name for c in a.components] == [c.name for c in b.components]
+
+
+def test_score_deteriorates_as_regime_turns_hostile():
+    """Bull debit spread; the tape flips bear + short gamma across successive
+    evaluations. The EMA-fed score must fall monotonically and every
+    component must carry a non-empty note."""
+    regime0 = _regime()
+    intent0 = _intent(structure="LCS", direction="call",
+                      direction_bias="bull", bias_value=68.0)
+    market0 = _market(spot=600.0, gamma_flip=594.0, net_gex=4e9)
+    entry = build_entry_snapshot(regime0, intent0, market0, "directional", "LCS")
+    ctx = PositionContext("p7", "call", "bull", entry)
+
+    hostile_std = {"flip_proximity": (85.0, 1.0), "gamma_sign": (25.0, 1.0)}
+    stages = [
+        (regime0, intent0, market0),
+        (_regime(confidences={"trend": 55.0, "directional_confidence": 52.0,
+                              "compression": 30.0, "expansion": 25.0}),
+         _intent(structure="LCS", direction="call",
+                 exec_regime="trend", context_regime="compression",
+                 direction_bias="neutral", bias_value=50.0),
+         _market(spot=596.0, gamma_flip=595.0, net_gex=1e9)),
+        (_regime(vetoes=["below_gamma_flip"], standardized=hostile_std,
+                 confidences={"trend": 42.0, "directional_confidence": 40.0,
+                              "compression": 30.0, "expansion": 40.0}),
+         _intent(structure="LCS", direction="call",
+                 exec_regime="compression", context_regime="trend",
+                 direction_bias="bear", bias_value=35.0),
+         _market(spot=593.0, gamma_flip=596.0, net_gex=-2e9)),
+        (_regime(dominant_regime="breakout", permitted_engine="none",
+                 vetoes=["below_gamma_flip", "catalyst:CPI"],
+                 standardized=hostile_std,
+                 confidences={"trend": 28.0, "directional_confidence": 25.0,
+                              "compression": 22.0, "expansion": 60.0}),
+         _intent(structure="LCS", direction="call",
+                 exec_regime="breakout", context_regime="breakout",
+                 direction_bias="bear", bias_value=25.0),
+         _market(spot=590.0, gamma_flip=597.0, net_gex=-4e9)),
+    ]
+
+    scores = []
+    for regime, intent, market in stages:
+        ras = compute_regime_alignment(regime, intent, market, ctx)
+        scores.append(ras.score)
+        ctx.prev_ema_score = ras.ema_score
+        for c in ras.components:
+            assert c.note, f"component {c.name} has an empty note"
+    assert scores[0] > 0
+    assert all(b < a for a, b in zip(scores, scores[1:])), scores
+    assert scores[-1] < -30
+
+
+# --------------------------------------------------------------------------- #
+# Journal RAS logging                                                          #
+# --------------------------------------------------------------------------- #
+def _ras_result(position_id="pos1", score=-42.0, action="warning") -> RASResult:
+    return RASResult(
+        score=score,
+        components=[
+            RASComponent(name="direction_alignment", raw=-1.0, weight=1.5,
+                         contribution=-1.5, note="bias flipped bear"),
+            RASComponent(name="gamma_alignment", raw=-0.8, weight=1.5,
+                         contribution=-1.2, note="below flip, short gamma"),
+        ],
+        action=action, position_id=position_id, ema_score=score,
+    )
+
+
+def test_journal_log_ras_round_trip(tmp_path):
+    from journal import Journal
+    jrn = Journal(str(tmp_path / "j.sqlite"))
+    row_id = jrn.log_ras("2026-07-08T10:31:00-04:00", "2026-07-08",
+                         _ras_result())
+    assert row_id > 0
+
+    rows = jrn.fetch_ras(position_id="pos1")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["position_id"] == "pos1"
+    assert r["score"] == -42.0
+    assert r["ema_score"] == -42.0
+    assert r["action"] == "warning"
+    assert len(r["components"]) == 2
+    c = r["components"][0]
+    assert c["name"] == "direction_alignment"
+    assert c["raw"] == -1.0
+    assert c["weight"] == 1.5
+    assert c["contribution"] == -1.5
+    assert c["note"] == "bias flipped bear"
+    jrn.close()
+
+
+def test_journal_fetch_ras_filters(tmp_path):
+    from journal import Journal
+    jrn = Journal(str(tmp_path / "j.sqlite"))
+    jrn.log_ras("2026-07-08T10:31:00-04:00", "2026-07-08", _ras_result("a"))
+    jrn.log_ras("2026-07-08T10:32:00-04:00", "2026-07-08", _ras_result("b"))
+    jrn.log_ras("2026-07-09T10:31:00-04:00", "2026-07-09", _ras_result("a"))
+    assert len(jrn.fetch_ras()) == 3
+    assert len(jrn.fetch_ras(position_id="a")) == 2
+    assert len(jrn.fetch_ras(session_date="2026-07-08")) == 2
+    assert len(jrn.fetch_ras(position_id="a", session_date="2026-07-09")) == 1
+    jrn.close()
+
+
+def test_ras_table_migration_on_legacy_db(tmp_path):
+    """A journal DB created before ras_evaluations existed must gain the
+    table on reopen, not crash."""
+    import sqlite3
+    from journal import Journal
+    path = str(tmp_path / "legacy.sqlite")
+    Journal(path).close()                       # full pre-existing schema...
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE ras_evaluations")  # ...minus the new table
+    conn.commit()
+    conn.close()
+    jrn = Journal(path)
+    jrn.log_ras("2026-07-08T10:31:00-04:00", "2026-07-08", _ras_result())
+    assert len(jrn.fetch_ras()) == 1
+    jrn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Orchestrator integration: open position -> ras_evaluations rows              #
+# --------------------------------------------------------------------------- #
+def test_orchestrator_tick_journals_ras_for_open_position():
+    from journal import Journal
+    from unified_loop import UnifiedOrchestrator, SyntheticUnifiedFeed
+
+    feed = SyntheticUnifiedFeed(days=5)
+    jrn = Journal(":memory:")
+    orch = UnifiedOrchestrator(feed=feed, journal=jrn)
+    ctx = PositionContext("live-pos", "call", "bull", _entry())
+
+    start = dt.datetime(2026, 6, 27, 9, 30, tzinfo=ET)
+    n_ras_ticks = 0
+    for i in range(10):
+        result = orch.tick(start + dt.timedelta(minutes=i),
+                           position_contexts=[ctx])
+        if result is not None and result.ras_results:
+            n_ras_ticks += 1
+            ctx.prev_ema_score = result.ras_results[0].ema_score
+    assert n_ras_ticks > 0
+
+    rows = jrn.fetch_ras(position_id="live-pos")
+    assert len(rows) == n_ras_ticks
+    for r in rows:
+        assert r["session_date"] == "2026-06-27"
+        assert r["action"] in ("ok", "warning", "tighten", "exit")
+        assert isinstance(r["score"], float)
+        names = {c["name"] for c in r["components"]}
+        assert "direction_alignment" in names
+        assert "gamma_alignment" in names
+        assert all(c["note"] for c in r["components"])
+
+
+def test_signals_flatten_uses_worst_position():
+    """With several open positions, signals_json must carry the minimum
+    (worst) score instead of arbitrary key overwrites."""
+    import json as _json
+    from unified_loop import UnifiedOrchestrator
+
+    healthy = _ras_result("h", score=20.0, action="ok")
+    sick = _ras_result("s", score=-60.0, action="tighten")
+    merged, sj = UnifiedOrchestrator._signals_with_ras({}, [healthy, sick])
+    assert merged["ras_score"] == -60.0
+    decoded = _json.loads(sj)
+    assert decoded["ras_score"] == -60.0
+    assert decoded["ras_action"] == 2   # tighten
