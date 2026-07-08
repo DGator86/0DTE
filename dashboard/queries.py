@@ -29,7 +29,8 @@ def journal_fetch(db_path: str, session_date: Optional[str] = None,
         out = []
         for r in reversed(rows):
             d = dict(r)
-            for key in ("gate_failed", "veto_reasons", "short_strikes", "long_strikes", "legs_json"):
+            for key in ("gate_failed", "veto_reasons", "short_strikes", "long_strikes",
+                        "legs_json", "signals_json"):
                 if d.get(key) and isinstance(d[key], str):
                     try:
                         d[key] = json.loads(d[key])

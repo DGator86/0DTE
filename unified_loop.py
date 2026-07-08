@@ -292,6 +292,16 @@ class UnifiedOrchestrator:
         regimes = regime_rows(mat_rows)
         intent = decide_from_matrix(mat_rows, regimes, vetoes=regime_state.vetoes)
 
+        # Observation-only regime time series for the dashboard (chart shading
+        # + quadrant view): the continuous direction-bias value (0-100, 50 =
+        # neutral) and the dominant regime's confidence. Journaled in
+        # signals_json so no schema change and zero gate/veto power.
+        if isinstance(intent.bias_value, (int, float)) and math.isfinite(intent.bias_value):
+            signals["regime_bias_value"] = float(intent.bias_value)
+        dom_conf = regime_state.confidences.get(regime_state.dominant_regime)
+        if isinstance(dom_conf, (int, float)) and math.isfinite(dom_conf):
+            signals["regime_dominant_conf"] = float(dom_conf)
+
         ras_results = self._compute_ras(
             regime_state, intent, snap.market, position_contexts)
         self._journal_ras(now, ras_results)

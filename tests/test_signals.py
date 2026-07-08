@@ -283,3 +283,6 @@ def test_end_to_end_signals_reach_journal_and_matrix():
     assert "expected_move_consumed" in sig
     assert "flip_velocity" in sig
     assert "wall_rupture" in sig
+    # observation-only regime time series for the dashboard visualizations
+    assert 0.0 <= sig["regime_bias_value"] <= 100.0
+    assert 0.0 <= sig["regime_dominant_conf"] <= 100.0
