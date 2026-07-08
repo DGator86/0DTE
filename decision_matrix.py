@@ -175,6 +175,9 @@ def _dominant(blend: dict) -> tuple:
 
 
 def _direction_bias(rows: list, tfs_fast, tfs_slow) -> tuple:
+    """Return (label, blended, fast, slow). The blend drives entries; the raw
+    fast composite is exposed separately because it leads the blend at intraday
+    turns (the slow side is session-anchored and structurally late)."""
     by = {r.variable: r for r in rows}
     def composite(tfs):
         vals = []
@@ -190,7 +193,7 @@ def _direction_bias(rows: list, tfs_fast, tfs_slow) -> tuple:
     slow = composite(tfs_slow)
     bias = 0.4 * fast + 0.6 * slow            # context-weighted
     label = "bull" if bias >= 58 else ("bear" if bias <= 42 else "neutral")
-    return label, round(bias, 1)
+    return label, round(bias, 1), round(fast, 1), round(slow, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -206,6 +209,11 @@ class TradeIntent:
     size_mult: float
     vetoes: list
     note: str
+    # Raw fast (1m/5m/15m) and slow (1h/4h/1d) direction composites behind
+    # bias_value. Exit logic (RAS) keys off bias_fast because the 60%-slow
+    # blend cannot warn during the first leg of an intraday reversal.
+    bias_fast: Optional[float] = None
+    bias_slow: Optional[float] = None
 
 
 def decide_from_matrix(rows: list, regimes: dict,
@@ -215,7 +223,7 @@ def decide_from_matrix(rows: list, regimes: dict,
     slow_blend = _regime_blend(regimes, SLOW)
     exec_r, _ = _dominant(fast_blend)
     ctx_r, _ = _dominant(slow_blend)
-    dir_label, dir_val = _direction_bias(rows, FAST, SLOW)
+    dir_label, dir_val, dir_fast, dir_slow = _direction_bias(rows, FAST, SLOW)
 
     # insufficient history on a basket => regime undefined => stand down cleanly
     if exec_r == "none" or ctx_r == "none":
@@ -227,6 +235,7 @@ def decide_from_matrix(rows: list, regimes: dict,
                               "stand down", "—"),
             size_mult=0.0, vetoes=vetoes,
             note="insufficient history: a timeframe basket had no computable regime",
+            bias_fast=dir_fast, bias_slow=dir_slow,
         )
 
     decision = DECISION_TABLE[(exec_r, ctx_r, dir_label)]
@@ -262,6 +271,7 @@ def decide_from_matrix(rows: list, regimes: dict,
         exec_regime=exec_r, context_regime=ctx_r,
         direction_bias=dir_label, bias_value=dir_val,
         decision=decision, size_mult=round(size, 2), vetoes=vetoes, note=note,
+        bias_fast=dir_fast, bias_slow=dir_slow,
     )
 
 

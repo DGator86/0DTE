@@ -72,9 +72,12 @@ def serialize_tick_result(
         "size_mult": intent.size_mult,
         "final_size_mult": result.final_size_mult,
         # continuous direction bias (0-100, 50 = neutral) + its label, for the
-        # four-way quadrant and regime shading on the chart
+        # four-way quadrant and regime shading on the chart; bias_fast is the
+        # raw fast-timeframe composite (leads the blend at intraday turns)
         "direction_bias": intent.direction_bias,
         "bias_value": intent.bias_value,
+        "bias_fast": getattr(intent, "bias_fast", None),
+        "bias_slow": getattr(intent, "bias_slow", None),
     }
 
     if dec is not None:

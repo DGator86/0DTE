@@ -749,7 +749,20 @@
       ctx.fill();
     });
 
-    // current-state dot
+    // fast-composite marker: hollow ring at the raw fast (1m/5m/15m) bias.
+    // When it sits far to one side of the solid dot, the short timeframes are
+    // leading the blend — the V-turn signature.
+    const fastRaw = num(doing.bias_fast);
+    const fastBias = fastRaw != null ? Math.max(-1, Math.min(1, (fastRaw - 50) / 50)) : null;
+    if (fastBias != null) {
+      ctx.strokeStyle = "#ffb648";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(px(fastBias), py(gamma), 4.5, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // current-state dot (blended bias — what entries actually use)
     const dotX = px(bias), dotY = py(gamma);
     ctx.fillStyle = "#4aa8ff";
     ctx.strokeStyle = "#e6edf7";
@@ -765,7 +778,8 @@
       const side = bias > 0.12 ? "bull" : bias < -0.12 ? "bear" : "neutral";
       const gq = gamma > 0.12 ? "favorable γ" : gamma < -0.12 ? "hostile γ" : "flat γ";
       const vtxt = vix != null ? ` · VIX ${vix.toFixed(1)}` : "";
-      lbl.textContent = `${side} · ${gq}${vtxt}`;
+      const ftxt = fastRaw != null ? ` · fast ${fastRaw.toFixed(0)}` : "";
+      lbl.textContent = `${side} · ${gq}${vtxt}${ftxt}`;
     }
   }
 

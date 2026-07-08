@@ -90,6 +90,8 @@ def _intent(**kw) -> TradeIntent:
         size_mult=1.0,
         vetoes=list(kw.get("vetoes", [])),
         note="",
+        bias_fast=kw.get("bias_fast"),
+        bias_slow=kw.get("bias_slow"),
     )
 
 
@@ -314,6 +316,68 @@ def test_score_deteriorates_as_regime_turns_hostile():
     assert scores[0] > 0
     assert all(b < a for a, b in zip(scores, scores[1:])), scores
     assert scores[-1] < -30
+
+
+# --------------------------------------------------------------------------- #
+# fast_momentum component (turn-detection channel)                             #
+# --------------------------------------------------------------------------- #
+def _comp(ras: RASResult, name: str):
+    return next((c for c in ras.components if c.name == name), None)
+
+
+def test_fast_momentum_skipped_when_intent_predates_bias_fast():
+    """Intents without bias_fast (legacy journal rows, old tests) must produce
+    the exact pre-existing component set — no dilution of the score."""
+    ctx = PositionContext("f0", "call", "bull", _entry())
+    ras = compute_ras(_regime(), _intent(), _market(), ctx)
+    assert _comp(ras, "fast_momentum") is None
+    assert len(ras.components) == 6
+
+
+def test_fast_momentum_warns_before_blend_flips():
+    """The V-turn scenario from live trading: blend still bullish (60% slow),
+    fast composite already bearish. The component must go hostile NOW."""
+    ctx = PositionContext("f1", "call", "bull", _entry())
+    intent = _intent(direction_bias="bull", bias_value=61.0, bias_fast=28.0)
+    ras = compute_ras(_regime(), intent, _market(), ctx)
+    comp = _comp(ras, "fast_momentum")
+    assert comp is not None
+    assert comp.raw < -0.8                     # (28-50)/25 = -0.88
+    assert "fast composite 28" in comp.note
+
+    # sanity: direction_alignment is still fully aligned on the same tick —
+    # fast_momentum is the ONLY component that can see the turn this early
+    assert _comp(ras, "direction_alignment").raw == 1.0
+
+
+def test_fast_momentum_asymmetric_upside_cap():
+    """Quick to cut, slow to add: a screaming-hot fast read must not be able
+    to mask deterioration elsewhere (capped at +0.5), while a hostile read
+    keeps the full -1.0 range."""
+    ctx = PositionContext("f2", "call", "bull", _entry())
+    hot = compute_ras(_regime(), _intent(bias_fast=95.0), _market(), ctx)
+    assert _comp(hot, "fast_momentum").raw == 0.5
+    cold = compute_ras(_regime(), _intent(bias_fast=5.0), _market(), ctx)
+    assert _comp(cold, "fast_momentum").raw == -1.0
+
+
+def test_fast_momentum_premium_threatened_by_either_direction():
+    """Neutral premium position: strong fast momentum in ANY direction
+    threatens the range; small drift inside the deadband is ignored."""
+    entry = _entry(structure="IC", structure_class="premium",
+                   direction_bias="neutral", bias_value=50.0)
+    ctx = PositionContext("f3", "both", "neutral", entry)
+    calm = compute_ras(_regime(), _intent(bias_fast=55.0), _market(), ctx)
+    assert _comp(calm, "fast_momentum").raw == 0.0
+    hot = compute_ras(_regime(), _intent(bias_fast=85.0), _market(), ctx)
+    assert _comp(hot, "fast_momentum").raw < -0.5
+
+
+def test_fast_momentum_bear_position_mirrors():
+    ctx = PositionContext("f4", "put", "bear", _entry(direction_bias="bear"))
+    ras = compute_ras(_regime(), _intent(direction_bias="bear",
+                                         bias_fast=75.0), _market(), ctx)
+    assert _comp(ras, "fast_momentum").raw == -1.0
 
 
 # --------------------------------------------------------------------------- #
