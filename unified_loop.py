@@ -57,6 +57,7 @@ from regime_alignment import (
 from journal import Journal
 from market_dynamics import DynamicsWindow, session_open_from_bars
 from risk_manager import RiskManager
+from volatility_channel_features import channel_features_from_bars
 
 ET = ZoneInfo("America/New_York")
 
@@ -275,8 +276,18 @@ class UnifiedOrchestrator:
         snap_dict.update(signals)
         # signals_json finalized after RAS merge below
 
+        # ---- Volatility channels (Bollinger / Keltner / Donchian) ----
+        # One classifier-TF computation per tick, shared by the classifier
+        # (ctx.channel), RAS (via RegimeState.standardized), and the journal
+        # (chan_* keys in signals_json for component_correlations).
+        channel = channel_features_from_bars(snap.bars)
+        for k, v in channel.items():
+            if isinstance(v, (int, float)) and math.isfinite(v):
+                signals[f"chan_{k}"] = float(v)
+
         # ---- Track B: regime classifier ----
-        clf_ctx = ClassifierContext(market=snap.market, rnd=rnd, edge=edge)
+        clf_ctx = ClassifierContext(market=snap.market, rnd=rnd, edge=edge,
+                                    channel=channel)
         regime_state = self._classifier.classify(clf_ctx, self._prev_std)
         self._prev_std = regime_state.standardized
 
