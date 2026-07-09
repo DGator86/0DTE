@@ -247,6 +247,56 @@ def test_unified_loop_journals_routing_provenance():
 
 
 # --------------------------------------------------------------------------- #
+# premium-veto thresholds: dead-zone alignment + calibratable knobs            #
+# --------------------------------------------------------------------------- #
+def test_classifier_trending_threshold_matches_the_gate():
+    """One fact, one threshold: the classifier's trending veto must default to
+    the premium gate's max_adx, or the 20-25 dead zone (credit routed into a
+    guaranteed TRENDING gate fail) comes back."""
+    from regime_classifier import ClassifierConfig
+    assert ClassifierConfig().adx_no_premium == GateConfig().max_adx
+
+
+def test_dead_zone_adx_now_emits_trending_veto():
+    from regime_classifier import ClassifierConfig, ClassifierContext, _vetoes
+    ctx = ClassifierContext(market=_snap(adx=22.0))     # the former dead zone
+    names = [r for r, _ in _vetoes(ctx, ClassifierConfig())]
+    assert "trending" in names
+    # and it is calibratable back up without code edits
+    names_hi = [r for r, _ in _vetoes(ctx, ClassifierConfig(adx_no_premium=25.0))]
+    assert "trending" not in names_hi
+
+
+def test_term_backwardation_ratio_is_calibratable():
+    from regime_classifier import ClassifierConfig, ClassifierContext, _vetoes
+    flat = ClassifierContext(market=_snap(vix=16.0, vix3m=16.2))
+    names = [r for r, _ in _vetoes(flat, ClassifierConfig())]
+    assert "term_backwardation" not in names            # default: plain inversion
+    inverted = ClassifierContext(market=_snap(vix=16.3, vix3m=16.2))
+    names = [r for r, _ in _vetoes(inverted, ClassifierConfig())]
+    assert "term_backwardation" in names
+    # tightened: even near-inversion forbids premium
+    names = [r for r, _ in _vetoes(flat, ClassifierConfig(term_backwardation_ratio=0.98))]
+    assert "term_backwardation" in names
+
+
+def test_trending_veto_flips_credit_to_debit_not_dead():
+    """A trending tape must convert a routed credit cell into its debit cousin
+    (take what the market gives) instead of a guaranteed gate NO_TRADE."""
+    from decision_matrix import NO_PREMIUM_VETOES, PREMIUM_STRUCTURES, decide_from_matrix
+    from mtf_matrix import build_matrix, demo_input, regime_rows
+
+    assert "trending" in NO_PREMIUM_VETOES
+    rows = build_matrix(demo_input())
+    regimes = regime_rows(rows)
+    intent = decide_from_matrix(rows, regimes, vetoes=["trending"])
+    assert intent.decision.structure not in PREMIUM_STRUCTURES
+    if intent.decision.structure != "NT":
+        assert "premium veto" in intent.note
+        assert "trending" in intent.note                # attribution for the funnel
+
+
+# --------------------------------------------------------------------------- #
 # vocabulary sync with the source of truth                                     #
 # --------------------------------------------------------------------------- #
 def test_funnel_vocabulary_matches_selector_and_matrix():

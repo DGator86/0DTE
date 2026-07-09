@@ -151,10 +151,15 @@ CH_TRIM = 0.75                # trim when a breakout opposes the trade
 # regime_classifier._vetoes (the one wired into the live loop) emits
 # "short_gamma_regime"/"below_gamma_flip". Matching only one set silently
 # disabled the credit->debit flip below for the live path.
+# "trending" (classifier, ADX >= adx_no_premium) belongs here for the same
+# reason: the premium gate hard-fails TRENDING at the same threshold, so a
+# credit cell routed under it was a guaranteed NO_TRADE — flipping to the
+# debit cousin takes what the trending tape is actually giving.
 NO_PREMIUM_VETOES = {
     "short_gamma", "short_gamma_regime",
     "below_flip", "below_gamma_flip",
     "term_backwardation",
+    "trending",
 }
 
 
@@ -302,19 +307,20 @@ def decide_from_matrix(rows: list, regimes: dict,
         note = "catalyst veto: all engines blocked"
     elif no_premium and decision.structure in PREMIUM_STRUCTURES:
         # flip a credit structure to its directional debit cousin or stand down
+        matched = ",".join(sorted(v for v in vetoes if v in NO_PREMIUM_VETOES))
         flip = {"PCS": "LCS", "CCS": "LPS", "IC": "NT", "IF": "NT"}[decision.structure]
         if flip == "NT":
             decision = Decision("NT", "none", "NONE",
-                                "premium forbidden (short gamma) and no clean direction",
+                                "premium forbidden and no clean direction",
                                 "stand down", "—")
             size = 0.0
         else:
             d = "call" if flip == "LCS" else "put"
             decision = Decision(flip, d, "LOW",
-                                "premium forbidden by dealer state; express bias as debit",
+                                "premium forbidden by dealer/tape state; express bias as debit",
                                 "small directional spread in bias direction", decision.anchor_tf)
             size = SIZE["LOW"]
-        note = "premium veto: short-gamma/below-flip forces directional or stand-down"
+        note = f"premium veto ({matched}): forces directional or stand-down"
 
     # channel-based conviction adjustment (post-table, post-veto): fast-TF
     # squeeze/breakout cells nudge size, never resurrect a vetoed trade
