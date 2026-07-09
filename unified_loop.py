@@ -193,8 +193,9 @@ class UnifiedOrchestrator:
     @staticmethod
     def _signals_with_ras(signals: dict, ras_results: list) -> tuple[dict, Optional[str]]:
         if not ras_results:
-            return signals, (json.dumps({k: round(v, 6) for k, v in signals.items()
-                                        if isinstance(v, (int, float))})
+            return signals, (json.dumps({k: (v if isinstance(v, str) else round(v, 6))
+                                        for k, v in signals.items()
+                                        if isinstance(v, (int, float, str))})
                              if signals else None)
         merged = dict(signals)
         # Flatten only the WORST-scoring position: with several open positions
@@ -312,6 +313,17 @@ class UnifiedOrchestrator:
         dom_conf = regime_state.confidences.get(regime_state.dominant_regime)
         if isinstance(dom_conf, (int, float)) and math.isfinite(dom_conf):
             signals["regime_dominant_conf"] = float(dom_conf)
+
+        # Routing provenance for journal.decision_funnel(): what Track B
+        # actually routed, whether a dealer veto flipped a credit cell to its
+        # debit cousin, and which regime vetoes were active. Without this the
+        # journal only sees the FINAL family, so a forced LCS is
+        # indistinguishable from a trend-cell LCS — exactly the distinction
+        # needed to answer "why is premium not trading?".
+        signals["routed_structure"] = intent.decision.structure
+        signals["premium_flip"] = 1.0 if "premium veto" in intent.note else 0.0
+        if regime_state.vetoes:
+            signals["regime_vetoes"] = ",".join(regime_state.vetoes)
 
         ras_results = self._compute_ras(
             regime_state, intent, snap.market, position_contexts)

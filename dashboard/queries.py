@@ -188,6 +188,7 @@ def report_summary(db_path: str) -> dict:
             "gate_effectiveness": jrn.gate_effectiveness(),
             "component_correlations": jrn.component_correlations(),
             "calibration": jrn.calibration(),
+            "decision_funnel": jrn.decision_funnel(),
             "unsettled_dates": jrn.unsettled_dates(),
         }
     finally:

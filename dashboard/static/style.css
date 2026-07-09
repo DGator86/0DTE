@@ -478,6 +478,41 @@ html, body {
   border: 1px solid var(--amber-dim);
 }
 
+/* ---------------- Decision funnel ---------------- */
+#funnel-panel .metrics { margin-bottom: 10px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.fn-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.fn-col { background: var(--panel); padding: 10px 12px; }
+.fn-title {
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 8px;
+}
+.fn-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.fn-row .lbl {
+  flex: 0 0 46%;
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fn-row .track { flex: 1; height: 5px; background: var(--bg-2); border-radius: 999px; overflow: hidden; }
+.fn-row .track > span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, #2b6fae, var(--blue)); }
+.fn-row.credit .track > span { background: linear-gradient(90deg, var(--green-dim), var(--green)); }
+.fn-row.warn .track > span { background: linear-gradient(90deg, var(--amber-dim), var(--amber)); }
+.fn-row .num { width: 44px; text-align: right; font-family: var(--mono); font-size: 11px; }
+.fn-empty { font-size: 11px; color: var(--muted); }
+
 .rc-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
