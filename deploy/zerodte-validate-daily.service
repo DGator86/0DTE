@@ -1,0 +1,29 @@
+[Unit]
+# Daily validation: short walk-forward over recent shadow recordings + journal
+# health metrics, persisted to validation_reports (Validation dashboard tab).
+# Pushes an ntfy alert when metrics degrade beyond thresholds.
+Description=0DTE daily validation report (post-close health check)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zerodte
+Group=zerodte
+WorkingDirectory=/opt/zerodte
+EnvironmentFile=/etc/zerodte/zerodte.env
+ExecStart=/opt/zerodte/venv/bin/python /opt/zerodte/validation_pipeline.py \
+    --mode daily \
+    --db /var/lib/zerodte/shadow.db \
+    --record-dir /var/lib/zerodte/ticks \
+    --notify
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zerodte
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-validate-daily

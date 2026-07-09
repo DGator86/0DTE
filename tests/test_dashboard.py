@@ -172,6 +172,58 @@ def test_journal_fetch_decodes_signals_json(tmp_path):
     assert sig["regime_dominant_conf"] == 71.0
 
 
+def test_api_validation_reports(monkeypatch, tmp_path):
+    """/api/validation serves report history (filterable) and /api/validation/{id}
+    the full decoded metrics; both degrade gracefully on legacy/missing DBs."""
+    from journal import Journal
+
+    monkeypatch.setenv("DASHBOARD_TOKEN", "test-secret-token")
+    db = str(tmp_path / "shadow.db")
+    jrn = Journal(db)
+    daily_id = jrn.log_validation_report(
+        "2026-07-08", "daily", {"journal": {"win_rate": 0.6}},
+        "Daily validation — healthy",
+        flags=[{"flag": "insufficient_data", "severity": "info", "detail": "x"}])
+    jrn.log_validation_report(
+        "2026-07-06", "weekly", {"per_regime": {}}, "Weekly validation — ok")
+    jrn.close()
+    _configure(db, str(tmp_path / "paper.sqlite"), str(tmp_path / "live.json"))
+
+    c = TestClient(app)
+    hdrs = {"Authorization": "Bearer test-secret-token"}
+
+    # unauthenticated -> 401
+    assert c.get("/api/validation").status_code == 401
+
+    r = c.get("/api/validation", headers=hdrs)
+    assert r.status_code == 200
+    reports = r.json()["reports"]
+    assert len(reports) == 2
+    assert reports[0]["report_type"] == "daily"     # newest first
+    assert reports[0]["metrics"]["journal"]["win_rate"] == 0.6
+    assert reports[0]["flags"][0]["flag"] == "insufficient_data"
+
+    # type filter
+    r = c.get("/api/validation?report_type=weekly", headers=hdrs)
+    assert [x["report_type"] for x in r.json()["reports"]] == ["weekly"]
+
+    # invalid type rejected
+    assert c.get("/api/validation?report_type=bogus", headers=hdrs).status_code == 422
+
+    # single report
+    r = c.get(f"/api/validation/{daily_id}", headers=hdrs)
+    assert r.status_code == 200
+    assert r.json()["summary"] == "Daily validation — healthy"
+    assert c.get("/api/validation/9999", headers=hdrs).status_code == 404
+
+    # missing DB degrades gracefully
+    _configure(str(tmp_path / "absent.db"), str(tmp_path / "p.sqlite"),
+               str(tmp_path / "live.json"))
+    r = c.get("/api/validation", headers=hdrs)
+    assert r.status_code == 200
+    assert r.json()["reports"] == []
+
+
 def test_api_ras_history(monkeypatch, tmp_path):
     """/api/ras serves the per-position RAS timeline with full components."""
     from journal import Journal
