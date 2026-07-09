@@ -234,6 +234,7 @@ class CoupledSyntheticFeed:
             spot=spot, net_gex=g, gamma_flip=float(self._flip[i]),
             call_wall=pin + 5.0, put_wall=pin - 5.0,
             gex_pct_rank=self._gex_rank.rank(g),
+            gex_rank_warm=self._gex_rank.is_warm,
             vix9d=iv_pts * (1.06 if trending else 0.94),
             vix=iv_pts,
             vix3m=iv_pts * (0.95 if trending else 1.12),
