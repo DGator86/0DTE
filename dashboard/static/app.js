@@ -530,6 +530,77 @@
     ].join("");
   }
 
+  /* ---------------- decision funnel ---------------- */
+  const CREDIT_KEYS = new Set([
+    "put_credit", "call_credit", "iron_condor", "iron_fly", "broken_wing",
+    "PCS", "CCS", "IC", "IF",
+  ]);
+  function fnHistCol(title, obj, { creditTint = false, warnKeys = null, fmtRow = null } = {}) {
+    const entries = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    const rows = entries.length
+      ? (() => {
+          const max = entries[0][1] || 1;
+          return entries.map(([k, v]) => {
+            const cls = creditTint && CREDIT_KEYS.has(k) ? "credit"
+              : (warnKeys && warnKeys.has(k) ? "warn" : "");
+            const label = fmtRow ? fmtRow(k) : k;
+            return `<div class="fn-row ${cls}">
+              <span class="lbl" title="${esc(k)}">${esc(label)}</span>
+              <span class="track"><span style="width:${Math.max(4, (v / max) * 100)}%"></span></span>
+              <span class="num">${v}</span>
+            </div>`;
+          }).join("");
+        })()
+      : '<div class="fn-empty">none</div>';
+    return `<div class="fn-col"><div class="fn-title">${esc(title)}</div>${rows}</div>`;
+  }
+  function renderFunnel(report) {
+    const f = report && report.decision_funnel;
+    if (!f || !f.n) {
+      $("funnel-sub").textContent = "—";
+      $("funnel-metrics").innerHTML = "";
+      $("funnel-hists").innerHTML = '<p class="empty">No funnel data yet</p>';
+      return;
+    }
+    $("funnel-sub").textContent = `${f.n} ticks · ${f.sessions} session${f.sessions === 1 ? "" : "s"}`;
+
+    const cm = f.class_mix || {};
+    const credit = cm.credit || {}, debit = cm.debit || {}, stand = cm.stand_down || {};
+    const flips = (f.premium_flips || {}).n;
+    const gex = f.gex_rank || {};
+    const warmFrac = gex.frac_at_warmup_neutral;
+    $("funnel-metrics").innerHTML = [
+      metricCard("Credit routed · traded", `${credit.n || 0} · ${credit.traded || 0}`,
+        (credit.traded || 0) > 0 ? "pos" : "warn"),
+      metricCard("Debit routed · traded", `${debit.n || 0} · ${debit.traded || 0}`),
+      metricCard("Stand-down ticks", `${stand.n || 0}`),
+      metricCard("Credit→debit flips", flips != null ? String(flips) : "—",
+        num(flips) > 0 ? "warn" : ""),
+      metricCard("GEX rank in warm-up", warmFrac != null ? pct(warmFrac) : "—",
+        num(warmFrac) > 0.2 ? "warn" : ""),
+      metricCard("GEX rank < gate floor", gex.frac_below_gate_floor != null
+        ? `${pct(gex.frac_below_gate_floor)} of ticks` : "—"),
+    ].join("");
+
+    const mixCounts = Object.fromEntries(
+      Object.entries(f.structure_mix || {}).map(([k, s]) => [k, (s && s.n) || 0]));
+    $("funnel-hists").innerHTML = [
+      fnHistCol("Routed by regime (Track B)", f.routed_structures, { creditTint: true }),
+      fnHistCol("Final structure · traded/total", mixCounts, {
+        creditTint: true,
+        fmtRow: (k) => {
+          const s = (f.structure_mix || {})[k] || {};
+          return `${k} ${s.traded || 0}/${s.n || 0}`;
+        },
+      }),
+      fnHistCol("Which layer said no", f.no_trade_reasons),
+      fnHistCol("Gate failures", f.gate_failures,
+        { warnKeys: new Set(["GEX_WEAK", "TRENDING"]) }),
+      fnHistCol("Dealer vetoes", f.regime_vetoes),
+      fnHistCol("Selector vetoes", f.selector_vetoes),
+    ].join("");
+  }
+
   /* ---------------- live-readiness checklist ---------------- */
   function fmtNum(x) {
     return Number.isInteger(x) ? String(x) : fmt(x, 3);
@@ -1519,6 +1590,7 @@
       }
       renderPaper(paper);
       renderEdge(report);
+      renderFunnel(report);
       renderPredict(report);
       renderReadiness(readiness);
       renderTimeline(history);

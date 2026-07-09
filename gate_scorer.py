@@ -81,6 +81,15 @@ class MarketSnapshot:
     has_catalyst: bool             # FOMC/CPI/PCE/NFP/mega-cap earnings in the danger window
     catalyst_label: str = ""
 
+    # Whether the |GEX| percentile window behind gex_pct_rank has enough
+    # samples to hold a real opinion (gex_window.GexRankWindow.is_warm).
+    # During warm-up the window reports a neutral 0.5, which sits BELOW the
+    # gate's min_gex_pct_rank floor — without this flag, "no data yet" reads
+    # as GEX_WEAK and suppresses every premium entry for days after a deploy
+    # for no market reason. Default True preserves behavior for callers that
+    # set gex_pct_rank explicitly (tests, synthetic harnesses).
+    gex_rank_warm: bool = True
+
     # --- OBSERVATION-ONLY orthogonal signals (NaN = source unavailable) ---
     # Options-flow lite, from the same chain snapshot the RND already uses:
     pcr_volume: float = float("nan")        # put volume / call volume (0DTE chain)
@@ -229,10 +238,13 @@ def evaluate_gates(s: MarketSnapshot, cfg: GateConfig) -> list[str]:
     """Return list of failed-gate reasons. Empty list => all gates pass."""
     failed: list[str] = []
 
-    # 1. Long-gamma regime: net GEX positive AND meaningfully large
+    # 1. Long-gamma regime: net GEX positive AND meaningfully large.
+    # The magnitude check only applies once the rank window is warm: an
+    # unwarmed window reports a neutral 0.5 ("no opinion"), and no-opinion
+    # must not veto — the sign check above still protects the short-gamma case.
     if s.net_gex <= 0:
         failed.append("GEX_SHORT: net gamma <= 0 (dealers short gamma; moves amplify)")
-    elif s.gex_pct_rank < cfg.min_gex_pct_rank:
+    elif s.gex_rank_warm and s.gex_pct_rank < cfg.min_gex_pct_rank:
         failed.append(
             f"GEX_WEAK: |GEX| rank {s.gex_pct_rank:.2f} < {cfg.min_gex_pct_rank:.2f} "
             "(positive but too thin to pin)"
@@ -299,8 +311,10 @@ def score_setup(s: MarketSnapshot, cfg: GateConfig) -> dict[str, float]:
     """Per-component scores (already weighted). Sum = total 0..100."""
     sub: dict[str, float] = {}
 
-    # GEX magnitude: percentile rank above the gate floor, ramped to 1.0
-    gex_q = _scale(s.gex_pct_rank, cfg.min_gex_pct_rank, 1.0)
+    # GEX magnitude: percentile rank above the gate floor, ramped to 1.0.
+    # An unwarmed rank window has no opinion — score it mid, not zero, so
+    # warm-up doesn't silently zero the largest score weight.
+    gex_q = _scale(s.gex_pct_rank, cfg.min_gex_pct_rank, 1.0) if s.gex_rank_warm else 0.5
     sub["gex_magnitude"] = cfg.w_gex_magnitude * gex_q
 
     # Distance above flip: more cushion = safer, saturating ~1.5% above

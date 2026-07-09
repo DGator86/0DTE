@@ -45,6 +45,13 @@ class GexRankWindow:
         self._load()
 
     # -- public ---------------------------------------------------------------
+    @property
+    def is_warm(self) -> bool:
+        """True once the window has enough samples to hold a real opinion.
+        Below min_samples, rank() returns the neutral 0.5 sentinel — consumers
+        (the premium gate) must treat that as "no opinion", not as a value."""
+        return len(self._entries) >= self.min_samples
+
     def rank(self, net_gex: float, now_epoch: Optional[float] = None) -> float:
         """Record this print and return the percentile rank of |net_gex|."""
         # Re-read before appending: failover means several feed instances share

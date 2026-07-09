@@ -29,7 +29,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from gate_scorer import MarketSnapshot
+from gate_scorer import GateConfig, MarketSnapshot
 from rnd_extractor import RiskNeutralDensity, EdgeReport
 from volatility_channel_features import donchian_breakout_strength
 
@@ -311,9 +311,11 @@ SUPPORT_REGIMES = ["dealer_stability", "volatility_confidence"]
 ALL_ENGINES = {"premium_selling", "directional", "vol_expansion"}
 
 
-def _vetoes(ctx: ClassifierContext) -> list[tuple]:
+def _vetoes(ctx: ClassifierContext,
+            cfg: Optional["ClassifierConfig"] = None) -> list[tuple]:
     """Return (reason, blocked_engines). Catalyst is a true hard stop; the rest
     block premium selling but PERMIT directional / vol-expansion engines."""
+    cfg = cfg or ClassifierConfig()
     m = ctx.market
     v = []
     if m.has_catalyst:
@@ -322,9 +324,9 @@ def _vetoes(ctx: ClassifierContext) -> list[tuple]:
         v.append(("short_gamma_regime", {"premium_selling"}))
     if m.spot < m.gamma_flip:
         v.append(("below_gamma_flip", {"premium_selling"}))
-    if m.vix >= m.vix3m:
+    if m.vix >= m.vix3m * cfg.term_backwardation_ratio:
         v.append(("term_backwardation", {"premium_selling"}))
-    if m.adx >= 25:
+    if m.adx >= cfg.adx_no_premium:
         v.append(("trending", {"premium_selling"}))
     return v
 
@@ -363,6 +365,20 @@ class ClassifierConfig:
     ig_stand_down: float = 70.0        # global IG above this => regime unstable, stand down
     update_scales: bool = True
 
+    # -- premium-selling veto thresholds (journal-calibratable) --
+    # "A trend is present" is ONE fact, but it used to be measured with TWO
+    # thresholds: the premium gate kills at ADX >= GateConfig.max_adx (20)
+    # while this veto was hardcoded at 25. In the 20-25 dead zone the matrix
+    # kept routing credit cells straight into a guaranteed TRENDING gate fail
+    # instead of flipping them to their debit cousins. Default to the gate's
+    # own threshold so routing and gating agree; calibrate them TOGETHER from
+    # the journal, never separately.
+    adx_no_premium: float = GateConfig.max_adx
+    # Backwardation veto fires when vix >= vix3m * ratio. 1.0 is the plain
+    # inversion test (unchanged default); tune from decision_funnel() data if
+    # marginal inversions prove sellable (or dangerous even in mild contango).
+    term_backwardation_ratio: float = 1.0
+
 
 @dataclass
 class RegimeClassifier:
@@ -399,7 +415,7 @@ class RegimeClassifier:
             self._update_scales(ctx)
 
         std = self._standardize(ctx)
-        vetoes = _vetoes(ctx)
+        vetoes = _vetoes(ctx, self.cfg)
         blocked_engines = set()
         for _, eng in vetoes:
             blocked_engines |= eng
