@@ -4,6 +4,11 @@ decision_matrix.py
 Turns the multi-timeframe matrix (mtf_matrix.py) into a concrete trade intent:
 direction, structure family, strike rule, conviction/size, and invalidation.
 
+Prediction Engine V2 / PR 10: this module remains the LegacyMatrixPolicy
+backend (policy/legacy_matrix.py). Live promotion to PredictionPolicy is a
+PolicyRouter mode pointer — do not delete this table during the transition
+(docs/PREDICTION_ENGINE_V2_HANDOFF.md §17).
+
 Three decision axes, collapsed from the matrix:
   EXECUTION regime = blend of fast TFs (1m/5m/15m) -- what's harvestable NOW
   CONTEXT  regime  = blend of slow TFs (1h/4h/1d)  -- the bigger move / the threat

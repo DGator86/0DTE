@@ -7,6 +7,11 @@ The pure composition layer. Given a MarketSnapshot + ChainSnapshot, run:
                                 -> GateScorer        (whether to trade at all)
     -> TradeDecision
 
+Prediction Engine V2 / PR 10: structure/direction arrive from PolicyRouter
+(legacy matrix or PredictionPolicy). This module does not choose regime —
+it only enumerates and gates candidates for the routed family
+(docs/PREDICTION_ENGINE_V2_HANDOFF.md §17).
+
 No I/O, no clock, no DB -- entirely a function of its inputs, so it is
 backtestable and unit-testable in isolation. The orchestrator handles feed,
 timing, and journaling.
