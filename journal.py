@@ -41,12 +41,17 @@ COLUMNS = [
     "signals_json",         # JSON dict of observation-only signals (see below)
 ]
 
-# Optional provenance columns (Prediction Engine V2, PR 3): present in the
-# schema and stored when the caller supplies them, but NOT required of every
-# row producer — legacy callers and older recordings keep working untouched.
-# snapshot_id links an evaluation to prediction.storage.feature_snapshots /
-# prediction_outputs rows (transitional audit linkage, spec §20.3).
-OPTIONAL_COLUMNS = ["snapshot_id"]
+# Optional provenance columns (Prediction Engine V2):
+#   snapshot_id (PR 3) — links evaluations to feature_snapshots / prediction_outputs
+#   execution_json / credit_expected / credit_conservative (PR 6) — executable
+#     entry economics; mid `credit` remains the diagnostic. Settlement fills
+#     realized_pnl_expected / realized_pnl_conservative when these are present.
+OPTIONAL_COLUMNS = [
+    "snapshot_id",
+    "execution_json",
+    "credit_expected",
+    "credit_conservative",
+]
 
 # signals_json is the admission channel for NEW signal domains (dealer
 # dynamics, options flow, breadth, ...). A candidate signal is journaled here
@@ -55,7 +60,10 @@ OPTIONAL_COLUMNS = ["snapshot_id"]
 # it earn a matrix weight or veto. Flexible JSON so adding a signal never
 # requires a schema migration.
 
-_SETTLE_COLUMNS = ["settle_price", "realized_pnl", "ev_error", "settled"]
+_SETTLE_COLUMNS = [
+    "settle_price", "realized_pnl", "ev_error",
+    "realized_pnl_expected", "realized_pnl_conservative", "settled",
+]
 
 # --------------------------------------------------------------------------- #
 # Structure vocabulary for decision_funnel().                                  #
@@ -86,7 +94,8 @@ def _coltype(col: str) -> str:
     if col in ("session_date", "ts", "gex_regime", "selected_family",
                "short_strikes", "long_strikes", "legs_json",
                "gate_failed", "veto_reasons", "decision", "no_trade_reason",
-               "regime_direction", "signals_json", "snapshot_id"):
+               "regime_direction", "signals_json", "snapshot_id",
+               "execution_json"):
         return "TEXT"
     if col in ("gate_pass", "was_traded", "candidate_present"):
         return "INTEGER"
@@ -98,6 +107,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     {", ".join(c + " " + _coltype(c) for c in COLUMNS + OPTIONAL_COLUMNS)},
     settle_price REAL, realized_pnl REAL, ev_error REAL,
+    realized_pnl_expected REAL, realized_pnl_conservative REAL,
     settled INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_session ON evaluations(session_date);
@@ -200,6 +210,18 @@ def realized_pnl(legs: list[dict], credit: float, settle_price: float) -> float:
     return total
 
 
+def economic_pnl(row: dict) -> Optional[float]:
+    """
+    Primary V2 economic P&L for a settled row (§13.5): prefer net expected-fill
+    settlement when present, else fall back to midpoint realized_pnl.
+    """
+    for key in ("realized_pnl_expected", "realized_pnl"):
+        v = row.get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
+
+
 @dataclass
 class Journal:
     db_path: str = "zerodte_journal.sqlite"
@@ -214,6 +236,19 @@ class Journal:
             self.conn.execute("ALTER TABLE evaluations ADD COLUMN signals_json TEXT")
         if "snapshot_id" not in cols:
             self.conn.execute("ALTER TABLE evaluations ADD COLUMN snapshot_id TEXT")
+        if "execution_json" not in cols:
+            self.conn.execute("ALTER TABLE evaluations ADD COLUMN execution_json TEXT")
+        if "credit_expected" not in cols:
+            self.conn.execute("ALTER TABLE evaluations ADD COLUMN credit_expected REAL")
+        if "credit_conservative" not in cols:
+            self.conn.execute(
+                "ALTER TABLE evaluations ADD COLUMN credit_conservative REAL")
+        if "realized_pnl_expected" not in cols:
+            self.conn.execute(
+                "ALTER TABLE evaluations ADD COLUMN realized_pnl_expected REAL")
+        if "realized_pnl_conservative" not in cols:
+            self.conn.execute(
+                "ALTER TABLE evaluations ADD COLUMN realized_pnl_conservative REAL")
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_snapshot ON evaluations(snapshot_id)")
         self.conn.commit()
@@ -505,25 +540,53 @@ class Journal:
         Fill settlement for every unsettled row of the session. Realized P&L is
         computed for ALL candidates that have a structure stored -- the
         hypothetical outcome of no-trades is exactly what makes the gate
-        measurable. Returns count settled.
+        measurable.
+
+        Midpoint `realized_pnl` is always filled (diagnostic). When the row
+        carries PR 6 executable credits, `realized_pnl_expected` and
+        `realized_pnl_conservative` are filled too — those are the primary
+        V2 economic metrics (§13.5). Returns count settled.
         """
         rows = self.conn.execute(
-            "SELECT id, legs_json, credit, ev FROM evaluations "
+            "SELECT id, legs_json, credit, credit_expected, credit_conservative, "
+            "execution_json, ev FROM evaluations "
             "WHERE session_date=? AND settled=0",
             (session_date,),
         ).fetchall()
         n = 0
         for r in rows:
             legs = json.loads(r["legs_json"]) if r["legs_json"] else []
+            pnl = pnl_exp = pnl_con = ev_err = None
             if legs:
-                pnl = realized_pnl(legs, r["credit"], settle_price)
-                ev_err = pnl - r["ev"] if r["ev"] is not None else None
-            else:
-                pnl, ev_err = None, None
+                credit = r["credit"]
+                if credit is not None:
+                    pnl = realized_pnl(legs, credit, settle_price)
+                    ev_err = (pnl - r["ev"]) if r["ev"] is not None else None
+                # Executable settlement: apply entry credit + entry fees already
+                # netted into credit_expected; subtract expected exit drag from
+                # the stored execution panel when present.
+                exec_ = {}
+                if r["execution_json"]:
+                    try:
+                        exec_ = json.loads(r["execution_json"]) or {}
+                    except (json.JSONDecodeError, TypeError):
+                        exec_ = {}
+                exit_drag = float(exec_.get("exit_slippage_expected") or 0.0) + float(
+                    exec_.get("exit_fees_expected") or 0.0)
+                if r["credit_expected"] is not None:
+                    pnl_exp = (realized_pnl(legs, r["credit_expected"], settle_price)
+                               - exit_drag)
+                if r["credit_conservative"] is not None:
+                    # Conservative exit: use stop-exit slippage when available.
+                    stop_drag = float(exec_.get("exit_slippage_stop") or 0.0) + float(
+                        exec_.get("exit_fees_expected") or 0.0)
+                    pnl_con = (realized_pnl(legs, r["credit_conservative"],
+                                            settle_price) - stop_drag)
             self.conn.execute(
-                "UPDATE evaluations SET settle_price=?, realized_pnl=?, ev_error=?, settled=1 "
+                "UPDATE evaluations SET settle_price=?, realized_pnl=?, ev_error=?, "
+                "realized_pnl_expected=?, realized_pnl_conservative=?, settled=1 "
                 "WHERE id=?",
-                (settle_price, pnl, ev_err, r["id"]),
+                (settle_price, pnl, ev_err, pnl_exp, pnl_con, r["id"]),
             )
             n += 1
         self.conn.commit()

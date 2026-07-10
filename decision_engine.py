@@ -111,6 +111,16 @@ class TradeDecision:
             "candidate_present": 1 if c else 0,
             "regime_direction": self.direction,
             "signals_json": None,     # observation-only signals; unified_loop fills it
+            # PR 6 executable economics (optional; journal stores when present)
+            "execution_json": (json.dumps(c.execution)
+                               if c is not None and getattr(c, "execution", None)
+                               else None),
+            "credit_expected": (c.execution.get("net_expected_credit")
+                                if c is not None and getattr(c, "execution", None)
+                                else None),
+            "credit_conservative": (c.execution.get("net_conservative_credit")
+                                    if c is not None and getattr(c, "execution", None)
+                                    else None),
         }
 
 

@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from journal import Journal
+from journal import Journal, economic_pnl
 from unified_loop import UnifiedOrchestrator, TickSnapshot
 from decision_engine import EngineConfig
 from regime_classifier import ClassifierConfig
@@ -42,11 +42,16 @@ ET = ZoneInfo("America/New_York")
 # Metrics helpers                                                               #
 # --------------------------------------------------------------------------- #
 def _daily_pnl(rows: list[dict]) -> dict[str, float]:
+    """Session-date -> sum of primary economic P&L on traded rows (§13.5)."""
     by_date: dict[str, float] = {}
     for r in rows:
-        if r["was_traded"] == 1 and r["realized_pnl"] is not None:
-            d = r["session_date"]
-            by_date[d] = by_date.get(d, 0.0) + r["realized_pnl"]
+        if r["was_traded"] != 1:
+            continue
+        pnl = economic_pnl(r)
+        if pnl is None:
+            continue
+        d = r["session_date"]
+        by_date[d] = by_date.get(d, 0.0) + pnl
     return by_date
 
 
@@ -243,8 +248,8 @@ def run_backtest(
         if with_cand else 0.0
     )
 
-    # -- P&L --
-    pnls = [r["realized_pnl"] for r in traded if r["realized_pnl"] is not None]
+    # -- P&L (primary = net expected-fill when present, else mid; §13.5) --
+    pnls = [p for r in traded if (p := economic_pnl(r)) is not None]
     total_pnl = round(sum(pnls), 6) if pnls else 0.0
     mean_pnl = round(sum(pnls) / len(pnls), 6) if pnls else None
     win_rate = round(sum(1 for p in pnls if p > 0) / len(pnls), 4) if pnls else None
@@ -254,7 +259,7 @@ def run_backtest(
     sharpe = _sharpe(daily)
     mdd = _max_drawdown(daily)
 
-    # -- EV accuracy --
+    # -- EV accuracy (still vs mid realized_pnl: EV is mid-priced by default) --
     ev_pairs = [(r["ev"], r["realized_pnl"])
                 for r in traded
                 if r["ev"] is not None and r["realized_pnl"] is not None]
