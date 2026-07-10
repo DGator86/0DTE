@@ -139,6 +139,13 @@ class UnifiedOrchestrator:
     # candidate or gate result — callers must not close that loop.
     physical_forecast: Optional[object] = None
     physical_forecast_provider: Optional[Callable] = None
+    # Candidate-value shadow ranker (Prediction Engine V2, PR 8 / §14).
+    # When set, every tick with a chain runs V2 utility ranking on the
+    # evaluated candidate set, journals diagnostics into signals_json, and
+    # optionally persists candidate snapshots. Legacy `decision.candidate`
+    # remains authoritative until RankerConfig.mode == "champion".
+    candidate_value_model: Optional[object] = None
+    candidate_ranker_cfg: Optional[object] = None
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
@@ -642,6 +649,84 @@ class UnifiedOrchestrator:
             if (decision.candidate is not None
                     and isinstance(decision.candidate.ev, (int, float))):
                 signals["phys_live_ev"] = decision.candidate.ev
+
+            # ---- V2 candidate-value shadow ranking (PR 8 / §14) ----
+            # Observation-only: never replaces decision.candidate / TRADE.
+            if self.candidate_value_model is not None:
+                try:
+                    from prediction.candidate_ranker import (
+                        RankerConfig, run_shadow_ranking,
+                    )
+                    from spread_selector import select_spreads, GammaContext
+                    from rnd_extractor import extract_rnd, compute_edge
+
+                    rcfg = self.candidate_ranker_cfg or RankerConfig()
+                    shadow_cands = list(decision.all_candidates or [])
+                    # §14.4: also generate outside the routed family for research
+                    if getattr(rcfg, "shadow_all_families", True):
+                        try:
+                            rnd_s = extract_rnd(snap.chain, cfg.rnd)
+                            edge_s = compute_edge(
+                                rnd_s, snap.chain, cfg.rnd,
+                                physical_pdf=decide_pdf)
+                            ctx_s = GammaContext.from_market_snapshot(
+                                snap.market)
+                            sel_s = select_spreads(
+                                snap.chain, rnd_s, edge_s, ctx_s, cfg.selector,
+                                physical_pdf=decide_pdf, target_families=None)
+                            shadow_cands = list(
+                                sel_s.all_candidates or sel_s.ranked or [])
+                        except Exception as exc:
+                            log.warning("shadow candidate gen failed: %s", exc)
+                    if shadow_cands:
+                        mkt = snap.market
+                        minutes_left = None
+                        try:
+                            # Prefer market helper if present
+                            minutes_left = getattr(
+                                mkt, "minutes_to_close", None)
+                        except Exception:
+                            minutes_left = None
+                        ranking = run_shadow_ranking(
+                            shadow_cands,
+                            self.candidate_value_model,
+                            snapshot_id=snapshot_id,
+                            spot=float(mkt.spot),
+                            call_wall=float(mkt.call_wall),
+                            put_wall=float(mkt.put_wall),
+                            gamma_flip=float(mkt.gamma_flip),
+                            minutes_to_close=minutes_left,
+                            net_gex=float(mkt.net_gex),
+                            cfg=rcfg,
+                            store=self.prediction_store,
+                        )
+                        signals.update(ranking.signals())
+                        # Annotate the live (legacy) candidate with V2 utility
+                        # when it appears in the shadow set — observation only.
+                        if decision.candidate is not None:
+                            live_id = None
+                            for c in shadow_cands:
+                                if (c.family == decision.candidate.family
+                                        and c.short_strikes
+                                        == decision.candidate.short_strikes
+                                        and c.long_strikes
+                                        == decision.candidate.long_strikes):
+                                    live_id = getattr(
+                                        c, "_v2_candidate_id", None)
+                                    break
+                            if live_id and live_id in ranking.forecasts:
+                                fc = ranking.forecasts[live_id]
+                                decision = dataclasses.replace(
+                                    decision,
+                                    candidate=dataclasses.replace(
+                                        decision.candidate,
+                                        v2_utility_score=fc.utility_score,
+                                        v2_candidate_id=live_id,
+                                    ),
+                                )
+                except Exception as exc:
+                    log.warning("V2 candidate shadow ranking failed: %s", exc)
+
             # Re-finalize signals_json after density provenance is attached.
             signals, signals_json = self._signals_with_ras(signals, ras_results)
             # ---- Risk gate (optional, applied before journaling) ----

@@ -270,8 +270,10 @@ class PredictionStore:
         self.conn.commit()
 
     def fetch_candidates(self, snapshot_id: Optional[str] = None) -> list[dict]:
-        sql = ("SELECT s.*, o.settled, o.settlement_price, o.pnl_mid, o.mfe, "
-               "o.mae, o.target_hit, o.stop_hit, o.first_event, o.outcome_json "
+        sql = ("SELECT s.*, o.settled, o.settlement_price, o.pnl_mid, "
+               "o.pnl_expected_fill, o.pnl_conservative, o.pnl_policy, "
+               "o.mfe, o.mae, o.target_hit, o.stop_hit, o.first_event, "
+               "o.outcome_json "
                "FROM candidate_snapshots s "
                "LEFT JOIN candidate_outcomes o USING (candidate_id)")
         args: list = []

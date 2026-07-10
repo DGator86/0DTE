@@ -19,6 +19,8 @@ Currently implemented (PR 4 — probabilistic baselines):
                      probabilities; optional path-sim features (PR 7).
   range_survival   — calibrated wall-channel / short-strike / breakeven
                      survival by horizon (PR 7).
+  candidate_value  — multi-head expected net P&L / P(profit) / downside
+                     quantile model for candidate ranking (PR 8).
 
 No deep learning by design: the number of independent market sessions is far
 smaller than the number of tick rows.

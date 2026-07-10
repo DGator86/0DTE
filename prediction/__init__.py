@@ -36,6 +36,10 @@ Currently implemented:
               and range events (PR 7).
   models/barrier_touch, models/range_survival — calibrated elastic-net
               barrier-touch and range-survival probabilities (PR 7).
+  models/candidate_value — multi-head candidate net-P&L / P(profit) /
+              downside-quantile model (PR 8).
+  candidate_dataset — snapshot-grouped training frames and folds (PR 8).
+  candidate_ranker — expected-utility ranking + shadow vs legacy (PR 8).
 """
 # Note: execution_cost.py lives at the repo root (alongside spread_selector)
 # because it is shared by the selector, journal, labels, and paper fill
