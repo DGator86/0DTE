@@ -31,6 +31,11 @@ Currently implemented:
               PredictionBundle / PhysicalForecast: center, scale, shift,
               uncertainty-blend toward RND; replaces the circular
               dir_drift_frac tilt (PR 5).
+  path_model — residual block-bootstrap path simulator preserving
+              contiguous return blocks; scores target/stop, walls, flip,
+              and range events (PR 7).
+  models/barrier_touch, models/range_survival — calibrated elastic-net
+              barrier-touch and range-survival probabilities (PR 7).
 """
 # Note: execution_cost.py lives at the repo root (alongside spread_selector)
 # because it is shared by the selector, journal, labels, and paper fill
