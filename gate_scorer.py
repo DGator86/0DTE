@@ -54,6 +54,10 @@ class MarketSnapshot:
     call_wall: float               # strike of largest positive call gamma (resistance)
     put_wall: float                # strike of largest positive put gamma (support)
     gex_pct_rank: float            # 0..1 percentile of |net_gex| vs trailing window (adaptive)
+    # NOTE (Prediction Engine V2 / PR 9): these GEX fields are the OI-only
+    # baseline from the live feed. Parallel variants (weekly / volume / hybrid)
+    # are journaled under signals_json as gex_* keys and must NOT replace these
+    # fields until a variant passes promotion criteria.
 
     # --- volatility pricing ---
     vix9d: float

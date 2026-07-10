@@ -59,6 +59,15 @@ OPTIONAL_COLUMNS = [
 # and the recorded walk-forward show it predicts realized P&L. Only then does
 # it earn a matrix weight or veto. Flexible JSON so adding a signal never
 # requires a schema migration.
+#
+# Prediction Engine V2 / PR 9 GEX variant keys (observation-only, §16.3):
+#   gex_oi_*, gex_weekly_*, gex_volume_*, gex_hybrid_*
+#     (net_gex, gamma_flip, call_wall, put_wall, gex_concentration,
+#      wall_concentration, quality_score, assumption, ...)
+#   gex_disagree_flip_spread, gex_disagree_wall_call, gex_disagree_wall_put,
+#   gex_disagree_sign, gex_disagree_net_gex_range, gex_disagree_n_variants
+#   gex_authoritative, gex_feed_source
+# Policy continues to use evaluations.net_gex / call_wall / put_wall (OI).
 
 _SETTLE_COLUMNS = [
     "settle_price", "realized_pnl", "ev_error",
@@ -838,6 +847,73 @@ class Journal:
                      if isinstance(s.get(k), (int, float))]
             if len(pairs) >= 3:
                 out[f"sig:{k}"] = corr([p for p, _ in pairs], [p for _, p in pairs])
+        return out
+
+    def gex_variant_comparison(self, session_date: Optional[str] = None) -> dict:
+        """
+        PR 9 / §16.4 — compare journaled GEX variant signals vs realized P&L
+        and vs each other. Observation-only readout; does not change policy.
+        """
+        rows = self.fetch(session_date=session_date, settled_only=True)
+        rows = [r for r in rows if r.get("realized_pnl") is not None]
+        if len(rows) < 3:
+            return {"n": len(rows), "note": "need >=3 settled rows"}
+
+        def _sig(r):
+            try:
+                s = json.loads(r["signals_json"]) if r.get("signals_json") else {}
+            except (json.JSONDecodeError, TypeError):
+                s = {}
+            return s if isinstance(s, dict) else {}
+
+        sigs = [_sig(r) for r in rows]
+        y = [r["realized_pnl"] for r in rows]
+
+        def corr(xs, ys):
+            n = len(xs)
+            if n < 3:
+                return None
+            mx, my = sum(xs) / n, sum(ys) / n
+            cov = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+            vx = sum((a - mx) ** 2 for a in xs)
+            vy = sum((b - my) ** 2 for b in ys)
+            return round(cov / (vx * vy) ** 0.5, 3) if vx > 0 and vy > 0 else None
+
+        variants = ("oi", "weekly", "volume", "hybrid")
+        out: dict = {"n": len(rows), "variants": {}}
+        for v in variants:
+            key = f"gex_{v}_net_gex"
+            pairs = [(s[key], yy) for s, yy in zip(sigs, y)
+                     if isinstance(s.get(key), (int, float))]
+            panel = {
+                "n": len(pairs),
+                "corr_vs_pnl": corr([p for p, _ in pairs],
+                                    [p for _, p in pairs]) if pairs else None,
+            }
+            # disagreement rate when this variant's sign differs from OI
+            if v != "oi":
+                disagree = 0
+                n_cmp = 0
+                for s in sigs:
+                    a, b = s.get("gex_oi_net_gex"), s.get(key)
+                    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                        n_cmp += 1
+                        if (a > 0) != (b > 0):
+                            disagree += 1
+                panel["sign_disagree_vs_oi"] = (
+                    round(disagree / n_cmp, 3) if n_cmp else None)
+            out["variants"][v] = panel
+
+        # Aggregate disagreement feature vs PnL
+        dkey = "gex_disagree_sign"
+        dpairs = [(s[dkey], yy) for s, yy in zip(sigs, y)
+                  if isinstance(s.get(dkey), (int, float))]
+        out["disagree_sign_corr_vs_pnl"] = (
+            corr([p for p, _ in dpairs], [p for _, p in dpairs])
+            if dpairs else None)
+        out["disagree_sign_rate"] = (
+            round(sum(p for p, _ in dpairs) / len(dpairs), 3)
+            if dpairs else None)
         return out
 
     # ---- predictive-power readouts -------------------------------------------
