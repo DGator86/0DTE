@@ -10,6 +10,8 @@ Per tick:
   2. Track B — resample bars -> build_matrix -> regime_classifier.classify ->
      decide_from_matrix. Produces a TradeIntent (structure family, conviction,
      size_mult) and a RegimeState (dominant_regime, permitted_engine, stand_down).
+     Prediction Engine V2 / PR 10: PolicyRouter also runs LegacyMatrixPolicy +
+     PredictionPolicy in shadow (legacy authoritative until mode=champion).
   3. Combine — if regime stands down, or TradeIntent is NT, log a NO_TRADE row
      and return. Otherwise run Track A decide() for a concrete SpreadCandidate.
   4. Size — final_size_mult = intent.size_mult. Track A's gate and selector
@@ -145,6 +147,16 @@ class UnifiedOrchestrator:
     # candidate or gate result — callers must not close that loop.
     physical_forecast: Optional[object] = None
     physical_forecast_provider: Optional[Callable] = None
+    # Prediction policy / regime consolidation (PR 10 / §17). Promotion is
+    # this single pointer: legacy | shadow | champion. Shadow (default) keeps
+    # the matrix authoritative while journaling V2 disagreement.
+    policy_mode: str = "shadow"
+    policy_router_cfg: Optional[object] = None
+    # Optional PredictionBundle for PredictionPolicy. Prefer a dedicated
+    # provider so physical_forecast can stay a PhysicalForecast. Callable
+    # signature: (snap, signals, intent, regime_state) -> PredictionBundle|None.
+    prediction_bundle: Optional[object] = None
+    prediction_bundle_provider: Optional[Callable] = None
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
@@ -342,6 +354,84 @@ class UnifiedOrchestrator:
                 return None
         log.warning("unsupported physical_forecast type: %s", type(raw).__name__)
         return None
+
+    def _resolve_prediction_bundle(self, snap, signals: dict, intent,
+                                   regime_state) -> Optional[object]:
+        """
+        Resolve a PredictionBundle for PredictionPolicy (PR 10).
+
+        Order: prediction_bundle_provider, prediction_bundle, then a
+        PredictionBundle already sitting on physical_forecast /
+        physical_forecast_provider (without lifting to PhysicalForecast).
+        Never invents a neutral bundle — missing means explicit fallback.
+        """
+        from prediction.contracts import PredictionBundle
+
+        raw = None
+        if self.prediction_bundle_provider is not None:
+            try:
+                raw = self.prediction_bundle_provider(
+                    snap, signals, intent, regime_state)
+            except Exception as exc:
+                log.warning("prediction_bundle_provider failed: %s", exc)
+                raw = None
+        if raw is None:
+            raw = self.prediction_bundle
+        if raw is None and self.physical_forecast_provider is not None:
+            try:
+                cand = self.physical_forecast_provider(snap, signals, intent)
+                if isinstance(cand, PredictionBundle):
+                    raw = cand
+            except Exception:
+                pass
+        if raw is None and isinstance(self.physical_forecast, PredictionBundle):
+            raw = self.physical_forecast
+        if raw is None:
+            return None
+        if isinstance(raw, PredictionBundle):
+            return raw
+        if isinstance(raw, dict):
+            try:
+                return PredictionBundle.from_dict(raw)
+            except (TypeError, ValueError) as exc:
+                log.warning("invalid prediction_bundle dict: %s", exc)
+                return None
+        log.warning("unsupported prediction_bundle type: %s", type(raw).__name__)
+        return None
+
+    def _route_policy(self, snap, signals: dict, intent, regime_state):
+        """
+        Dual-run legacy + V2 policy (PR 10). Returns PolicyRouteResult or
+        None on hard failure (tick continues on the matrix path alone).
+        """
+        try:
+            from policy.contracts import PolicyInput, StructuralState
+            from policy.router import PolicyRouter, PolicyRouterConfig
+
+            bundle = self._resolve_prediction_bundle(
+                snap, signals, intent, regime_state)
+            op_risk = {
+                "hard_vetoes": list(regime_state.vetoes or []),
+                "stand_down": bool(regime_state.stand_down),
+                "implied_remaining_move": signals.get("implied_move")
+                or signals.get("chan_bb_width"),
+            }
+            pin = PolicyInput(
+                predictions=bundle,
+                structural_state=StructuralState.from_market(snap.market),
+                operational_risk_state=op_risk,
+                legacy_regime_state=regime_state,
+                legacy_matrix_intent=intent,
+            )
+            cfg = self.policy_router_cfg
+            if cfg is None:
+                cfg = PolicyRouterConfig(mode=self.policy_mode)
+            elif getattr(cfg, "mode", None) is None:
+                cfg.mode = self.policy_mode
+            return PolicyRouter(cfg).route(pin)
+        except Exception as exc:
+            log.warning("policy router failed: %s", exc)
+            return None
 
     def _next_snapshot_id(self, now: dt.datetime) -> str:
         """Stable per-tick observation id (PR 3): SHA256 of symbol |
@@ -573,12 +663,45 @@ class UnifiedOrchestrator:
         self._journal_ras(now, ras_results)
         signals, signals_json = self._signals_with_ras(signals, ras_results)
 
+        # ---- Prediction policy dual-run (PR 10 / §17) ----
+        # Shadow (default): legacy matrix remains authoritative; V2 decision
+        # and disagreement are journaled. Champion: V2 drives structure /
+        # stand-down with explicit fallback_legacy when the bundle is missing.
+        policy_route = self._route_policy(snap, signals, intent, regime_state)
+        live_structure = intent.decision.structure
+        live_direction = intent.decision.direction
+        live_size_mult = float(intent.size_mult)
+        stand_down_now = bool(
+            regime_state.stand_down or intent.decision.structure == "NT")
+        if policy_route is not None:
+            for k, v in policy_route.journal_signals().items():
+                if isinstance(v, (int, float)) and math.isfinite(float(v)):
+                    signals[k] = float(v) if not isinstance(v, bool) else v
+                elif isinstance(v, bool):
+                    signals[k] = v
+                elif isinstance(v, str):
+                    signals[k] = v
+            # Refresh signals_json so policy provenance lands on the journal.
+            signals, signals_json = self._signals_with_ras(signals, ras_results)
+            if str(getattr(policy_route, "mode", "")).lower() == "champion":
+                auth = policy_route.authoritative
+                if auth.action == "NO_TRADE":
+                    stand_down_now = True
+                    live_structure = "NT"
+                    live_direction = "none"
+                    live_size_mult = 0.0
+                else:
+                    stand_down_now = False
+                    live_structure = auth.structure_code or "NT"
+                    live_direction = auth.direction
+                    live_size_mult = float(auth.size_cap)
+
         # ---- Canonical dataset capture (observation-only, PR 3) ----
         self._log_feature_snapshot(now, snapshot_id, snap, snap_dict,
                                    signals, mat_rows)
 
-        # ---- Stand-down: regime unstable or NT cell ----
-        if regime_state.stand_down or intent.decision.structure == "NT":
+        # ---- Stand-down: regime unstable or NT cell (or champion NO_TRADE) ----
+        if stand_down_now:
             result = TickResult(
                 ts=now, regime=regime_state, intent=intent,
                 decision=None, final_size_mult=0.0,
@@ -587,7 +710,7 @@ class UnifiedOrchestrator:
             )
             if self.journal:
                 row = _no_trade_row(snap.market, intent, regime_state,
-                                    direction=intent.decision.direction,
+                                    direction=live_direction,
                                     signals_json=signals_json)
                 row["snapshot_id"] = snapshot_id
                 self.journal.log(row)
@@ -644,10 +767,10 @@ class UnifiedOrchestrator:
             elif (self.physical_pdf is None and rnd is not None
                     and sigma_rv is not None
                     and self.use_legacy_directional_tilt
-                    and intent.decision.structure in DIRECTIONAL_TILT_STRUCTURES):
+                    and live_structure in DIRECTIONAL_TILT_STRUCTURES):
                 # Legacy circular tilt — kept behind the migration flag.
-                sign = 1.0 if intent.decision.direction == "call" else -1.0
-                tilt = sign * cfg.rnd.dir_drift_frac * intent.size_mult
+                sign = 1.0 if live_direction == "call" else -1.0
+                tilt = sign * cfg.rnd.dir_drift_frac * live_size_mult
                 tilted = physical_pdf_from_realized_vol(
                     rnd, sigma_rv, cfg.rnd, drift_std_frac=tilt)
                 if tilted is not None:
@@ -664,8 +787,8 @@ class UnifiedOrchestrator:
                     shadow = decide(
                         snap.market, snap.chain, cfg,
                         physical_pdf=v2_result.as_callable(),
-                        target_structure=intent.decision.structure,
-                        direction=intent.decision.direction,
+                        target_structure=live_structure,
+                        direction=live_direction,
                         physical_density_mode="v2",
                         physical_moments=v2_result.moments)
                     if shadow.candidate is not None:
@@ -676,8 +799,8 @@ class UnifiedOrchestrator:
 
             decision = decide(snap.market, snap.chain, cfg,
                               physical_pdf=decide_pdf,
-                              target_structure=intent.decision.structure,
-                              direction=intent.decision.direction,
+                              target_structure=live_structure,
+                              direction=live_direction,
                               physical_density_mode=density_mode,
                               physical_moments=density_moments)
             signals["phys_density_mode"] = density_mode
@@ -710,14 +833,15 @@ class UnifiedOrchestrator:
             if self.journal:
                 row = _no_trade_row(snap.market, intent, regime_state,
                                     reason="no_chain",
-                                    direction=intent.decision.direction,
+                                    direction=live_direction,
                                     signals_json=signals_json)
                 row["snapshot_id"] = snapshot_id
                 self.journal.log(row)
 
-        # size_mult from Track B scales the Track A position; the champion's
-        # per-regime size_mult (if any) scales on top.
-        final_size = (intent.size_mult * regime_size_mult
+        # size_mult from Track B (or champion policy size_cap) scales the
+        # Track A position; the champion's per-regime size_mult (if any)
+        # scales on top.
+        final_size = (live_size_mult * regime_size_mult
                       if (decision is not None
                           and decision.decision == "TRADE") else 0.0)
 
