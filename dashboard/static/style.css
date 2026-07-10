@@ -716,3 +716,26 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ---------------- Learning tab (adaptive learning engine) ---------------- */
+.lrn-card {
+  padding: 10px 12px; margin-bottom: 8px;
+  background: var(--panel-2); border: 1px solid var(--border-2, #263042);
+  border-radius: 8px;
+}
+.lrn-card-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.lrn-pending { border-color: var(--amber); box-shadow: 0 0 0 1px rgba(255,182,72,0.25); }
+.lrn-champ { border-color: var(--green-dim, var(--green)); }
+.lrn-reco { color: var(--muted); margin-top: 4px; }
+.lrn-rules { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.lrn-rule {
+  font-family: var(--mono); font-size: 10px;
+  padding: 2px 7px; border-radius: 999px;
+  border: 1px solid var(--border-2, #263042); background: transparent;
+}
+.lrn-rule.ok  { color: var(--green); border-color: var(--green-dim, var(--green)); }
+.lrn-rule.bad { color: var(--red);   border-color: var(--red-dim, var(--red)); }
+.lrn-ov {
+  font-size: 11px; padding: 1px 6px; border-radius: 5px;
+  background: rgba(74,168,255,0.08); border: 1px solid rgba(74,168,255,0.25);
+}

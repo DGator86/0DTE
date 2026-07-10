@@ -107,6 +107,12 @@ class UnifiedOrchestrator:
     risk_manager: Optional[RiskManager] = None
     state_path: Optional[str] = None            # persist adaptive scales across restarts
     ras_cfg: Optional[RASConfig] = None
+    # Static per-dominant-regime engine deltas from the champion config
+    # (adaptive_learning.config_store schema). Resolved ONCE at construction —
+    # nothing adaptive happens at tick time, the live engine stays
+    # deterministic. Keys: classifier regime names (or "unknown"); values:
+    # dot-notation engine overrides plus the special "size_mult".
+    regime_overrides: Optional[dict] = None
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
@@ -123,6 +129,17 @@ class UnifiedOrchestrator:
             dyn_path = os.path.join(os.path.dirname(self.state_path) or ".",
                                     "dynamics_state.json")
         self._dynamics = DynamicsWindow(path=dyn_path)
+        # Pre-resolve one (EngineConfig, size_mult) per overridden regime so a
+        # bad champion file fails at startup, not mid-session.
+        self._regime_cfg: dict[str, tuple[EngineConfig, float]] = {}
+        if self.regime_overrides:
+            from adaptive_learning.config_store import (
+                engine_cfg_for_regime, validate_regime_overrides)
+            validate_regime_overrides(self.regime_overrides)
+            base = self.engine_cfg or EngineConfig()
+            for regime in self.regime_overrides:
+                self._regime_cfg[regime] = engine_cfg_for_regime(
+                    base, self.regime_overrides, regime)
         self._load_state()
 
     # -- adaptive-state persistence -------------------------------------------
@@ -315,6 +332,16 @@ class UnifiedOrchestrator:
         regime_state = self._classifier.classify(clf_ctx, self._prev_std)
         self._prev_std = regime_state.standardized
 
+        # Champion regime_overrides: swap in the pre-resolved per-regime
+        # EngineConfig for everything downstream of classification (gate +
+        # selector). The RND extraction above ran on the base config — the
+        # regime is unknowable before the classifier has spoken.
+        regime_size_mult = 1.0
+        if self._regime_cfg:
+            key = regime_state.dominant_regime or "unknown"
+            if key in self._regime_cfg:
+                cfg, regime_size_mult = self._regime_cfg[key]
+
         # periodic flush of adaptive scales (cheap; ~every 10 minutes at 60s ticks)
         self._ticks_since_save += 1
         if self._ticks_since_save >= 10:
@@ -431,9 +458,11 @@ class UnifiedOrchestrator:
                                                direction=intent.decision.direction,
                                                signals_json=signals_json))
 
-        # size_mult from Track B scales the Track A position
-        final_size = intent.size_mult if (decision is not None
-                                          and decision.decision == "TRADE") else 0.0
+        # size_mult from Track B scales the Track A position; the champion's
+        # per-regime size_mult (if any) scales on top.
+        final_size = (intent.size_mult * regime_size_mult
+                      if (decision is not None
+                          and decision.decision == "TRADE") else 0.0)
 
         return TickResult(
             ts=now, regime=regime_state, intent=intent,

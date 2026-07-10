@@ -51,6 +51,9 @@
       <button class="tab" id="tab-validation" type="button">Validation
         <span class="val-alert-dot hidden" id="tab-validation-dot"></span>
       </button>
+      <button class="tab" id="tab-learning" type="button">Learning
+        <span class="val-alert-dot hidden" id="tab-learning-dot"></span>
+      </button>
     </nav>
 
     <!-- ===================== GRID ===================== -->
@@ -243,6 +246,33 @@
       <section class="panel" id="val-detail-panel">
         <h2>Report detail <span class="h2-right" id="val-detail-date">—</span></h2>
         <div id="val-detail"><p class="empty">Select a report</p></div>
+      </section>
+    </div>
+
+    <!-- ===================== LEARNING VIEW ===================== -->
+    <div class="validation-view hidden" id="view-learning">
+      <section class="panel" id="lrn-left">
+        <h2>Diagnostics <span class="h2-right" id="lrn-diag-sub">—</span></h2>
+        <div id="lrn-diagnostics"><p class="empty">No learning runs yet — run
+          <span class="mono">python3 -m adaptive_learning.learner</span></p></div>
+
+        <h2 style="margin-top:18px">Promotion queue <span class="h2-right" id="lrn-promo-sub">—</span></h2>
+        <div id="lrn-promotions"><p class="empty">No promotion decisions yet</p></div>
+
+        <h2 style="margin-top:18px">Drift <span class="h2-right" id="lrn-drift-sub">—</span></h2>
+        <div id="lrn-drift"><p class="empty">No drift snapshots yet</p></div>
+      </section>
+
+      <section class="panel" id="lrn-right">
+        <h2>Champion vs challengers <span class="h2-right" id="lrn-cand-sub">—</span></h2>
+        <div id="lrn-champion"><p class="empty">No champion config — dataclass defaults live</p></div>
+        <div id="lrn-candidates"><p class="empty">No candidate configs yet</p></div>
+
+        <h2 style="margin-top:18px">Learning runs <span class="h2-right" id="lrn-runs-sub">—</span></h2>
+        <div id="lrn-runs"><p class="empty">No learning runs yet</p></div>
+
+        <h2 style="margin-top:18px">Feature stability <span class="h2-right" id="lrn-feat-sub">—</span></h2>
+        <div id="lrn-features"><p class="empty">No feature scores yet</p></div>
       </section>
     </div>
 

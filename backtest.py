@@ -112,6 +112,11 @@ class TearSheet:
     gate_effectiveness: dict = field(default_factory=dict)
     component_correlations: dict = field(default_factory=dict)
 
+    # probability calibration + regime coverage (used by the optimizer's
+    # composite metric; None/{} when the window is too thin to judge)
+    brier_skill: Optional[float] = None
+    regime_counts: dict = field(default_factory=dict)
+
     def print(self) -> None:
         w = 56
         pct = lambda x: f"{x * 100:.1f}%" if x is not None else "n/a"
@@ -271,6 +276,8 @@ def run_backtest(
         ev_accuracy=ev_acc,
         gate_effectiveness=jrn.gate_effectiveness(),
         component_correlations=jrn.component_correlations(),
+        brier_skill=jrn.prob_calibration().get("brier_skill"),
+        regime_counts=jrn.regime_diversity().get("regimes", {}),
     )
 
 

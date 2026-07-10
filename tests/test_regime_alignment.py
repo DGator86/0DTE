@@ -331,7 +331,12 @@ def test_fast_momentum_skipped_when_intent_predates_bias_fast():
     ctx = PositionContext("f0", "call", "bull", _entry())
     ras = compute_ras(_regime(), _intent(), _market(), ctx)
     assert _comp(ras, "fast_momentum") is None
-    assert len(ras.components) == 6
+    # the full baseline set (incl. channel_break), just never fast_momentum
+    assert len(ras.components) == 7
+    assert {c.name for c in ras.components} == {
+        "direction_alignment", "matrix_alignment", "gamma_alignment",
+        "veto_escalation", "confidence_erosion", "regime_flip",
+        "channel_break"}
 
 
 def test_fast_momentum_warns_before_blend_flips():

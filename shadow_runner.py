@@ -104,6 +104,7 @@ class ShadowRunner:
         live_state_path: str = "live_state.json",
         record_dir: Optional[str] = None,   # None = <db_dir>/ticks; "" disables
         ras_exit: bool = True,              # False = RAS observation-only (no auto-exits)
+        champion_path: Optional[str] = None,  # None = configs/champion.json; "" disables
     ) -> None:
         self.symbol = symbol
         self.interval_s = interval_s
@@ -131,10 +132,32 @@ class ShadowRunner:
         # an "exit" action actually closes) — a single flag, never three that
         # can drift apart.
         self._ras_cfg = RASConfig(exit_enabled=ras_exit)
+        # Champion config: the ONE live configuration, produced by the
+        # adaptive-learning promotion flow and installed only via the human
+        # approval CLI. Missing file = dataclass defaults (unchanged
+        # behaviour); an INVALID file raises — silently trading on defaults
+        # when a champion was intended is the worse failure mode.
+        engine_cfg = classifier_cfg = None
+        regime_overrides = None
+        self.champion = None
+        if champion_path is None:
+            champion_path = os.path.join("configs", "champion.json")
+        if champion_path and os.path.isfile(champion_path):
+            from adaptive_learning.config_store import load_config
+            rec = load_config(champion_path)          # raises on invalid file
+            engine_cfg, classifier_cfg = rec.engine_cfg()
+            regime_overrides = rec.regime_overrides or None
+            self.champion = rec
+            log.info("Champion config loaded: %s (id=%s, label=%r, "
+                     "%d overrides, %d regime overrides)",
+                     champion_path, rec.config_id[:8], rec.label,
+                     len(rec.overrides), len(rec.regime_overrides or {}))
         self._orch = UnifiedOrchestrator(
             feed=self._feed, journal=self._jrn, risk_manager=self._risk,
+            engine_cfg=engine_cfg, classifier_cfg=classifier_cfg,
             state_path=os.path.join(state_dir, "adaptive_state.json"),
             ras_cfg=self._ras_cfg,
+            regime_overrides=regime_overrides,
         )
         # Record every tick (market + chain + incremental bars) so a REAL-data
         # walk-forward becomes possible. ~1 MB/session gzipped; you cannot
@@ -430,6 +453,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-ras-exit", dest="ras_exit", action="store_false",
                    help="RAS observation-only: log scores/actions but never "
                         "auto-close paper positions (default: exits enabled)")
+    p.add_argument("--champion", dest="champion_path", default=None,
+                   help="Champion config JSON (default: configs/champion.json "
+                        "when present; pass an empty string to force defaults)")
     return p
 
 
@@ -460,6 +486,7 @@ if __name__ == "__main__":
         live_state_path=args.live_state,
         record_dir=args.record_dir,
         ras_exit=args.ras_exit,
+        champion_path=args.champion_path,
     )
 
     if args.report:

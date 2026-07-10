@@ -21,6 +21,10 @@ Search modes
 ------------
   grid    — exhaustive Cartesian product of all param values.
   random  — n_trials random draws, reproducible via seed.
+  tpe     — Tree-Parzen-style sequential sampler: past trials are split into
+            a good and a bad quantile per parameter and new draws are weighted
+            toward values that appear in the good set. Far fewer evaluations
+            than grid for the same convergence; no external dependency.
 
 Metric choices
 --------------
@@ -28,6 +32,10 @@ Metric choices
   total_pnl     — sum of out-of-sample P&L across folds
   win_rate      — mean win rate across folds
   sharpe_over_dd — mean Sharpe / (1 + mean max-drawdown), penalises tail risk
+  composite     — the adaptive-learning objective: NOT highest P&L but
+                  0.30·Sharpe + 0.25·fold consistency + 0.20·gate edge +
+                  0.10·Brier skill + 0.10·trade count + 0.05·regime diversity
+                  (each term normalised to roughly [-1, 1])
 
 Output
 ------
@@ -38,7 +46,6 @@ NOT financial advice.
 """
 from __future__ import annotations
 
-import dataclasses
 import datetime as dt
 import itertools
 import random as _random
@@ -84,33 +91,73 @@ def _score(wf: WalkForwardResult, metric: str) -> float:
         mu_dd = sum(dd) / len(dd) if dd else 0.0
         return mu_sh / (1.0 + mu_dd)
 
+    if metric == "composite":
+        return composite_score(wf)
+
     raise ValueError(f"Unknown metric: {metric!r}")
+
+
+def composite_score(wf: WalkForwardResult) -> float:
+    """
+    The adaptive-learning search objective (see module docstring). Each term
+    is normalised to roughly [-1, 1] before weighting so no single unit
+    (dollars vs ratios) dominates:
+
+      0.30  Sharpe            tanh(mean fold Sharpe / 2)
+      0.25  WF consistency    fraction of profitable folds
+      0.20  gate edge         tanh(mean taken−blocked P&L, $/share)
+      0.10  Brier skill       mean fold skill clipped to [-1, 1]
+      0.05  regime diversity  mean fold distinct-regimes / 3 (capped)
+      0.10  trade count       1 − exp(−trades per fold / 5); a config that
+            stops trading scores ~0 here no matter how pretty its Sharpe
+
+    Missing readouts (too few settled rows to judge) contribute 0 — absence
+    of evidence is not evidence of quality.
+    """
+    import math as _math
+
+    folds = wf.folds
+    if not folds:
+        return _NEG_INF
+
+    sharpes = [f.tearsheet.sharpe for f in folds if f.tearsheet.sharpe is not None]
+    sharpe_term = _math.tanh((sum(sharpes) / len(sharpes)) / 2.0) if sharpes else 0.0
+
+    consistency = wf.n_profitable() / len(folds)
+
+    edges = []
+    for f in folds:
+        eff = f.tearsheet.gate_effectiveness or {}
+        t = (eff.get("trades_taken") or {}).get("mean")
+        b = (eff.get("blocked_by_gate") or {}).get("mean")
+        if t is not None and b is not None:
+            edges.append(t - b)
+    gate_term = _math.tanh(sum(edges) / len(edges)) if edges else 0.0
+
+    skills = [f.tearsheet.brier_skill for f in folds
+              if f.tearsheet.brier_skill is not None]
+    brier_term = max(-1.0, min(1.0, sum(skills) / len(skills))) if skills else 0.0
+
+    trades_per_fold = sum(f.tearsheet.trade_ticks for f in folds) / len(folds)
+    trade_term = 1.0 - _math.exp(-trades_per_fold / 5.0)
+
+    div = [min(1.0, len(f.tearsheet.regime_counts or {}) / 3.0) for f in folds]
+    regime_term = sum(div) / len(div) if div else 0.0
+
+    return (0.30 * sharpe_term + 0.25 * consistency + 0.20 * gate_term
+            + 0.10 * brier_term + 0.10 * trade_term + 0.05 * regime_term)
 
 
 # --------------------------------------------------------------------------- #
 # Config builder                                                                #
 # --------------------------------------------------------------------------- #
 def _build_engine_cfg(base: EngineConfig, params: dict) -> EngineConfig:
-    """Apply a flat param dict (dot-notation paths) on top of a base EngineConfig."""
-    gate_kw: dict = {}
-    sel_kw:  dict = {}
-    rnd_kw:  dict = {}
-
-    for path, val in params.items():
-        prefix, _, key = path.partition(".")
-        if prefix == "gate":
-            gate_kw[key] = val
-        elif prefix == "selector":
-            sel_kw[key] = val
-        elif prefix == "rnd":
-            rnd_kw[key] = val
-        else:
-            raise ValueError(f"Unknown param prefix: {prefix!r} in {path!r}")
-
-    gate = dataclasses.replace(base.gate, **gate_kw) if gate_kw else base.gate
-    sel  = dataclasses.replace(base.selector, **sel_kw) if sel_kw else base.selector
-    rnd  = dataclasses.replace(base.rnd, **rnd_kw) if rnd_kw else base.rnd
-    return EngineConfig(rnd=rnd, selector=sel, gate=gate)
+    """Apply a flat param dict (dot-notation paths) on top of a base EngineConfig.
+    Delegates to the ONE shared applier in adaptive_learning.config_store so
+    the optimizer, the YAML config loader, and the live champion loader can
+    never drift apart."""
+    from adaptive_learning.config_store import build_engine_cfg
+    return build_engine_cfg(base, params)
 
 
 # --------------------------------------------------------------------------- #
@@ -125,6 +172,47 @@ def _grid_params(param_space: dict) -> list[dict]:
 def _random_params(param_space: dict, n: int, seed: int) -> list[dict]:
     rng = _random.Random(seed)
     return [{k: rng.choice(v) for k, v in param_space.items()} for _ in range(n)]
+
+
+def _tpe_next(param_space: dict, history: list[tuple[dict, float]],
+              rng: "_random.Random", gamma: float = 0.30,
+              n_startup: int = 5) -> dict:
+    """
+    One Tree-Parzen-Estimator-style draw over categorical value lists.
+
+    Past trials are ranked by score; the top `gamma` fraction form the "good"
+    set and the rest the "bad" set. For each parameter independently, each
+    candidate value is weighted by (count_good + 1) / (count_bad + 1) — the
+    add-one smoothing keeps unseen values reachable — and sampled
+    proportionally. The first `n_startup` draws are uniform random so the
+    density estimates have something to stand on. Deterministic given the rng.
+    """
+    scored = [(p, s) for p, s in history if s > _NEG_INF]
+    if len(scored) < n_startup:
+        return {k: rng.choice(v) for k, v in param_space.items()}
+
+    ranked = sorted(scored, key=lambda ps: ps[1], reverse=True)
+    n_good = max(1, int(len(ranked) * gamma))
+    good, bad = ranked[:n_good], ranked[n_good:]
+
+    params: dict = {}
+    for key, values in param_space.items():
+        weights = []
+        for v in values:
+            cg = sum(1 for p, _ in good if p.get(key) == v)
+            cb = sum(1 for p, _ in bad if p.get(key) == v)
+            weights.append((cg + 1.0) / (cb + 1.0))
+        total = sum(weights)
+        r = rng.random() * total
+        acc = 0.0
+        chosen = values[-1]
+        for v, w in zip(values, weights):
+            acc += w
+            if r <= acc:
+                chosen = v
+                break
+        params[key] = chosen
+    return params
 
 
 # --------------------------------------------------------------------------- #
@@ -280,20 +368,29 @@ def run_optimizer(
         cut = int(len(timestamps) * (1.0 - opt.holdout_frac))
         search_ts, holdout_ts = timestamps[:cut], timestamps[cut:]
 
+    param_list: Optional[list[dict]]
     if opt.search == "grid":
         param_list = _grid_params(param_space)
+        n_total = len(param_list)
     elif opt.search == "random":
         param_list = _random_params(param_space, opt.n_trials, opt.seed)
+        n_total = len(param_list)
+    elif opt.search == "tpe":
+        param_list = None                     # sampled sequentially from history
+        n_total = opt.n_trials
     else:
         raise ValueError(f"Unknown search mode: {opt.search!r}")
 
-    n_total = len(param_list)
     print(f"  Optimizer: {opt.search} search, {n_total} trials, "
           f"metric={opt.metric}, wf={wf.mode}/{wf.n_folds}-fold"
           + (f", holdout={opt.holdout_frac:.0%}" if holdout_ts else ""))
 
+    rng = _random.Random(opt.seed)
+    history: list[tuple[dict, float]] = []
     trials: list[Trial] = []
-    for i, params in enumerate(param_list, start=1):
+    for i in range(1, n_total + 1):
+        params = (param_list[i - 1] if param_list is not None
+                  else _tpe_next(param_space, history, rng))
         engine_cfg = _build_engine_cfg(base, params)
         param_str = "  ".join(f"{k.split('.',1)[1]}={v}" for k, v in params.items())
         print(f"  Trial {i:>3}/{n_total}  {param_str}", end="", flush=True)
@@ -307,6 +404,7 @@ def run_optimizer(
         )
         sc = _score(wf_result, opt.metric)
         print(f"  → score={sc:+.4f}")
+        history.append((params, sc))
         trials.append(Trial(
             trial_id=i, params=params,
             engine_cfg=engine_cfg, wf_result=wf_result, score=sc,
