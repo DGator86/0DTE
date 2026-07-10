@@ -9,6 +9,11 @@ and emits, per tick:
     - hard vetoes (catalyst, short-gamma, etc.) that override the scores
     - global information gain (how much the state shifted since last tick)
 
+Prediction Engine V2 / PR 10: RegimeState feeds PolicyInput.legacy_regime_state
+and operational hard vetoes. Stand-down / vetoes remain structural inputs to
+policy — they are not absorbed into PredictionBundle
+(docs/PREDICTION_ENGINE_V2_HANDOFF.md §17).
+
 It is NOT machine-learned. Each regime is a reliability-weighted blend of
 standardized features with hand-set prior weights. Those weights are exactly
 what the journal's realized-P&L regression will later calibrate -- this module
