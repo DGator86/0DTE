@@ -28,6 +28,10 @@ Each component scorer returns a raw value in [-1, +1] plus a human-readable
 note (every RASResult carries the full breakdown for journaling):
 
   direction_alignment   Is the matrix direction bias still with the position?
+  fast_momentum         Raw fast (1m/5m/15m) composite vs the position — the
+                        early-warning channel; the blended bias is 60% slow
+                        and structurally late at intraday turns. Skipped when
+                        the intent predates bias_fast.
   matrix_alignment      Has the exec/context matrix cell moved for/against it?
   gamma_alignment       Dealer gamma surface (flip, net GEX) vs the thesis.
   veto_escalation       New vetoes since entry that undermine this structure.
@@ -74,6 +78,7 @@ VOL_STRUCTURES = frozenset({"STG"})
 
 DEFAULT_WEIGHTS = {
     "direction_alignment": 1.5,
+    "fast_momentum": 1.3,
     "matrix_alignment": 1.2,
     "gamma_alignment": 1.5,
     "veto_escalation": 1.0,
@@ -313,6 +318,42 @@ def _score_direction_alignment(intent: TradeIntent, bias: str) -> tuple[float, s
             return -1.0, "bias flipped bull"
         return -0.2 if val > 50 else 0.0, f"bias neutral ({val})"
     return 0.0, "unknown bias"
+
+
+def _score_fast_momentum(intent: Optional[TradeIntent],
+                         bias: str) -> Optional[tuple[float, str]]:
+    """Raw fast-timeframe (1m/5m/15m) direction composite vs the position.
+
+    This is the early-warning channel: the blended bias_value is 60% weighted
+    to session-anchored slow timeframes and mathematically cannot flip during
+    the first leg of an intraday reversal, so exits key off the fast composite
+    directly. Asymmetric by design (quick to cut, slow to add): full -1.0
+    downside when fast momentum turns against the position, but upside capped
+    at +0.5 so a hot fast read cannot mask deterioration elsewhere.
+
+    Returns None (component skipped, score unchanged) when the intent predates
+    bias_fast — e.g. replaying journal rows written before this existed.
+    """
+    fast = getattr(intent, "bias_fast", None) if intent is not None else None
+    if fast is None or not (isinstance(fast, (int, float)) and math.isfinite(fast)):
+        return None
+
+    dev = (fast - 50.0) / 25.0                 # ±1.0 at composite 25/75
+    if bias == "bull":
+        raw = _clip_unit(dev)
+    elif bias == "bear":
+        raw = _clip_unit(-dev)
+    elif bias == "vol":
+        raw = _clip_unit(0.5 * abs(dev))       # vol positions want movement
+    else:
+        # premium/neutral: strong fast momentum either way threatens the range
+        raw = _clip_unit(-max(0.0, abs(dev) - 0.3))
+    raw = min(raw, 0.5)
+
+    blend = getattr(intent, "bias_value", None)
+    blend_txt = f", blend {blend:.0f}" if isinstance(blend, (int, float)) else ""
+    side = "with" if raw >= 0 else "against"
+    return raw, f"fast composite {fast:.0f} ({side} {bias}{blend_txt})"
 
 
 def _regime_favor(exec_r: str, ctx_r: str, bias: str, structure_class: str) -> float:
@@ -594,6 +635,11 @@ def compute_ras(regime: RegimeState, intent: Optional[TradeIntent],
 
     scorers = [
         ("direction_alignment", *_score_direction_alignment(intent, bias)),
+    ]
+    fast_mom = _score_fast_momentum(intent, bias)
+    if fast_mom is not None:                   # None: intent predates bias_fast
+        scorers.append(("fast_momentum", *fast_mom))
+    scorers += [
         ("matrix_alignment", *_score_matrix_alignment(intent, entry, bias)),
         ("gamma_alignment", *_score_gamma_alignment(
             regime, market, entry, bias, entry.structure_class)),

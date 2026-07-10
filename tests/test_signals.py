@@ -287,3 +287,37 @@ def test_end_to_end_signals_reach_journal_and_matrix():
     # observation-only regime time series for the dashboard visualizations
     assert 0.0 <= sig["regime_bias_value"] <= 100.0
     assert 0.0 <= sig["regime_dominant_conf"] <= 100.0
+    # raw fast/slow direction composites (turn-detection channel)
+    assert 0.0 <= sig["bias_fast"] <= 100.0
+    assert 0.0 <= sig["bias_slow"] <= 100.0
+
+
+def test_intent_exposes_fast_and_slow_composites():
+    """decide_from_matrix must surface the raw composites behind bias_value:
+    the fast one is the early-warning channel for RAS and the lag study."""
+    from decision_matrix import decide_from_matrix
+    from mtf_matrix import build_matrix, demo_input, regime_rows
+
+    rows = build_matrix(demo_input())
+    intent = decide_from_matrix(rows, regime_rows(rows))
+    assert intent.bias_fast is not None and 0.0 <= intent.bias_fast <= 100.0
+    assert intent.bias_slow is not None and 0.0 <= intent.bias_slow <= 100.0
+    # the blend is the documented 0.4 fast + 0.6 slow combination
+    blend = 0.4 * intent.bias_fast + 0.6 * intent.bias_slow
+    assert abs(blend - intent.bias_value) < 0.2
+
+
+def test_bias_cross_detector_hysteresis():
+    """+/-1 only on the tick the fast composite decisively overtakes/loses
+    the slow one; deadband holds the prior side; missing data is inert."""
+    from unified_loop import UnifiedOrchestrator
+
+    orch = UnifiedOrchestrator(feed=None)
+    assert orch._bias_cross(40.0, 55.0) is None    # first reading: sets side
+    assert orch._bias_cross(45.0, 55.0) is None    # same side, no event
+    assert orch._bias_cross(55.2, 55.0) is None    # inside deadband: hold
+    assert orch._bias_cross(60.0, 55.0) == 1.0     # decisive cross above
+    assert orch._bias_cross(62.0, 55.0) is None    # no repeat while above
+    assert orch._bias_cross(40.0, 55.0) == -1.0    # cross back below
+    assert orch._bias_cross(None, 55.0) is None    # missing data: inert
+    assert orch._bias_cross(41.0, 55.0) is None    # still below, no event

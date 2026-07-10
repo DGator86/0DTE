@@ -115,6 +115,7 @@ class UnifiedOrchestrator:
         self._prev_std: Optional[dict] = None   # for information-gain computation
         self._matrix_scale_book = ScaleBook()   # adaptive scales for MTF matrix variables
         self._ticks_since_save = 0
+        self._bias_side: Optional[int] = None   # fast-vs-slow composite side, for crossovers
         # dealer-surface / vol-state derivatives (observation-only signals)
         dyn_path = None
         if self.state_path:
@@ -158,6 +159,28 @@ class UnifiedOrchestrator:
             os.replace(tmp, self.state_path)
         except Exception:
             pass                                 # never let persistence break a tick
+
+    def _bias_cross(self, fast: Optional[float],
+                    slow: Optional[float]) -> Optional[float]:
+        """Fast/slow direction-composite crossover detector with hysteresis.
+
+        Returns +1.0 the tick the fast composite crosses above the slow one
+        (the V-bottom signature: short timeframes turning before the
+        session-anchored context), -1.0 crossing below, None otherwise.
+        A 1-point deadband on the gap prevents chatter when the composites
+        are riding on top of each other.
+        """
+        if fast is None or slow is None:
+            return None
+        gap = fast - slow
+        side = 1 if gap >= 1.0 else (-1 if gap <= -1.0 else None)
+        if side is None:                     # inside deadband: hold prior side
+            return None
+        prev = self._bias_side
+        self._bias_side = side
+        if prev is not None and side != prev:
+            return float(side)
+        return None
 
     def _compute_ras(self, regime_state: RegimeState, intent: TradeIntent,
                      market: MarketSnapshot,
@@ -313,6 +336,23 @@ class UnifiedOrchestrator:
         dom_conf = regime_state.confidences.get(regime_state.dominant_regime)
         if isinstance(dom_conf, (int, float)) and math.isfinite(dom_conf):
             signals["regime_dominant_conf"] = float(dom_conf)
+
+        # Raw fast/slow direction composites plus the crossover event. The fast
+        # composite is the turn-detection channel (leads the 60%-slow blend at
+        # intraday reversals); bias_cross = +/-1 only on the tick where the
+        # fast side overtakes/loses the slow side. Observation-only.
+        bf, bs = intent.bias_fast, intent.bias_slow
+        if isinstance(bf, (int, float)) and math.isfinite(bf):
+            signals["bias_fast"] = float(bf)
+        if isinstance(bs, (int, float)) and math.isfinite(bs):
+            signals["bias_slow"] = float(bs)
+        cross = self._bias_cross(
+            bf if isinstance(bf, (int, float)) else None,
+            bs if isinstance(bs, (int, float)) else None)
+        if cross is not None:
+            signals["bias_cross"] = cross
+            log.info("Direction composite crossover: fast %s slow (fast=%.1f slow=%.1f)",
+                     "above" if cross > 0 else "below", bf, bs)
 
         # Routing provenance for journal.decision_funnel(): what Track B
         # actually routed, whether a dealer veto flipped a credit cell to its
