@@ -113,13 +113,23 @@ class UnifiedOrchestrator:
     # deterministic. Keys: classifier regime names (or "unknown"); values:
     # dot-notation engine overrides plus the special "size_mult".
     regime_overrides: Optional[dict] = None
+    # Transition flag (Prediction Engine V2, PR 2): the matrix scale book is
+    # the per-feature-AND-timeframe, exponentially decayed, lagged
+    # RobustScaleBook by default. Set True to fall back to the legacy
+    # name-only Welford ScaleBook (update-before-score) for comparison.
+    use_legacy_scaler: bool = False
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
             cfg=self.classifier_cfg or ClassifierConfig()
         )
         self._prev_std: Optional[dict] = None   # for information-gain computation
-        self._matrix_scale_book = ScaleBook()   # adaptive scales for MTF matrix variables
+        # adaptive scales for MTF matrix variables
+        if self.use_legacy_scaler:
+            self._matrix_scale_book = ScaleBook()
+        else:
+            from prediction.scalers import RobustScaleBook
+            self._matrix_scale_book = RobustScaleBook()
         self._ticks_since_save = 0
         self._bias_side: Optional[int] = None   # fast-vs-slow composite side, for crossovers
         # dealer-surface / vol-state derivatives (observation-only signals)
@@ -153,7 +163,13 @@ class UnifiedOrchestrator:
         try:
             with open(self.state_path, encoding="utf-8") as f:
                 data = json.load(f)
-            self._matrix_scale_book.load_dict(data.get("matrix_scales", {}))
+            # V2 matrix scales live under a separate versioned key so legacy
+            # name-only Welford state can never be reinterpreted as
+            # per-timeframe state (RobustScaleBook.load_dict additionally
+            # rejects any version/config-hash mismatch and re-warms).
+            matrix_key = ("matrix_scales" if self.use_legacy_scaler
+                          else "matrix_scales_v2")
+            self._matrix_scale_book.load_dict(data.get(matrix_key, {}))
             self._classifier.scales.load_dict(data.get("classifier_scales", {}))
         except Exception:
             pass
@@ -164,8 +180,10 @@ class UnifiedOrchestrator:
         try:
             import os
             import tempfile
+            matrix_key = ("matrix_scales" if self.use_legacy_scaler
+                          else "matrix_scales_v2")
             payload = {
-                "matrix_scales": self._matrix_scale_book.to_dict(),
+                matrix_key: self._matrix_scale_book.to_dict(),
                 "classifier_scales": self._classifier.scales.to_dict(),
             }
             directory = os.path.dirname(self.state_path) or "."

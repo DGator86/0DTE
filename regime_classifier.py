@@ -411,10 +411,13 @@ class RegimeClassifier:
 
     def classify(self, ctx: ClassifierContext,
                  prev_standardized: Optional[dict] = None) -> RegimeState:
+        # Score BEFORE update: the tick is standardized against the scales
+        # learned from history only, then this tick's raw values enter the
+        # book. The old order let an observation influence the scale used to
+        # score itself (see docs/PREDICTION_ENGINE_V2_HANDOFF.md §10.2).
+        std = self._standardize(ctx)
         if self.cfg.update_scales:
             self._update_scales(ctx)
-
-        std = self._standardize(ctx)
         vetoes = _vetoes(ctx, self.cfg)
         blocked_engines = set()
         for _, eng in vetoes:
