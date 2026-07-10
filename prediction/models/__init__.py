@@ -13,6 +13,8 @@ Currently implemented (PR 4 — probabilistic baselines):
                      monotone rearrangement, pinball loss and coverage.
   volatility       — log-target realized-move regressor with quantile range
                      and forecast/implied ratio.
+  fill             — structure-specific fill-fraction priors for the
+                     execution-cost model (PR 6); empirical trainer later.
 
 No deep learning by design: the number of independent market sessions is far
 smaller than the number of tick rows.

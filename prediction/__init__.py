@@ -18,7 +18,8 @@ Currently implemented:
   storage   — SQLite dataset tables + Parquet export + deterministic
               dataset hashing (PR 3).
   models/   — calibrated elastic-net direction models, quantile return
-              models, and the realized-move volatility model (PR 4).
+              models, the realized-move volatility model (PR 4), and
+              structure-specific fill-fraction priors (PR 6).
   calibration — sigmoid/Platt (default) and gated isotonic probability
               calibration, fitted on training data only (PR 4).
   registry  — versioned, hashed, fail-closed joblib model artifacts with
@@ -31,3 +32,6 @@ Currently implemented:
               uncertainty-blend toward RND; replaces the circular
               dir_drift_frac tilt (PR 5).
 """
+# Note: execution_cost.py lives at the repo root (alongside spread_selector)
+# because it is shared by the selector, journal, labels, and paper fill
+# capture — not only the prediction package.

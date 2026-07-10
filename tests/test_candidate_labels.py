@@ -1,10 +1,11 @@
 """
 tests/test_candidate_labels.py
 ==============================
-PR 3 acceptance — candidate outcome records:
+PR 3 + PR 6 acceptance — candidate outcome records:
   * settlement P&L from midpoint entry economics (per-share intrinsic math,
     same convention as journal.realized_pnl);
-  * expected/conservative fill P&L stays None until PR 6 (absent, not faked);
+  * expected/conservative fill P&L filled when an ExecutionEstimate is
+    supplied (PR 6); stay None when absent (never faked);
   * path MFE/MAE and target/stop first-passage from intrinsic bar marks,
     with same-bar ambiguity resolved conservatively;
   * stable candidate ids and SQLite round-trip via PredictionStore.
@@ -62,11 +63,30 @@ class TestSettlementPnl:
             assert out["pnl_mid"] == pytest.approx(
                 realized_pnl(PCS_LEGS, PCS_CREDIT, settle))
 
-    def test_fill_adjusted_pnl_absent_until_pr6(self):
+    def test_fill_adjusted_pnl_absent_without_execution(self):
         out = candidate_outcome_labels(PCS_LEGS, PCS_CREDIT, 602.0)
         assert out["pnl_expected_fill"] is None
         assert out["pnl_conservative"] is None
         assert out["pnl_policy"] is None
+
+    def test_fill_adjusted_pnl_from_execution(self):
+        execution = {
+            "net_expected_credit": 0.25,
+            "net_conservative_credit": 0.20,
+            "exit_slippage_expected": 0.02,
+            "exit_fees_expected": 0.007,
+            "exit_slippage_stop": 0.04,
+        }
+        out = candidate_outcome_labels(PCS_LEGS, PCS_CREDIT, 602.0,
+                                       max_loss=0.70, capital=0.70,
+                                       execution=execution)
+        # At S=602 both puts expire worthless → P&L = entry credit - exit drag
+        assert out["pnl_mid"] == pytest.approx(0.30)
+        assert out["pnl_expected_fill"] == pytest.approx(0.25 - 0.02 - 0.007)
+        assert out["pnl_conservative"] == pytest.approx(0.20 - 0.04 - 0.007)
+        # return-on-risk uses expected-fill as the primary economic P&L
+        assert out["return_on_risk"] == pytest.approx(
+            out["pnl_expected_fill"] / 0.70)
 
     def test_return_on_risk_and_capital(self):
         out = candidate_outcome_labels(PCS_LEGS, PCS_CREDIT, 602.0,

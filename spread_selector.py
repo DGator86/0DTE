@@ -98,6 +98,12 @@ class SpreadCandidate:
     ev_per_capital: float = 0.0      # the right axis for capital-heavy structures
     size_cap: float = 1.0            # max fraction of normal size (naked << 1)
     stop_level: float = 0.0          # synthetic-wing stop for naked structures
+    # Prediction Engine V2 / PR 6: executable-price panel (mid / natural /
+    # expected / conservative + fees). None when quotes were incomplete.
+    # Mid `credit` / `ev` remain the diagnostic defaults; when
+    # SelectorConfig.use_executable_economics is True, `ev` is recomputed
+    # from net expected-fill credit instead.
+    execution: Optional[dict] = None
 
 
 @dataclass
@@ -162,6 +168,19 @@ class SelectorConfig:
     long_max_otm: float = 0.015          # ... to 1.5% OTM (0DTE ~0.35-0.50Δ)
 
     top_n: int = 8
+
+    # ---- execution cost (Prediction Engine V2, PR 6) ----
+    # Always attach an ExecutionEstimate to each candidate. When True, candidate
+    # EV / ranking / min_ev veto use net expected-fill credit; mid `credit` on
+    # the candidate remains the diagnostic midpoint entry either way. Default
+    # False keeps the legacy mid-EV ranker stable; V2 economic metrics
+    # (journal settlement, TearSheet, candidate labels) use expected-fill P&L
+    # whenever the estimate is present, independent of this flag.
+    use_executable_economics: bool = False
+    execution_cost: Optional[object] = None          # ExecutionCostConfig | None
+    quote_age_seconds: Optional[float] = None        # chain age at decision time
+    minutes_to_close: Optional[float] = None
+    realized_vol: Optional[float] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -304,20 +323,60 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
     if not is_debit and credit <= 0:
         return None                                        # credit structure must collect premium
 
+    # ---- executable economics (PR 6): always attach; optionally drive EV ----
+    execution = None
+    try:
+        from execution_cost import (ExecutionCostConfig, estimate_execution,
+                                    quotes_from_chain)
+        cost_cfg = cfg.execution_cost or ExecutionCostConfig()
+        # relative spread across legs (half-spread / mid), for the fill prior
+        rel_spread = 0.0
+        n_ok = 0
+        for lg in legs:
+            cs, ps = spr.get(lg.strike, (0.05, 0.05))
+            leg_spr = cs if lg.kind == "C" else ps
+            m = _leg_mid(lg, cmid, pmid) or 0.01
+            rel_spread += (0.5 * leg_spr) / max(m, 0.02)
+            n_ok += 1
+        rel_spread = rel_spread / max(n_ok, 1)
+        opt_px = abs(credit) / max(len(legs), 1)
+        execution = estimate_execution(
+            legs, quotes_from_chain(chain), family,
+            cfg=cost_cfg,
+            quote_age_seconds=cfg.quote_age_seconds,
+            minutes_to_close=cfg.minutes_to_close,
+            relative_spread=rel_spread,
+            option_price=opt_px,
+            realized_vol=cfg.realized_vol,
+        )
+    except Exception:
+        execution = None
+
+    # Entry credit used for the payoff / EV integral. Mid by default; net
+    # expected-fill (after entry fees) when executable economics are on.
+    entry_for_ev = credit
+    exit_drag = 0.0
+    if cfg.use_executable_economics and execution is not None:
+        entry_for_ev = execution.net_expected_credit
+        exit_drag = (execution.exit_slippage_expected
+                     + execution.exit_fees_expected)
+
     grid = rnd.grid
     dx = grid[1] - grid[0]
-    pnl = _payoff_curve(legs, grid, credit)
+    pnl = _payoff_curve(legs, grid, entry_for_ev) - exit_drag
 
     # ---- risk accounting: defined vs undefined-but-managed families ----
+    # max_loss / capital stay on the MID payoff (the contractual defined risk
+    # does not shrink just because we expect a worse fill).
     risk_mode, capital, stop_level = "defined", 0.0, 0.0
     naked = family in NAKED_FAMILIES
+    pnl_mid = _payoff_curve(legs, grid, credit)
     if family == "cash_secured_put":
         # single short put, collateralized to zero. Defined: max_loss = K - credit.
         K = legs[0].strike
         max_loss = float(K - credit)
         capital = float(K)                              # full strike held as cash
         risk_mode = "cash_secured"
-        # EV uses the grid payoff (physical mass below grid ~0 at 6 sigma)
     elif family == "naked_defended_call":
         # single short call; the wall-break STOP is the synthetic long wing.
         K = legs[0].strike
@@ -330,8 +389,9 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
         risk_mode = "naked_stop_defined"
         # cap the loss at the stop so EV reflects the managed exit, not infinity
         pnl = np.maximum(pnl, -max_loss)
+        pnl_mid = np.maximum(pnl_mid, -max_loss)
     else:
-        max_loss = float(-min(pnl.min(), 0.0))
+        max_loss = float(-min(pnl_mid.min(), 0.0))
         capital = max_loss
         if max_loss <= 1e-6:
             return None                                 # no defined risk / degenerate
@@ -442,6 +502,7 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
         risk_mode=risk_mode, capital=round(capital, 4),
         ev_per_capital=round(ev_per_capital, 6), size_cap=round(size_cap, 3),
         stop_level=round(stop_level, 3),
+        execution=(execution.to_dict() if execution is not None else None),
     )
 
 

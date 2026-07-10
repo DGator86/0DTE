@@ -71,7 +71,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
-from journal import Journal
+from journal import Journal, economic_pnl
 from unified_loop import UnifiedOrchestrator
 from decision_engine import EngineConfig
 from regime_classifier import ClassifierConfig
@@ -467,7 +467,7 @@ def _run_fold(
         if with_cand else 0.0
     )
 
-    pnls = [r["realized_pnl"] for r in traded if r["realized_pnl"] is not None]
+    pnls = [p for r in traded if (p := economic_pnl(r)) is not None]
     total_pnl   = round(sum(pnls), 6) if pnls else 0.0
     mean_pnl    = round(sum(pnls) / len(pnls), 6) if pnls else None
     win_rate    = round(sum(1 for p in pnls if p > 0) / len(pnls), 4) if pnls else None

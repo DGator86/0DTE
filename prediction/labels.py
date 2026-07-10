@@ -343,11 +343,14 @@ def candidate_outcome_labels(legs: list, credit: float,
                              labeler: Optional[SessionLabeler] = None,
                              entry_ts: Optional[dt.datetime] = None,
                              target_pnl: Optional[float] = None,
-                             stop_pnl: Optional[float] = None) -> dict:
+                             stop_pnl: Optional[float] = None,
+                             execution: Optional[dict] = None) -> dict:
     """
     Outcome record for one candidate (§9.8). Settlement P&L uses midpoint
-    entry economics (pnl_mid); expected/conservative-fill P&L are recorded as
-    None until the execution-cost model lands (PR 6) — absent, never faked.
+    entry economics for `pnl_mid` (diagnostic). When an ExecutionEstimate
+    dict is supplied (PR 6), `pnl_expected_fill` and `pnl_conservative` are
+    the primary V2 economic labels (§13.5) — net of entry fees and expected
+    exit drag. Absent execution, those fields stay None (never faked).
 
     Path P&L (MFE/MAE, target/stop) is approximated by marking the structure
     intrinsically at each bar's high, low and close — a lower bound on option
@@ -355,20 +358,34 @@ def candidate_outcome_labels(legs: list, credit: float,
     Same-bar target+stop is ambiguous and conservatively resolved to the stop.
     """
     pnl_mid = _structure_value(legs, credit, settle_price)
+    pnl_exp = pnl_con = None
+    if execution is not None:
+        exit_drag = float(execution.get("exit_slippage_expected") or 0.0) + float(
+            execution.get("exit_fees_expected") or 0.0)
+        stop_drag = float(execution.get("exit_slippage_stop") or 0.0) + float(
+            execution.get("exit_fees_expected") or 0.0)
+        if execution.get("net_expected_credit") is not None:
+            pnl_exp = (_structure_value(legs, execution["net_expected_credit"],
+                                        settle_price) - exit_drag)
+        if execution.get("net_conservative_credit") is not None:
+            pnl_con = (_structure_value(legs, execution["net_conservative_credit"],
+                                        settle_price) - stop_drag)
+    # Primary economic return-on-risk uses expected-fill when available.
+    econ = pnl_exp if pnl_exp is not None else pnl_mid
     out = {
         "settled": 1,
         "settlement_price": float(settle_price),
         "pnl_mid": pnl_mid,
-        "pnl_expected_fill": None,       # PR 6 (execution-cost model)
-        "pnl_conservative": None,        # PR 6
-        "pnl_policy": None,              # PR 6 (exit-policy simulation)
+        "pnl_expected_fill": pnl_exp,
+        "pnl_conservative": pnl_con,
+        "pnl_policy": None,              # exit-policy simulation (later PR)
         "mfe": None, "mae": None,
         "target_hit": None, "stop_hit": None,
         "first_event": None, "ambiguous_same_bar": None,
         "time_in_trade_min": None,
-        "return_on_risk": (pnl_mid / max_loss
+        "return_on_risk": (econ / max_loss
                            if max_loss is not None and max_loss > 0 else None),
-        "return_on_capital": (pnl_mid / capital
+        "return_on_capital": (econ / capital
                               if capital is not None and capital > 0 else None),
     }
     if labeler is None or entry_ts is None:
