@@ -238,6 +238,7 @@
   function renderPlaybook(latest, live) {
     const t = latest || {};
     const inp = live.inputs || {};
+    const s = tickSignals(t) || {};
     $("playbook-fam").textContent = t.selected_family || (live.doing && live.doing.structure) || "—";
 
     // The candidate journaled on a NO_TRADE tick is the measurement loop's
@@ -248,6 +249,9 @@
     $("playbook-diag").hidden = !isDiagnostic;
 
     const evCls = num(t.ev) > 0 ? "pos" : num(t.ev) < 0 ? "neg" : "";
+    const liveEv = num(s.phys_live_ev) != null ? num(s.phys_live_ev) : num(t.ev);
+    const shadowEv = num(s.phys_v2_shadow_ev);
+    const delta = (liveEv != null && shadowEv != null) ? shadowEv - liveEv : null;
     const cards = [
       metricCard("Short", strikes(t.short_strikes)),
       metricCard("Long", strikes(t.long_strikes)),
@@ -261,8 +265,215 @@
       metricCard("Gamma", fmt(t.gamma, 3)),
       metricCard("Cand. score", fmt(t.candidate_score, 1)),
       metricCard("Breakeven", fmt(inp.straddle_breakeven, 2)),
+      metricCard("Density mode", esc(s.phys_density_mode || "—"), "info"),
+      metricCard("Live EV", money(liveEv, 0), num(liveEv) > 0 ? "pos" : num(liveEv) < 0 ? "neg" : ""),
+      metricCard("V2 shadow EV", money(shadowEv, 0), num(shadowEv) > 0 ? "pos" : num(shadowEv) < 0 ? "neg" : ""),
+      metricCard("V2 − live Δ", money(delta, 0), num(delta) > 0 ? "pos" : num(delta) < 0 ? "neg" : ""),
+      metricCard("V2 var ratio", fmt(s.phys_v2_var_ratio, 2)),
+      metricCard("V2 uncertainty", fmt(s.phys_v2_uncertainty, 2),
+        num(s.phys_v2_uncertainty) > 0.5 ? "warn" : ""),
     ];
+    if (num(s.v2_utility_score) != null) {
+      cards.push(metricCard("V2 utility", fmt(s.v2_utility_score, 2),
+        num(s.v2_rank_disagreement) ? "warn" : "pos"));
+    }
+    if (num(t.liquidity_score) != null) {
+      cards.push(metricCard("Liquidity", fmt(t.liquidity_score, 2)));
+    }
+    if (num(t.credit_expected) != null) {
+      cards.push(metricCard("Credit exp.", "$" + fmt(t.credit_expected, 2)));
+    }
     $("playbook-metrics").innerHTML = cards.join("");
+  }
+
+  /* ---------------- policy shadow (PR 10) ---------------- */
+  function renderPolicy(latest) {
+    const s = tickSignals(latest) || {};
+    const mode = s.policy_mode || "—";
+    $("policy-mode").textContent = mode;
+    const disagree = num(s.policy_disagreement) === 1;
+    const fallback = num(s.policy_fallback_used) === 1;
+    const legStruct = s.legacy_policy_structure || s.policy_structure || "—";
+    const legAct = s.legacy_policy_action || s.policy_action || "—";
+    const legDir = s.legacy_policy_direction || s.policy_direction || "";
+    const v2Struct = s.v2_policy_structure || "—";
+    const v2Act = s.v2_policy_action || (fallback ? "fallback" : "—");
+    const v2Dir = s.v2_policy_direction || "";
+
+    if (!s.policy_mode && !s.policy_action && !s.legacy_policy_structure) {
+      $("policy-compare").innerHTML = '<p class="empty">No policy signals on latest tick</p>';
+      $("policy-metrics").innerHTML = "";
+      $("policy-chips").innerHTML = "";
+      return;
+    }
+
+    $("policy-compare").innerHTML = `
+      <div class="policy-side${disagree ? " disagree" : ""}">
+        <div class="ps-label">Legacy (authoritative in shadow)</div>
+        <div class="ps-struct">${esc(legStruct || "NT")}</div>
+        <div class="ps-meta">${esc(legAct)}${legDir ? " · " + esc(legDir) : ""}</div>
+      </div>
+      <div class="policy-side${disagree ? " disagree" : ""}">
+        <div class="ps-label">V2 prediction policy</div>
+        <div class="ps-struct">${esc(v2Struct || "—")}</div>
+        <div class="ps-meta">${esc(v2Act)}${v2Dir ? " · " + esc(v2Dir) : ""}</div>
+      </div>`;
+
+    $("policy-metrics").innerHTML = [
+      metricCard("Source", esc(s.policy_source || "—"),
+        s.policy_source === "fallback_legacy" ? "warn" : ""),
+      metricCard("Confidence", fmt(s.policy_confidence != null ? s.policy_confidence
+        : s.v2_policy_confidence, 2)),
+      metricCard("Uncertainty", fmt(s.policy_uncertainty != null ? s.policy_uncertainty
+        : s.v2_policy_uncertainty, 2),
+        num(s.policy_uncertainty) > 0.5 ? "warn" : ""),
+      metricCard("Size cap", fmt(s.policy_size_cap, 2)),
+      metricCard("V2 conf.", fmt(s.v2_policy_confidence, 2)),
+      metricCard("Version", esc(s.policy_version || s.v2_policy_version || "—")),
+    ].join("");
+
+    const chips = [];
+    if (disagree) chips.push('<span class="chip disagree">disagreement</span>');
+    if (fallback) chips.push('<span class="chip fallback">fallback legacy</span>');
+    if (s.policy_hard_vetoes) {
+      String(s.policy_hard_vetoes).split(",").filter(Boolean).forEach((v) =>
+        chips.push(`<span class="chip veto">${esc(v.trim())}</span>`));
+    }
+    if (s.policy_rationale) {
+      chips.push(`<span class="chip info" title="${esc(s.policy_rationale)}">${esc(String(s.policy_rationale).slice(0, 80))}</span>`);
+    }
+    if (!chips.length) chips.push('<span class="chip ok">aligned</span>');
+    $("policy-chips").innerHTML = chips.join("");
+  }
+
+  /* ---------------- GEX variants (PR 9) ---------------- */
+  function renderGexVariants(latest, report) {
+    const s = tickSignals(latest) || {};
+    const auth = s.gex_authoritative || "oi";
+    $("gex-auth").textContent = auth ? `auth · ${auth}` : "—";
+    const hasPanel = ["oi", "weekly", "volume", "hybrid"].some(
+      (v) => num(s[`gex_${v}_net_gex`]) != null || num(s[`gex_${v}_gamma_flip`]) != null);
+    const cmp = (report && report.gex_variant_comparison) || {};
+
+    if (!hasPanel && !cmp.n) {
+      $("gex-metrics").innerHTML = '<p class="empty">No GEX variant signals yet</p>';
+      return;
+    }
+
+    const disagree = num(s.gex_disagree_sign);
+    const cards = [
+      metricCard("Sign disagree", disagree == null ? "—" : (disagree ? "yes" : "no"),
+        disagree ? "warn" : "pos"),
+      metricCard("Flip spread", fmt(s.gex_disagree_flip_spread, 2),
+        num(s.gex_disagree_flip_spread) > 1 ? "warn" : ""),
+      metricCard("Wall Δ call", fmt(s.gex_disagree_wall_call, 2)),
+      metricCard("Wall Δ put", fmt(s.gex_disagree_wall_put, 2)),
+      metricCard("Net GEX range", compact(s.gex_disagree_net_gex_range)),
+      metricCard("Variants", s.gex_disagree_n_variants != null
+        ? String(s.gex_disagree_n_variants) : "—"),
+    ];
+    ["oi", "weekly", "volume", "hybrid"].forEach((v) => {
+      const flip = s[`gex_${v}_gamma_flip`];
+      const net = s[`gex_${v}_net_gex`];
+      if (num(flip) == null && num(net) == null) return;
+      const q = s[`gex_${v}_quality_score`];
+      cards.push(metricCard(
+        `${v} flip`,
+        `${fmt(flip, 2)}${num(q) != null ? " · q" + fmt(q, 2) : ""}`,
+        v === auth ? "info" : ""));
+    });
+    if (cmp.disagree_sign_rate != null) {
+      cards.push(metricCard("Hist. disagree rate", pct(cmp.disagree_sign_rate),
+        num(cmp.disagree_sign_rate) > 0.2 ? "warn" : ""));
+    }
+    if (cmp.variants) {
+      Object.entries(cmp.variants).forEach(([v, p]) => {
+        if (p && p.corr_vs_pnl != null) {
+          cards.push(metricCard(`${v} corr P&L`, fmt(p.corr_vs_pnl, 3),
+            num(p.corr_vs_pnl) > 0 ? "pos" : "neg"));
+        }
+      });
+    }
+    $("gex-metrics").innerHTML = cards.join("");
+  }
+
+  /* ---------------- dealer dynamics ---------------- */
+  function renderDynamics(latest) {
+    const s = tickSignals(latest) || {};
+    const keys = [
+      ["expected_move_consumed", "Move consumed", (v) => pct(v)],
+      ["flip_chase", "Flip chase", (v) => fmt(v, 3)],
+      ["flip_velocity", "Flip velocity", (v) => fmt(v, 3)],
+      ["gex_velocity_bn", "GEX velocity", (v) => fmt(v, 3)],
+      ["wall_rupture", "Wall rupture", (v) => fmt(v, 2)],
+      ["call_wall_velocity", "Call wall vel", (v) => fmt(v, 3)],
+      ["put_wall_velocity", "Put wall vel", (v) => fmt(v, 3)],
+      ["straddle_ramp", "Straddle ramp", (v) => fmt(v, 3)],
+      ["chan_bb_squeeze", "BB squeeze", (v) => fmt(v, 1)],
+      ["chan_donchian_breakout_up", "Donchian up", (v) => fmt(v, 1)],
+      ["chan_donchian_breakout_down", "Donchian dn", (v) => fmt(v, 1)],
+    ];
+    const cards = [];
+    keys.forEach(([k, label, fmtFn]) => {
+      if (num(s[k]) == null && s[k] !== 0) return;
+      const warn = (k === "wall_rupture" && num(s[k]) > 0)
+        || (k === "expected_move_consumed" && num(s[k]) > 0.7);
+      cards.push(metricCard(label, fmtFn(s[k]), warn ? "warn" : ""));
+    });
+    $("dynamics-metrics").innerHTML = cards.length
+      ? cards.join("")
+      : '<p class="empty">No dynamics signals on latest tick</p>';
+  }
+
+  /* ---------------- V2 forecast bundle ---------------- */
+  function renderForecast(predPayload) {
+    const row = predPayload && predPayload.prediction;
+    const p = (row && row.predictions) || {};
+    if (!row || !Object.keys(p).length) {
+      $("forecast-sub").textContent = predPayload && predPayload.note
+        ? "unavailable" : "—";
+      $("forecast-metrics").innerHTML =
+        '<p class="empty">No PredictionBundle for this snapshot</p>';
+      return;
+    }
+    $("forecast-sub").textContent = row.mode || row.model_group_version || "bundle";
+    const cards = [
+      metricCard("P(up) 30m", pct(p.p_up_30m)),
+      metricCard("P(up) close", pct(p.p_up_close)),
+      metricCard("E[r] 30m", fmt(p.expected_return_30m, 4)),
+      metricCard("q10 / q50 / q90",
+        `${fmt(p.return_q10_30m, 4)} / ${fmt(p.return_q50_30m, 4)} / ${fmt(p.return_q90_30m, 4)}`),
+      metricCard("Range survive 30m", pct(p.p_range_survive_30m)),
+      metricCard("Realized move 30m", fmt(p.expected_realized_move_30m, 4)),
+      metricCard("Touch call wall", pct(p.p_touch_call_wall_30m)),
+      metricCard("Touch put wall", pct(p.p_touch_put_wall_30m)),
+      metricCard("Uncertainty", fmt(p.uncertainty != null ? p.uncertainty : row.uncertainty, 2),
+        num(p.uncertainty != null ? p.uncertainty : row.uncertainty) > 0.5 ? "warn" : ""),
+      metricCard("Data quality", pct(p.data_quality)),
+      metricCard("Coverage", pct(p.feature_coverage)),
+    ];
+    $("forecast-metrics").innerHTML = cards.join("");
+  }
+
+  /* ---------------- signal correlations (V2 keys from report) ---------------- */
+  const SIGCORR_PREFIXES = ["sig:policy_", "sig:v2_", "sig:phys_", "sig:gex_",
+    "sig:expected_move", "sig:flip_", "sig:wall_", "sig:chan_"];
+  function renderSigCorr(report) {
+    const corr = (report && report.component_correlations) || {};
+    const entries = Object.entries(corr)
+      .filter(([k]) => SIGCORR_PREFIXES.some((p) => k.startsWith(p)))
+      .map(([k, v]) => [k.replace(/^sig:/, ""), num(v && v.r != null ? v.r : v)])
+      .filter(([, r]) => r != null)
+      .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+      .slice(0, 14);
+    if (!entries.length) {
+      $("sigcorr-rows").innerHTML = '<p class="empty">No V2 signal correlations yet</p>';
+      return;
+    }
+    $("sigcorr-rows").innerHTML = `<div class="val-corr">${entries.map(([k, r]) =>
+      `<div class="val-corr-row"><span>${esc(k)}</span>
+        <span class="${r >= 0 ? "pos" : "neg"}">${r >= 0 ? "+" : ""}${r.toFixed(3)}</span></div>`
+    ).join("")}</div>`;
   }
 
   /* ---------------- regime confidence bars ---------------- */
@@ -554,7 +765,7 @@
       : '<div class="fn-empty">none</div>';
     return `<div class="fn-col"><div class="fn-title">${esc(title)}</div>${rows}</div>`;
   }
-  function renderFunnel(report) {
+  function renderFunnel(report, ticks) {
     const f = report && report.decision_funnel;
     if (!f || !f.n) {
       $("funnel-sub").textContent = "—";
@@ -569,6 +780,22 @@
     const flips = (f.premium_flips || {}).n;
     const gex = f.gex_rank || {};
     const warmFrac = gex.frac_at_warmup_neutral;
+
+    // Session-local policy disagreement roll-up from journaled ticks (PR 10).
+    let polN = 0, polDisagree = 0, polFallback = 0;
+    const polPairs = {};
+    (ticks || []).forEach((t) => {
+      const s = tickSignals(t);
+      if (!s || !s.policy_mode) return;
+      polN += 1;
+      if (num(s.policy_disagreement) === 1) {
+        polDisagree += 1;
+        const key = `${s.legacy_policy_structure || "?"}→${s.v2_policy_structure || "?"}`;
+        polPairs[key] = (polPairs[key] || 0) + 1;
+      }
+      if (num(s.policy_fallback_used) === 1) polFallback += 1;
+    });
+
     $("funnel-metrics").innerHTML = [
       metricCard("Credit routed · traded", `${credit.n || 0} · ${credit.traded || 0}`,
         (credit.traded || 0) > 0 ? "pos" : "warn"),
@@ -580,6 +807,12 @@
         num(warmFrac) > 0.2 ? "warn" : ""),
       metricCard("GEX rank < gate floor", gex.frac_below_gate_floor != null
         ? `${pct(gex.frac_below_gate_floor)} of ticks` : "—"),
+      metricCard("Policy disagree (session)",
+        polN ? `${polDisagree}/${polN}` : "—",
+        polDisagree > 0 ? "warn" : ""),
+      metricCard("Policy fallback (session)",
+        polN ? `${polFallback}/${polN}` : "—",
+        polFallback > 0 ? "warn" : ""),
     ].join("");
 
     const mixCounts = Object.fromEntries(
@@ -598,6 +831,7 @@
         { warnKeys: new Set(["GEX_WEAK", "TRENDING"]) }),
       fnHistCol("Dealer vetoes", f.regime_vetoes),
       fnHistCol("Selector vetoes", f.selector_vetoes),
+      fnHistCol("Policy disagreements", polPairs, { creditTint: false }),
     ].join("");
   }
 
@@ -651,9 +885,23 @@
     $("timeline").innerHTML = ticks.map((t) => {
       const trade = t.decision === "TRADE";
       const fam = t.selected_family || "—";
+      const s = tickSignals(t) || {};
+      const extras = [];
+      if (s.policy_structure || s.legacy_policy_structure) {
+        const leg = s.legacy_policy_structure || s.policy_structure;
+        const v2 = s.v2_policy_structure;
+        extras.push(v2 && v2 !== leg
+          ? `pol ${leg}≠${v2}`
+          : `pol ${leg || "—"}`);
+      }
+      if (s.phys_density_mode) extras.push(s.phys_density_mode);
+      if (num(s.gex_disagree_sign) === 1) extras.push("gex≠");
+      if (num(s.policy_fallback_used) === 1) extras.push("fallback");
+      const extraHtml = extras.length
+        ? ` <small class="tl-v2">${esc(extras.join(" · "))}</small>` : "";
       const detail = trade
-        ? `${esc(fam)} <small>gate ${fmt(t.gate_score, 0)} · EV ${money(t.ev, 0)}</small>`
-        : `<small>${esc((t.no_trade_reason || t.gex_regime || "no trade").replace(/_/g, " "))}</small>`;
+        ? `${esc(fam)} <small>gate ${fmt(t.gate_score, 0)} · EV ${money(t.ev, 0)}</small>${extraHtml}`
+        : `<small>${esc((t.no_trade_reason || t.gex_regime || "no trade").replace(/_/g, " "))}</small>${extraHtml}`;
       const tint = t.regime_direction === "call" ? " tl-call"
                  : t.regime_direction === "put" ? " tl-put" : "";
       return `<div class="tl-item${trade ? " is-trade" : ""}${tint}">
@@ -1798,11 +2046,14 @@
       renderSignal(live);
       renderOpenPositions(live.paper);
       renderPlaybook(candidate, live);
+      renderPolicy(latest);
       renderRegime(live);
       renderReason(live, candidate);
       renderWhy(live);
       renderVol(live);
       renderTech(live);
+      renderGexVariants(latest, report);
+      renderDynamics(latest);
       // Before any trade has closed, /api/paper's equity is null (it's derived
       // from the last CLOSED trade's balance in SQL); the live broker snapshot
       // embedded in /api/live already has the correct starting/current equity.
@@ -1811,11 +2062,21 @@
       }
       renderPaper(paper);
       renderEdge(report);
-      renderFunnel(report);
+      renderFunnel(report, ticks);
       renderPredict(report);
+      renderSigCorr(report);
       renderReadiness(readiness);
       renderTimeline(history);
       staleNote(live, market);
+
+      // PredictionBundle for the latest tick (separate store; optional).
+      if (latest && latest.snapshot_id) {
+        api("/api/predictions?snapshot_id=" + encodeURIComponent(latest.snapshot_id))
+          .then(renderForecast)
+          .catch(() => renderForecast(null));
+      } else {
+        renderForecast(null);
+      }
 
       lastChartData = { ticks, live, market, trades };
       drawChart();

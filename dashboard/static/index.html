@@ -79,6 +79,13 @@
           </div>
         </section>
 
+        <section class="panel" id="policy-panel">
+          <h2>Policy shadow <span class="h2-right" id="policy-mode">—</span></h2>
+          <div class="policy-compare" id="policy-compare"></div>
+          <div class="metrics" id="policy-metrics"></div>
+          <div class="chips" id="policy-chips" style="margin-top:10px"></div>
+        </section>
+
         <section class="panel hidden" id="open-positions-panel">
           <h2>Open position <span class="h2-right" id="open-positions-count">—</span></h2>
           <div id="open-positions-list"></div>
@@ -90,6 +97,11 @@
             <span class="h2-right" id="playbook-fam">—</span>
           </h2>
           <div class="metrics" id="playbook-metrics"></div>
+        </section>
+
+        <section class="panel" id="forecast-panel">
+          <h2>V2 forecast <span class="h2-right" id="forecast-sub">—</span></h2>
+          <div class="metrics" id="forecast-metrics"></div>
         </section>
 
         <section class="panel" id="regime-panel">
@@ -160,6 +172,16 @@
           <div class="metrics" id="tech-metrics"></div>
         </section>
 
+        <section class="panel" id="gex-panel">
+          <h2>GEX variants <span class="h2-right" id="gex-auth">—</span></h2>
+          <div class="metrics" id="gex-metrics"></div>
+        </section>
+
+        <section class="panel" id="dynamics-panel">
+          <h2>Dealer dynamics</h2>
+          <div class="metrics" id="dynamics-metrics"></div>
+        </section>
+
         <section class="panel" id="paper-panel">
           <h2>Paper account <span class="h2-right">simulated</span></h2>
           <div class="metrics" id="paper-metrics"></div>
@@ -173,6 +195,11 @@
         <section class="panel" id="predict-panel">
           <h2>Predictive power</h2>
           <div class="metrics" id="predict-metrics"></div>
+        </section>
+
+        <section class="panel" id="sigcorr-panel">
+          <h2>Signal correlations <span class="h2-right">V2 · settled</span></h2>
+          <div id="sigcorr-rows"><p class="empty">No correlation sample yet</p></div>
         </section>
 
       </div>

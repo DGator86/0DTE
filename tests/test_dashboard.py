@@ -265,3 +265,92 @@ def test_api_ras_history(monkeypatch, tmp_path):
     r = c.get("/api/ras", headers=hdrs)
     assert r.status_code == 200
     assert r.json()["evaluations"] == []
+
+
+def test_api_gex_variants_and_predictions(monkeypatch, tmp_path):
+    """V2 dashboard endpoints: GEX variant comparison + PredictionBundle join."""
+    monkeypatch.setenv("DASHBOARD_TOKEN", "test-secret-token")
+    from journal import COLUMNS, Journal
+    from prediction.storage import PredictionStore
+
+    db = str(tmp_path / "shadow.db")
+    pred_db = str(tmp_path / "prediction_store.sqlite")
+    jrn = Journal(db)
+    # Need >=3 settled rows for gex_variant_comparison. Settlement columns
+    # are not part of Journal.log()'s insert set — fill them via SQL.
+    for i, (pnl, disagree) in enumerate([(10.0, 0), (-5.0, 1), (3.0, 0)]):
+        row = {c: None for c in COLUMNS}
+        row.update({
+            "ts": f"2026-07-10T10:{i:02d}:00-04:00",
+            "session_date": "2026-07-10",
+            "decision": "TRADE",
+            "spot": 600.0 + i,
+            "snapshot_id": f"snap-{i}",
+            "signals_json": json.dumps({
+                "gex_oi_net_gex": 1e9,
+                "gex_weekly_net_gex": -1e9 if disagree else 1e9,
+                "gex_volume_net_gex": 1e9,
+                "gex_hybrid_net_gex": 1e9,
+                "gex_disagree_sign": disagree,
+                "policy_mode": "shadow",
+                "policy_disagreement": disagree,
+            }),
+        })
+        rid = jrn.log(row)
+        jrn.conn.execute(
+            "UPDATE evaluations SET realized_pnl=?, settled=1 WHERE id=?",
+            (pnl, rid))
+    jrn.conn.commit()
+    jrn.close()
+
+    store = PredictionStore(pred_db)
+    store.log_prediction(
+        snapshot_id="snap-2",
+        model_group_version="test-v1",
+        predictions={
+            "p_up_30m": 0.62,
+            "p_range_survive_30m": 0.55,
+            "uncertainty": 0.2,
+            "data_quality": 0.9,
+        },
+        uncertainty=0.2,
+        generated_at="2026-07-10T10:02:00-04:00",
+        mode="shadow",
+    )
+    store.conn.close()
+
+    live = str(tmp_path / "live.json")
+    write_live_state(live, {"ts": "x", "doing": {}})
+    _configure(db, str(tmp_path / "paper.sqlite"), live,
+               prediction_db=pred_db)
+
+    c = TestClient(app)
+    hdrs = {"Authorization": "Bearer test-secret-token"}
+
+    r = c.get("/api/gex-variants", headers=hdrs)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["n"] >= 3
+    assert "oi" in body["variants"]
+    assert body["variants"]["weekly"]["sign_disagree_vs_oi"] is not None
+
+    r = c.get("/api/report", headers=hdrs)
+    assert r.status_code == 200
+    assert "gex_variant_comparison" in r.json()
+
+    r = c.get("/api/predictions?snapshot_id=snap-2", headers=hdrs)
+    assert r.status_code == 200
+    pred = r.json()["prediction"]
+    assert pred is not None
+    assert pred["predictions"]["p_up_30m"] == 0.62
+
+    r = c.get("/api/predictions?snapshot_id=missing", headers=hdrs)
+    assert r.status_code == 200
+    assert r.json()["prediction"] is None
+
+    # missing prediction DB still degrades
+    _configure(db, str(tmp_path / "paper.sqlite"), live,
+               prediction_db=str(tmp_path / "absent_pred.sqlite"))
+    r = c.get("/api/predictions?snapshot_id=snap-2", headers=hdrs)
+    assert r.status_code == 200
+    assert r.json()["prediction"] is None

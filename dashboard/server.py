@@ -21,6 +21,8 @@ from dashboard.auth import AuthMiddleware, ReadOnlyMiddleware, get_dashboard_tok
 from dashboard.queries import (
     candidate_configs,
     feature_scores,
+    fetch_prediction_for_snapshot,
+    gex_variant_summary,
     journal_fetch,
     journal_max_id,
     journal_row,
@@ -48,11 +50,13 @@ _config: dict = {}
 
 
 def _configure(db: str, paper_db: str, live_state: str,
-               configs_dir: str = "configs") -> None:
+               configs_dir: str = "configs",
+               prediction_db: str = "prediction_store.sqlite") -> None:
     _config["db"] = db
     _config["paper_db"] = paper_db
     _config["live_state"] = live_state
     _config["configs_dir"] = configs_dir
+    _config["prediction_db"] = prediction_db
 
 
 @app.get("/")
@@ -150,6 +154,29 @@ async def api_report():
     if not os.path.isfile(db):
         return {"note": "journal database not found"}
     return report_summary(db)
+
+
+@app.get("/api/gex-variants")
+async def api_gex_variants(
+    session_date: Optional[str] = Query(None),
+):
+    """PR 9 — settled GEX variant comparison (corr vs P&L, sign disagreement)."""
+    db = _config.get("db", "shadow.db")
+    if not os.path.isfile(db):
+        return {"note": "journal database not found"}
+    return gex_variant_summary(db, session_date=session_date)
+
+
+@app.get("/api/predictions")
+async def api_predictions(
+    snapshot_id: str = Query(..., min_length=1),
+):
+    """PR 4+ — PredictionBundle for a journal snapshot_id (read-only)."""
+    return fetch_prediction_for_snapshot(
+        snapshot_id,
+        prediction_db=_config.get("prediction_db", "prediction_store.sqlite"),
+        journal_db=_config.get("db", "shadow.db"),
+    )
 
 
 @app.get("/api/validation")
@@ -288,11 +315,14 @@ def main() -> None:
     parser.add_argument("--live-state", default="live_state.json", help="Live state JSON path")
     parser.add_argument("--configs-dir", default="configs",
                         help="Directory holding champion.json (Learning tab)")
+    parser.add_argument("--prediction-db", default="prediction_store.sqlite",
+                        help="PredictionStore SQLite (PredictionBundle rows)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
-    _configure(args.db, args.paper_db, args.live_state, args.configs_dir)
+    _configure(args.db, args.paper_db, args.live_state, args.configs_dir,
+               prediction_db=args.prediction_db)
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

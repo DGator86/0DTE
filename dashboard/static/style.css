@@ -739,3 +739,39 @@ html, body {
   font-size: 11px; padding: 1px 6px; border-radius: 5px;
   background: rgba(74,168,255,0.08); border: 1px solid rgba(74,168,255,0.25);
 }
+
+/* ---- V2 policy / GEX / forecast panels ---- */
+.policy-compare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.policy-side {
+  background: var(--panel-2, rgba(255,255,255,0.03));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.policy-side.disagree {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 1px rgba(255,182,72,0.2);
+}
+.policy-side .ps-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--muted); margin-bottom: 4px;
+}
+.policy-side .ps-struct {
+  font-family: var(--mono); font-size: 16px; font-weight: 700;
+}
+.policy-side .ps-meta {
+  font-size: 11px; color: var(--muted); margin-top: 4px;
+}
+.chip.disagree { color: var(--amber); border-color: var(--amber); background: rgba(255,182,72,0.08); }
+.chip.info { color: var(--blue, #4aa8ff); border-color: rgba(74,168,255,0.35); }
+.chip.fallback { color: var(--red); border-color: var(--red-dim); }
+#sigcorr-rows .val-corr-row { padding: 3px 0; border-bottom: 1px solid var(--border); }
+#sigcorr-rows .val-corr-row:last-child { border-bottom: none; }
+@media (max-width: 700px) {
+  .policy-compare { grid-template-columns: 1fr; }
+}
