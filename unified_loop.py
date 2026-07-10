@@ -658,7 +658,6 @@ class UnifiedOrchestrator:
                         RankerConfig, run_shadow_ranking,
                     )
                     from spread_selector import select_spreads, GammaContext
-                    from rnd_extractor import extract_rnd, compute_edge
 
                     rcfg = self.candidate_ranker_cfg or RankerConfig()
                     shadow_cands = list(decision.all_candidates or [])
