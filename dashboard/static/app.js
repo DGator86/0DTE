@@ -1364,7 +1364,13 @@
   function renderValList() {
     $("val-count").textContent = String(valReports.length);
     if (!valReports.length) {
-      $("val-list").innerHTML = '<p class="empty">No validation reports yet — the scheduled pipeline will populate this after its first run</p>';
+      const emptyMsg = {
+        "": "No validation reports yet — the scheduled pipeline will populate this after its first run",
+        daily: "No daily reports yet",
+        weekly: "No weekly reports yet",
+        feature_impact: "No feature-impact reports yet — these are generated manually via scripts/feature_impact.py",
+      }[valFilter] || "No validation reports yet";
+      $("val-list").innerHTML = `<p class="empty">${emptyMsg}</p>`;
       return;
     }
     $("val-list").innerHTML = valReports.map((r) => {
@@ -1533,7 +1539,10 @@
       renderValList();
       const rep = valReports.find((r) => r.id === valSelectedId);
       if (rep) renderValDetail(rep);
-      else $("val-detail").innerHTML = '<p class="empty">Select a report</p>';
+      else {
+        $("val-detail-date").textContent = "—";
+        $("val-detail").innerHTML = '<p class="empty">Select a report</p>';
+      }
     } catch (e) {
       if (e.message !== "Unauthorized") console.warn("validation", e);
     }
