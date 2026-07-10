@@ -125,6 +125,20 @@ class UnifiedOrchestrator:
     # Observation-only; a failed write never breaks a tick.
     prediction_store: Optional[object] = None
     symbol: str = "SPY"
+    # Physical-density migration (Prediction Engine V2, PR 5 / §12.5).
+    # True (default): keep the legacy dir_drift_frac tilt of the realized-vol
+    # density when the router emits a directional debit — the pre-V2 path.
+    # False: when a PhysicalForecast is available, price candidates against
+    # the independent V2 density instead. Richness measurement always stays
+    # on the drift-less realized-vol density either way.
+    use_legacy_directional_tilt: bool = True
+    # Optional independent forecast for the V2 physical density. Either a
+    # static PhysicalForecast, a PredictionBundle (lifted via
+    # forecast_from_bundle), or a callable(snap, signals, intent) ->
+    # PhysicalForecast | PredictionBundle | None. Never receives the selected
+    # candidate or gate result — callers must not close that loop.
+    physical_forecast: Optional[object] = None
+    physical_forecast_provider: Optional[Callable] = None
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
@@ -277,6 +291,51 @@ class UnifiedOrchestrator:
              if isinstance(v, (int, float, str))}
         ) if merged else None
         return merged, signals_json
+
+    def _resolve_physical_forecast(self, snap, signals: dict, intent) -> Optional[object]:
+        """
+        Resolve an independent PhysicalForecast for this tick.
+
+        Sources, in order: physical_forecast_provider (callable), then the
+        static physical_forecast field. Accepts a PhysicalForecast or a
+        PredictionBundle (lifted via forecast_from_bundle). Returns None when
+        nothing usable is available — the tick then falls back to the legacy
+        / realized-vol path. The provider must NOT close the policy loop: it
+        may read snap/signals/intent features, but the density builder itself
+        never sees structure/direction/conviction.
+        """
+        from prediction.contracts import PredictionBundle
+        from prediction.physical_distribution import (
+            PhysicalForecast, forecast_from_bundle)
+
+        raw = None
+        if self.physical_forecast_provider is not None:
+            try:
+                raw = self.physical_forecast_provider(snap, signals, intent)
+            except Exception as exc:
+                log.warning("physical_forecast_provider failed: %s", exc)
+                raw = None
+        if raw is None:
+            raw = self.physical_forecast
+        if raw is None:
+            return None
+        if isinstance(raw, PhysicalForecast):
+            return raw
+        if isinstance(raw, PredictionBundle):
+            return forecast_from_bundle(raw)
+        if isinstance(raw, dict):
+            # allow a plain dict shaped like PhysicalForecast
+            try:
+                return PhysicalForecast(**{k: raw[k] for k in (
+                    "expected_return", "return_q10", "return_q50", "return_q90",
+                    "expected_realized_move", "volatility_scale",
+                    "skew_adjustment", "uncertainty", "model_version")
+                    if k in raw})
+            except (TypeError, ValueError) as exc:
+                log.warning("invalid physical_forecast dict: %s", exc)
+                return None
+        log.warning("unsupported physical_forecast type: %s", type(raw).__name__)
+        return None
 
     def _next_snapshot_id(self, now: dt.datetime) -> str:
         """Stable per-tick observation id (PR 3): SHA256 of symbol |
@@ -493,26 +552,98 @@ class UnifiedOrchestrator:
             return result
 
         # ---- Track A: full engine (requires chain) ----
-        # A resolved directional intent carries a drift belief. Encode it as a
-        # tilt of the same realized-vol density (fraction of phys std, scaled
-        # by conviction) so debit structures aren't priced against a density
-        # that says the market goes nowhere. The tick-level edge/richness above
-        # stays drift-less — variance, not direction, is that measurement.
+        # Physical density for candidate EV. Priority:
+        #   1. Injected self.physical_pdf (tests / external override)
+        #   2. V2 independent density from PhysicalForecast, when the legacy
+        #      tilt flag is off (§12.5 migration)
+        #   3. Legacy dir_drift_frac tilt of the realized-vol density when the
+        #      router emits a directional debit AND use_legacy_directional_tilt
+        #   4. Drift-less realized-vol density (same as richness above)
+        # Richness (edge above) ALWAYS stays on the drift-less density — that
+        # measurement is variance, not direction, and must remain independent
+        # of the routed structure.
         decision = None
+        density_mode = "injected" if self.physical_pdf is not None else (
+            "realized_vol" if phys_pdf is not None else "vrp")
+        density_moments: Optional[dict] = None
+        v2_result = None
         if snap.chain is not None:
             decide_pdf = phys_pdf
-            if (self.physical_pdf is None and rnd is not None and sigma_rv is not None
+            forecast = self._resolve_physical_forecast(snap, signals, intent)
+            if forecast is not None and rnd is not None:
+                try:
+                    from prediction.physical_distribution import (
+                        build_physical_density)
+                    v2_result = build_physical_density(
+                        rnd, forecast,
+                        scale_min=cfg.rnd.rv_scale_min,
+                        scale_max=cfg.rnd.rv_scale_max)
+                    # Always journal V2 moments when a forecast is available
+                    # (shadow comparison), even if legacy tilt still prices
+                    # the live decision.
+                    signals["phys_v2_mean"] = v2_result.moments.get("mean")
+                    signals["phys_v2_std"] = v2_result.moments.get("std")
+                    signals["phys_v2_var_ratio"] = v2_result.moments.get(
+                        "var_ratio")
+                    signals["phys_v2_uncertainty"] = forecast.uncertainty
+                    signals["phys_v2_expected_return"] = forecast.expected_return
+                    signals["phys_v2_model_version"] = forecast.model_version
+                except Exception as exc:
+                    log.warning("V2 physical density failed: %s", exc)
+                    v2_result = None
+
+            use_v2 = (v2_result is not None
+                      and not self.use_legacy_directional_tilt
+                      and self.physical_pdf is None)
+            if use_v2:
+                decide_pdf = v2_result.as_callable()
+                density_mode = "v2"
+                density_moments = v2_result.moments
+            elif (self.physical_pdf is None and rnd is not None
+                    and sigma_rv is not None
+                    and self.use_legacy_directional_tilt
                     and intent.decision.structure in DIRECTIONAL_TILT_STRUCTURES):
+                # Legacy circular tilt — kept behind the migration flag.
                 sign = 1.0 if intent.decision.direction == "call" else -1.0
                 tilt = sign * cfg.rnd.dir_drift_frac * intent.size_mult
-                tilted = physical_pdf_from_realized_vol(rnd, sigma_rv, cfg.rnd,
-                                                        drift_std_frac=tilt)
+                tilted = physical_pdf_from_realized_vol(
+                    rnd, sigma_rv, cfg.rnd, drift_std_frac=tilt)
                 if tilted is not None:
                     decide_pdf = tilted
+                    density_mode = "legacy_tilt"
+                    signals["phys_legacy_tilt"] = tilt
+
+            # Shadow EV comparison: when V2 is available but legacy still
+            # prices the live decision (or vice versa), re-price the same
+            # candidate set under the other density and journal both EVs.
+            if (v2_result is not None and self.physical_pdf is None
+                    and density_mode != "v2"):
+                try:
+                    shadow = decide(
+                        snap.market, snap.chain, cfg,
+                        physical_pdf=v2_result.as_callable(),
+                        target_structure=intent.decision.structure,
+                        direction=intent.decision.direction,
+                        physical_density_mode="v2",
+                        physical_moments=v2_result.moments)
+                    if shadow.candidate is not None:
+                        signals["phys_v2_shadow_ev"] = shadow.candidate.ev
+                        signals["phys_v2_shadow_family"] = shadow.candidate.family
+                except Exception as exc:
+                    log.warning("V2 shadow EV failed: %s", exc)
+
             decision = decide(snap.market, snap.chain, cfg,
                               physical_pdf=decide_pdf,
                               target_structure=intent.decision.structure,
-                              direction=intent.decision.direction)
+                              direction=intent.decision.direction,
+                              physical_density_mode=density_mode,
+                              physical_moments=density_moments)
+            signals["phys_density_mode"] = density_mode
+            if (decision.candidate is not None
+                    and isinstance(decision.candidate.ev, (int, float))):
+                signals["phys_live_ev"] = decision.candidate.ev
+            # Re-finalize signals_json after density provenance is attached.
+            signals, signals_json = self._signals_with_ras(signals, ras_results)
             # ---- Risk gate (optional, applied before journaling) ----
             if (self.risk_manager is not None
                     and decision.decision == "TRADE"

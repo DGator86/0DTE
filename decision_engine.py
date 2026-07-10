@@ -67,6 +67,11 @@ class TradeDecision:
     edge_richness: float
     direction: str = ""           # Track B direction: call|put|both|none
     gate_kelly: float = 1.0       # gate's score->Kelly fraction; sizes the fill
+    # Physical-density provenance (Prediction Engine V2, PR 5). Observation-
+    # only: which density priced the candidate, and its moments. Never fed
+    # back into the density itself (independence rule §12.2).
+    physical_density_mode: str = ""
+    physical_moments: Optional[dict] = None
 
     def as_row(self) -> dict:
         c = self.candidate
@@ -123,7 +128,18 @@ def decide(
     physical_pdf: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     target_structure: Optional[str] = None,
     direction: str = "",
+    physical_density_mode: str = "",
+    physical_moments: Optional[dict] = None,
 ) -> TradeDecision:
+    """
+    Compose gate + selector into a TradeDecision.
+
+    `physical_pdf` is the SINGLE source of truth for edge and candidate EV.
+    Callers (unified_loop) are responsible for building it independently of
+    `target_structure` / `direction` when V2 is active — those arguments
+    select the gate class and the candidate family filter only; they must
+    never be used to construct the density that prices the trade (§12.2).
+    """
     cfg = cfg or EngineConfig()
     session_date = market.now.astimezone().date().isoformat()
     ts = market.now.isoformat()
@@ -192,4 +208,6 @@ def decide(
         gate_pass=gate_pass, gate_score=gate.score, gate_failed=gate.failed_gates,
         decision=decision, no_trade_reason=reason, edge_richness=edge_rich,
         direction=direction, gate_kelly=gate.kelly_fraction,
+        physical_density_mode=physical_density_mode or "",
+        physical_moments=dict(physical_moments) if physical_moments else None,
     )
