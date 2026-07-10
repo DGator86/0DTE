@@ -15,6 +15,10 @@ Currently implemented (PR 4 — probabilistic baselines):
                      and forecast/implied ratio.
   fill             — structure-specific fill-fraction priors for the
                      execution-cost model (PR 6); empirical trainer later.
+  barrier_touch    — calibrated elastic-net wall/flip/stop-before-target
+                     probabilities; optional path-sim features (PR 7).
+  range_survival   — calibrated wall-channel / short-strike / breakeven
+                     survival by horizon (PR 7).
 
 No deep learning by design: the number of independent market sessions is far
 smaller than the number of tick rows.

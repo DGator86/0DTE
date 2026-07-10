@@ -17,6 +17,14 @@ sizing before the live journal has a real sample, then corrected by the journal.
 This is a structured guess, not truth. It is only trustworthy once its predicted
 probabilities are checked against realized hit rates (see journal.calibration()).
 If MC says 60% and you realize 45%, believe the journal and recalibrate the knobs.
+
+V2 note (Prediction Engine PR 7)
+--------------------------------
+This module remains the **Gaussian / OU baseline**. The calibrated successor
+for path-relevant probabilities is ``prediction.path_model`` (residual
+block-bootstrap) plus ``prediction.models.barrier_touch`` /
+``range_survival``. Prefer those for decision-facing touch / range / barrier
+probs; keep ``project`` / ``project_range`` here for diagnostics and fallback.
 """
 from __future__ import annotations
 from dataclasses import dataclass

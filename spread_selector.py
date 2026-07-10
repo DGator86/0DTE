@@ -104,6 +104,10 @@ class SpreadCandidate:
     # SelectorConfig.use_executable_economics is True, `ev` is recomputed
     # from net expected-fill credit instead.
     execution: Optional[dict] = None
+    # Prediction Engine V2 / PR 7: touch source + optional legacy reflection
+    # value for shadow comparison when V2 touch_probability_fn is active.
+    touch_source: str = "reflection"                 # "v2" | "reflection"
+    legacy_prob_touch_short: Optional[float] = None
 
 
 @dataclass
@@ -181,6 +185,16 @@ class SelectorConfig:
     quote_age_seconds: Optional[float] = None        # chain age at decision time
     minutes_to_close: Optional[float] = None
     realized_vol: Optional[float] = None
+
+    # ---- barrier touch (Prediction Engine V2, PR 7) ----
+    # Optional override for short-strike touch probability. When set, must be a
+    # callable(strike: float) -> float in [0, 1] (e.g. a BarrierTouchModel or
+    # path-model frequency wrapped per strike). When None, the legacy RND
+    # reflection approximation (rnd.prob_touch) is used — retained as fallback.
+    touch_probability_fn: Optional[Callable[[float], float]] = None
+    # When True and touch_probability_fn is set, also journal the legacy
+    # reflection touch alongside the V2 value for shadow comparison.
+    journal_legacy_touch: bool = True
 
 
 # --------------------------------------------------------------------------- #
@@ -408,9 +422,21 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
     short_strikes = tuple(sorted(short_calls + short_puts))
 
     # touch risk: most exposed short
-    touches = [rnd.prob_touch(k) for k in short_strikes] or [0.0]
-    prob_touch_short = float(max(touches))
+    # Prefer calibrated V2 path/barrier model when provided; else RND reflection.
+    legacy_touches = [rnd.prob_touch(k) for k in short_strikes] or [0.0]
+    legacy_prob_touch = float(max(legacy_touches))
+    if cfg.touch_probability_fn is not None and short_strikes:
+        touches = [float(cfg.touch_probability_fn(k)) for k in short_strikes]
+        prob_touch_short = float(max(touches)) if touches else 0.0
+        touch_source = "v2"
+    else:
+        prob_touch_short = legacy_prob_touch
+        touch_source = "reflection"
     touch_safety = float(np.clip(1.0 - prob_touch_short, 0.0, 1.0))
+    legacy_for_journal = (
+        round(legacy_prob_touch, 4)
+        if (cfg.journal_legacy_touch and touch_source == "v2") else None
+    )
 
     # greeks
     gamma_tot = theta_tot = 0.0
@@ -457,7 +483,7 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
         reasons.append("illiquid")
     if not is_debit:
         if prob_touch_short > cfg.max_touch_short:
-            reasons.append(f"touch {prob_touch_short:.2f}>max")
+            reasons.append(f"touch {prob_touch_short:.2f}>max({touch_source})")
         if regime_short:
             reasons.append("short_gamma_regime")
         if cfg.veto_short_below_flip and short_below_flip:
@@ -503,6 +529,8 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
         ev_per_capital=round(ev_per_capital, 6), size_cap=round(size_cap, 3),
         stop_level=round(stop_level, 3),
         execution=(execution.to_dict() if execution is not None else None),
+        touch_source=touch_source,
+        legacy_prob_touch_short=legacy_for_journal,
     )
 
 
