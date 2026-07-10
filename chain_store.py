@@ -91,6 +91,7 @@ class ChainRecorder:
         self.directory = directory
         self._last_bar_ts: Optional[np.datetime64] = None
         self._last_session: Optional[str] = None
+        self._seq = 0                               # per-session source sequence
         os.makedirs(directory, exist_ok=True)
 
     def _path(self, session_date: str) -> str:
@@ -106,13 +107,16 @@ class ChainRecorder:
             if session != self._last_session:
                 self._last_bar_ts = None          # new session file: full bar window once
                 self._last_session = session
+                self._seq = 0
             rec = {
                 "t": "tick",
                 "ts": now.isoformat(),
+                "seq": self._seq,                 # stable per-session source sequence
                 "market": _market_to_dict(snap.market),
                 "chain": _chain_to_dict(snap.chain) if snap.chain is not None else None,
                 "bars": _bars_rows(snap.bars, self._last_bar_ts) if snap.bars is not None else [],
             }
+            self._seq += 1
             if snap.bars is not None and len(snap.bars.ts):
                 self._last_bar_ts = np.asarray(snap.bars.ts, dtype="datetime64[ns]")[-1]
             self._append(session, rec)
@@ -169,6 +173,42 @@ class RecordedFeed:
     def timestamps(self) -> list[dt.datetime]:
         """All recorded tick timestamps — feed these to run_replay/walk-forward."""
         return [dt.datetime.fromisoformat(o["ts"]) for o in self._ticks]
+
+    def replay_ticks(self):
+        """
+        Yield (seq, ts, TickSnapshot) for every recorded tick WITHOUT touching
+        the serving state (`_idx`/`_bars_acc`) — the dataset builder's entry
+        point (prediction/dataset.py). Bars are reassembled the same way
+        snapshot() does, then defensively as-of filtered so a malformed
+        recording can never leak a future bar into an earlier observation.
+
+        seq is the recorded per-session source sequence; recordings made
+        before seq existed fall back to the tick's position within the run.
+        """
+        from prediction.asof import bars_asof
+        bars_acc: list[list] = []
+        for i, rec in enumerate(self._ticks):
+            ts = dt.datetime.fromisoformat(rec["ts"])
+            bars_acc.extend(rec.get("bars") or [])
+            if len(bars_acc) > self.lookback:
+                bars_acc = bars_acc[-self.lookback:]
+            bars = None
+            if bars_acc:
+                bars = RawBars(
+                    ts=np.array([r[0] for r in bars_acc], dtype="datetime64[ns]"),
+                    open=np.array([r[1] for r in bars_acc], dtype=float),
+                    high=np.array([r[2] for r in bars_acc], dtype=float),
+                    low=np.array([r[3] for r in bars_acc], dtype=float),
+                    close=np.array([r[4] for r in bars_acc], dtype=float),
+                    volume=np.array([r[5] for r in bars_acc], dtype=float),
+                )
+                bars = bars_asof(bars, ts)
+            snap = TickSnapshot(
+                market=_market_from_dict(rec["market"]),
+                bars=bars,
+                chain=_chain_from_dict(rec["chain"]) if rec.get("chain") else None,
+            )
+            yield rec.get("seq", i), ts, snap
 
     def __len__(self) -> int:
         return len(self._ticks)

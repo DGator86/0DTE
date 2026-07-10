@@ -41,6 +41,13 @@ COLUMNS = [
     "signals_json",         # JSON dict of observation-only signals (see below)
 ]
 
+# Optional provenance columns (Prediction Engine V2, PR 3): present in the
+# schema and stored when the caller supplies them, but NOT required of every
+# row producer — legacy callers and older recordings keep working untouched.
+# snapshot_id links an evaluation to prediction.storage.feature_snapshots /
+# prediction_outputs rows (transitional audit linkage, spec §20.3).
+OPTIONAL_COLUMNS = ["snapshot_id"]
+
 # signals_json is the admission channel for NEW signal domains (dealer
 # dynamics, options flow, breadth, ...). A candidate signal is journaled here
 # on every tick — with NO gate or veto power — until component_correlations()
@@ -79,7 +86,7 @@ def _coltype(col: str) -> str:
     if col in ("session_date", "ts", "gex_regime", "selected_family",
                "short_strikes", "long_strikes", "legs_json",
                "gate_failed", "veto_reasons", "decision", "no_trade_reason",
-               "regime_direction", "signals_json"):
+               "regime_direction", "signals_json", "snapshot_id"):
         return "TEXT"
     if col in ("gate_pass", "was_traded", "candidate_present"):
         return "INTEGER"
@@ -89,7 +96,7 @@ def _coltype(col: str) -> str:
 _CREATE = f"""
 CREATE TABLE IF NOT EXISTS evaluations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    {", ".join(c + " " + _coltype(c) for c in COLUMNS)},
+    {", ".join(c + " " + _coltype(c) for c in COLUMNS + OPTIONAL_COLUMNS)},
     settle_price REAL, realized_pnl REAL, ev_error REAL,
     settled INTEGER NOT NULL DEFAULT 0
 );
@@ -201,22 +208,29 @@ class Journal:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_CREATE)
-        # migration: signals_json added after live DBs already existed
+        # migrations: columns added after live DBs already existed
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(evaluations)")}
         if "signals_json" not in cols:
             self.conn.execute("ALTER TABLE evaluations ADD COLUMN signals_json TEXT")
+        if "snapshot_id" not in cols:
+            self.conn.execute("ALTER TABLE evaluations ADD COLUMN snapshot_id TEXT")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_snapshot ON evaluations(snapshot_id)")
         self.conn.commit()
 
     # ---- write ----
     def log(self, row: dict) -> int:
         row = dict(row)
         row.setdefault("signals_json", None)     # optional; older callers omit it
+        for c in OPTIONAL_COLUMNS:
+            row.setdefault(c, None)
         missing = [c for c in COLUMNS if c not in row]
         if missing:
             raise ValueError(f"row missing columns: {missing}")
-        placeholders = ", ".join("?" for _ in COLUMNS)
-        sql = f"INSERT INTO evaluations ({', '.join(COLUMNS)}) VALUES ({placeholders})"
-        cur = self.conn.execute(sql, [row[c] for c in COLUMNS])
+        cols = COLUMNS + OPTIONAL_COLUMNS
+        placeholders = ", ".join("?" for _ in cols)
+        sql = f"INSERT INTO evaluations ({', '.join(cols)}) VALUES ({placeholders})"
+        cur = self.conn.execute(sql, [row[c] for c in cols])
         self.conn.commit()
         return cur.lastrowid
 
