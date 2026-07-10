@@ -90,6 +90,8 @@ def journal_health_metrics(jrn: Journal) -> dict:
     ev = cal["ev"]
     direction = cal["directional"]["overall"]
 
+    sessions = cal["directional"].get("sessions") or {}
+
     return {
         "n_settled_trades": taken["n"],
         "win_rate": taken["win_rate"],
@@ -101,6 +103,10 @@ def journal_health_metrics(jrn: Journal) -> dict:
         "ev_mae": ev.get("mae_ev_error"),
         "directional_hit_rate": direction.get("hit_rate"),
         "directional_n": direction.get("n"),
+        # The honest sample size: independent sessions, not tick counts.
+        "n_independent_sessions": sessions.get("n_sessions"),
+        "directional_session_hit_rate": sessions.get("mean_session_hit_rate"),
+        "directional_session_hit_ci95": sessions.get("hit_rate_ci95"),
         "regime_diversity": diversity,
         "ras": _ras_summary(jrn),
     }
@@ -153,11 +159,12 @@ def _recorded_walk_forward(record_dir: str, n_folds: int,
             or len(sessions) < FLAG_THRESHOLDS["min_wf_sessions"]):
         return None
 
+    # Session-unit folds (the default): train_frac is a fraction of complete
+    # sessions, so the daily lookback is expressed directly in sessions.
     train_frac = 0.6
     if lookback_sessions and len(sessions) > lookback_sessions:
-        window = set(sessions[-lookback_sessions:])
-        start_idx = next(i for i, t in enumerate(ticks) if t.date() in window)
-        train_frac = max(0.5, min(0.9, start_idx / len(ticks)))
+        train_frac = max(0.5, min(
+            0.9, (len(sessions) - lookback_sessions) / len(sessions)))
 
     wf = run_walk_forward(
         feed_factory=lambda: RecordedFeed(record_dir),

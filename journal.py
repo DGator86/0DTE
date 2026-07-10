@@ -776,6 +776,12 @@ class Journal:
         no-trades alike. A flat close counts as a miss (you paid theta/spread to
         be there). This is the sample that tells you within days, not weeks,
         whether the directional engine's premise holds.
+
+        The per-tick numbers OVERSTATE the sample: two predictions a minute
+        apart share almost the entire future path to settlement, so a few
+        dozen sessions can look like thousands of observations. The
+        "sessions" panel is the honest view — per-session hit rates, the
+        independent session count, and a session-bootstrap 95% CI.
         """
         rows = [r for r in self.fetch(settled_only=True)
                 if r["regime_direction"] in ("call", "put")
@@ -795,9 +801,27 @@ class Journal:
             return {"n": len(rs), "hit_rate": round(hits / len(rs), 4),
                     "avg_fwd_move_pct": round(sum(moves) / len(moves) * 100, 4)}
 
+        def session_stats(rs):
+            by_session: dict[str, list] = {}
+            for r in rs:
+                by_session.setdefault(r["session_date"], []).append(r)
+            per_session = {d: stats(srs)["hit_rate"]
+                           for d, srs in by_session.items()}
+            out = {"n_sessions": len(per_session),
+                   "mean_session_hit_rate": None,
+                   "hit_rate_ci95": None}
+            if per_session:
+                from validation.bootstrap import session_bootstrap
+                boot = session_bootstrap(per_session)
+                out["mean_session_hit_rate"] = boot["stat"]
+                if boot["ci_low"] is not None:
+                    out["hit_rate_ci95"] = [boot["ci_low"], boot["ci_high"]]
+            return out
+
         overall = stats(rows)
         return {
             "overall": overall,
+            "sessions": session_stats(rows),
             "by_direction": {
                 d: stats([r for r in rows if r["regime_direction"] == d])
                 for d in ("call", "put")
@@ -805,7 +829,9 @@ class Journal:
             "traded_only": stats([r for r in rows if r["was_traded"] == 1]),
             "note": ("hit = settlement moved in the bias direction; "
                      "avg_fwd_move_pct is the bias-signed mean move (edge in %, "
-                     "positive means the bias points the right way on average)"),
+                     "positive means the bias points the right way on average); "
+                     "'sessions' resamples complete sessions — the per-tick n "
+                     "overstates the independent sample size"),
         }
 
     def prob_calibration(self, n_bins: int = 5) -> dict:

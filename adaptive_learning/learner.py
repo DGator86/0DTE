@@ -121,13 +121,24 @@ def _evaluate_cfg(feed_factory: Callable, search_ts: list, holdout_ts: list,
     holdout_result = None
     holdout_score = None
     if holdout_ts:
+        if wf_cfg.fold_unit == "session":
+            from validation.session_folds import session_spans
+            hold_cfg = WalkForwardConfig(
+                mode="expanding", n_folds=1, fold_unit="session",
+                embargo_sessions=wf_cfg.embargo_sessions,
+                max_failed_tick_frac=wf_cfg.max_failed_tick_frac,
+                # Pin the test window to exactly the held-out sessions.
+                initial_warm_sessions=len(session_spans(search_ts)),
+            )
+        else:
+            hold_cfg = WalkForwardConfig(
+                mode="expanding", n_folds=1, fold_unit="tick",
+                train_frac=len(search_ts) / max(1, len(search_ts) + len(holdout_ts)),
+            )
         holdout_result = run_walk_forward(
             feed_factory=feed_factory,
             timestamps=search_ts + holdout_ts,
-            wf_cfg=WalkForwardConfig(
-                mode="expanding", n_folds=1,
-                train_frac=len(search_ts) / max(1, len(search_ts) + len(holdout_ts)),
-            ),
+            wf_cfg=hold_cfg,
             engine_cfg=engine_cfg)
         holdout_score = _score(holdout_result, metric)
     ev = evaluation_from_wf(wf_result, score=score, holdout_score=holdout_score)
@@ -213,8 +224,10 @@ def run_learning_cycle(cfg: Optional[LearnerConfig] = None,
 
         # -- 3. data + champion baseline -------------------------------------
         feed_factory, ticks = _resolve_feed(cfg, feed_factory, timestamps)
-        cut = int(len(ticks) * (1.0 - cfg.holdout_frac))
-        search_ts, holdout_ts = ticks[:cut], ticks[cut:]
+        # Session-based carve: the holdout is complete sessions, never a
+        # partial trading day (see validation/session_folds.py).
+        from validation.session_folds import split_holdout_by_sessions
+        search_ts, holdout_ts = split_holdout_by_sessions(ticks, cfg.holdout_frac)
         wf_cfg = WalkForwardConfig(mode=cfg.wf_mode, n_folds=cfg.wf_folds,
                                    train_frac=cfg.wf_train_frac)
 
