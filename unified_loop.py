@@ -118,6 +118,13 @@ class UnifiedOrchestrator:
     # RobustScaleBook by default. Set True to fall back to the legacy
     # name-only Welford ScaleBook (update-before-score) for comparison.
     use_legacy_scaler: bool = False
+    # Canonical dataset capture (Prediction Engine V2, PR 3): when set, every
+    # tick writes one feature_snapshots row (raw features + missingness +
+    # quality) keyed by the same snapshot_id that lands on the journal row —
+    # the audit linkage between evaluations and the V2 training dataset.
+    # Observation-only; a failed write never breaks a tick.
+    prediction_store: Optional[object] = None
+    symbol: str = "SPY"
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
@@ -132,6 +139,8 @@ class UnifiedOrchestrator:
             self._matrix_scale_book = RobustScaleBook()
         self._ticks_since_save = 0
         self._bias_side: Optional[int] = None   # fast-vs-slow composite side, for crossovers
+        self._snap_seq = 0                      # per-session source sequence for snapshot ids
+        self._snap_session: Optional[str] = None
         # dealer-surface / vol-state derivatives (observation-only signals)
         dyn_path = None
         if self.state_path:
@@ -269,6 +278,53 @@ class UnifiedOrchestrator:
         ) if merged else None
         return merged, signals_json
 
+    def _next_snapshot_id(self, now: dt.datetime) -> str:
+        """Stable per-tick observation id (PR 3): SHA256 of symbol |
+        normalized ET timestamp | feature version | per-session sequence."""
+        from prediction.dataset import FEATURE_VERSION, make_snapshot_id
+        session_date = now.astimezone(ET).date().isoformat()
+        if session_date != self._snap_session:
+            self._snap_session = session_date
+            self._snap_seq = 0
+        seq = self._snap_seq
+        self._snap_seq += 1
+        return make_snapshot_id(self.symbol, now, FEATURE_VERSION, seq)
+
+    def _log_feature_snapshot(self, now: dt.datetime, snapshot_id: str,
+                              snap: TickSnapshot, snap_dict: dict,
+                              signals: dict, mat_rows: list) -> None:
+        """Best-effort canonical feature_snapshots row (PR 3). Raw features =
+        the mtf snapshot dict + observation-only signals; standardized = the
+        0-100 matrix scores keyed variable:tf. Never breaks a tick."""
+        if self.prediction_store is None:
+            return
+        try:
+            from prediction.asof import AsOfFeatureBuilder
+            from prediction.dataset import build_observation
+            b = AsOfFeatureBuilder(observation_ts=now)
+            for name, v in {**snap_dict, **signals}.items():
+                b.add(name, v)
+            built = b.build()
+            standardized = {}
+            for row in mat_rows:
+                for tf, score in row.scores.items():
+                    if score is not None:
+                        standardized[f"{row.variable}:{tf}"] = score
+            obs = build_observation(
+                self.symbol, now, snap.market.spot,
+                features=built["features"],
+                standardized=standardized,
+                missingness=built["missingness"],
+                source_ages=built["source_ages"],
+                quality={"feature_coverage": built["coverage"],
+                         "has_chain": snap.chain is not None},
+            )
+            # keep the journal-linked id (seq already advanced this tick)
+            obs = dataclasses.replace(obs, snapshot_id=snapshot_id)
+            self.prediction_store.log_feature_snapshot(obs)
+        except Exception as exc:
+            log.warning("feature snapshot logging failed: %s", exc)
+
     def tick(self, now: dt.datetime,
              position_contexts: Optional[list[PositionContext]] = None
              ) -> Optional[TickResult]:
@@ -276,6 +332,7 @@ class UnifiedOrchestrator:
         if snap is None:
             return None
 
+        snapshot_id = self._next_snapshot_id(now)
         cfg = self.engine_cfg or EngineConfig()
 
         # ---- Track A RND (feeds both regime and selector) ----
@@ -415,6 +472,10 @@ class UnifiedOrchestrator:
         self._journal_ras(now, ras_results)
         signals, signals_json = self._signals_with_ras(signals, ras_results)
 
+        # ---- Canonical dataset capture (observation-only, PR 3) ----
+        self._log_feature_snapshot(now, snapshot_id, snap, snap_dict,
+                                   signals, mat_rows)
+
         # ---- Stand-down: regime unstable or NT cell ----
         if regime_state.stand_down or intent.decision.structure == "NT":
             result = TickResult(
@@ -424,9 +485,11 @@ class UnifiedOrchestrator:
                 ras_results=ras_results,
             )
             if self.journal:
-                self.journal.log(_no_trade_row(snap.market, intent, regime_state,
-                                               direction=intent.decision.direction,
-                                               signals_json=signals_json))
+                row = _no_trade_row(snap.market, intent, regime_state,
+                                    direction=intent.decision.direction,
+                                    signals_json=signals_json)
+                row["snapshot_id"] = snapshot_id
+                self.journal.log(row)
             return result
 
         # ---- Track A: full engine (requires chain) ----
@@ -467,14 +530,17 @@ class UnifiedOrchestrator:
             if self.journal:
                 row = decision.as_row()
                 row["signals_json"] = signals_json
+                row["snapshot_id"] = snapshot_id
                 self.journal.log(row)
         else:
             # No chain yet — log intent as a no-trade stub for calibration
             if self.journal:
-                self.journal.log(_no_trade_row(snap.market, intent, regime_state,
-                                               reason="no_chain",
-                                               direction=intent.decision.direction,
-                                               signals_json=signals_json))
+                row = _no_trade_row(snap.market, intent, regime_state,
+                                    reason="no_chain",
+                                    direction=intent.decision.direction,
+                                    signals_json=signals_json)
+                row["snapshot_id"] = snapshot_id
+                self.journal.log(row)
 
         # size_mult from Track B scales the Track A position; the champion's
         # per-regime size_mult (if any) scales on top.
