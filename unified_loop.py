@@ -72,6 +72,12 @@ class TickSnapshot:
     market: MarketSnapshot
     bars: RawBars
     chain: Optional[ChainSnapshot] = None
+    # Prediction Engine V2 / PR 9: raw option rows for parallel GEX variants.
+    # Observation-only — when absent, variant journaling is skipped.
+    # Feeds may attach these without changing MarketSnapshot policy fields.
+    option_rows: Optional[list] = None
+    weekly_option_rows: Optional[list] = None
+    gex_feed_source: str = ""
 
 
 @dataclass
@@ -455,6 +461,42 @@ class UnifiedOrchestrator:
             v = getattr(m, k, None)
             if isinstance(v, (int, float)) and math.isfinite(v):
                 signals[k] = v
+
+        # ---- GEX variants (Prediction Engine V2 / PR 9, observation-only) ----
+        # Parallel OI / weekly / volume / hybrid panels. Never overwrite
+        # MarketSnapshot.net_gex / walls / flip — those remain the OI baseline
+        # that gates and the selector consume until promotion.
+        if getattr(snap, "option_rows", None):
+            try:
+                from gex.base import compute_all_variants
+                mos = None
+                try:
+                    if snap.bars is not None and len(snap.bars.ts):
+                        # minutes since first bar of the session snapshot
+                        mos = float(len(snap.bars.ts))  # coarse proxy
+                except Exception:
+                    mos = None
+                vor = getattr(m, "volume_oi_ratio", None)
+                if isinstance(vor, float) and not math.isfinite(vor):
+                    vor = None
+                bundle = compute_all_variants(
+                    spot=float(m.spot),
+                    rows_0dte=snap.option_rows,
+                    rows_weekly=getattr(snap, "weekly_option_rows", None),
+                    source_age=None,
+                    minute_of_session=mos,
+                    volume_oi_ratio=vor,
+                    feed_source=(getattr(snap, "gex_feed_source", "")
+                                 or type(self.feed).__name__),
+                )
+                for k, v in bundle.to_signals_json().items():
+                    if isinstance(v, (int, float)) and math.isfinite(float(v)):
+                        signals[k] = float(v)
+                    elif isinstance(v, str):
+                        signals[k] = v
+            except Exception as exc:
+                log.warning("GEX variant panel failed: %s", exc)
+
         snap_dict.update(signals)
         # signals_json finalized after RAS merge below
 
