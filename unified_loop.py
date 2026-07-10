@@ -337,7 +337,6 @@ class UnifiedOrchestrator:
         if isinstance(dom_conf, (int, float)) and math.isfinite(dom_conf):
             signals["regime_dominant_conf"] = float(dom_conf)
 
-<<<<<<< HEAD
         # Raw fast/slow direction composites plus the crossover event. The fast
         # composite is the turn-detection channel (leads the 60%-slow blend at
         # intraday reversals); bias_cross = +/-1 only on the tick where the
@@ -354,7 +353,7 @@ class UnifiedOrchestrator:
             signals["bias_cross"] = cross
             log.info("Direction composite crossover: fast %s slow (fast=%.1f slow=%.1f)",
                      "above" if cross > 0 else "below", bf, bs)
-=======
+
         # Routing provenance for journal.decision_funnel(): what Track B
         # actually routed, whether a dealer veto flipped a credit cell to its
         # debit cousin, and which regime vetoes were active. Without this the
@@ -365,7 +364,6 @@ class UnifiedOrchestrator:
         signals["premium_flip"] = 1.0 if "premium veto" in intent.note else 0.0
         if regime_state.vetoes:
             signals["regime_vetoes"] = ",".join(regime_state.vetoes)
->>>>>>> origin/main
 
         ras_results = self._compute_ras(
             regime_state, intent, snap.market, position_contexts)

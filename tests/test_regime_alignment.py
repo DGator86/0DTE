@@ -319,7 +319,6 @@ def test_score_deteriorates_as_regime_turns_hostile():
 
 
 # --------------------------------------------------------------------------- #
-<<<<<<< HEAD
 # fast_momentum component (turn-detection channel)                             #
 # --------------------------------------------------------------------------- #
 def _comp(ras: RASResult, name: str):
@@ -379,7 +378,9 @@ def test_fast_momentum_bear_position_mirrors():
     ras = compute_ras(_regime(), _intent(direction_bias="bear",
                                          bias_fast=75.0), _market(), ctx)
     assert _comp(ras, "fast_momentum").raw == -1.0
-=======
+
+
+# --------------------------------------------------------------------------- #
 # channel_break component (Bollinger / Keltner / Donchian deterioration)       #
 # --------------------------------------------------------------------------- #
 def _chan_std(**kw) -> dict:
@@ -484,7 +485,6 @@ def test_channel_break_drives_exit_action():
     chan = next(c for c in ras.components if c.name == "channel_break")
     assert chan.raw == -1.0
     assert ras.action == "exit"
->>>>>>> origin/main
 
 
 # --------------------------------------------------------------------------- #
