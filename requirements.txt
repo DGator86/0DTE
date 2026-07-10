@@ -9,6 +9,11 @@ pyyaml
 # Columnar Parquet export of the canonical V2 research dataset
 # (prediction/storage.py). Lazy-imported: the SQLite store works without it.
 pyarrow
+# Prediction Engine V2 baseline models (prediction/models/, prediction/
+# calibration.py, prediction/registry.py): elastic-net logistic direction
+# models, quantile/volatility regressors, and joblib artifact serialization.
+scikit-learn
+joblib
 # Optional: enables the Tastytrade chain fallback (composite_feed/tastytrade_feed).
 # Safe to keep — it is lazy-imported and only activates when TASTYTRADE_* creds
 # are set. Yahoo backstop + Tradier/Massive feeds need nothing beyond the above.

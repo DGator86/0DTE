@@ -17,4 +17,13 @@ Currently implemented:
               the offline recording -> dataset builder (PR 3).
   storage   — SQLite dataset tables + Parquet export + deterministic
               dataset hashing (PR 3).
+  models/   — calibrated elastic-net direction models, quantile return
+              models, and the realized-move volatility model (PR 4).
+  calibration — sigmoid/Platt (default) and gated isotonic probability
+              calibration, fitted on training data only (PR 4).
+  registry  — versioned, hashed, fail-closed joblib model artifacts with
+              §19 metadata and status vocabulary (PR 4).
+  training  — session-grouped, embargoed walk-forward training with naive
+              baselines, PredictionBundle assembly, and journaled shadow
+              inference with zero policy effect (PR 4).
 """

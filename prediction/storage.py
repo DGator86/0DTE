@@ -207,6 +207,30 @@ class PredictionStore:
         self.conn.commit()
         return cur.lastrowid
 
+    def fetch_predictions(self, snapshot_id: Optional[str] = None,
+                          mode: Optional[str] = None) -> list[dict]:
+        sql = "SELECT * FROM prediction_outputs"
+        conds, args = [], []
+        if snapshot_id:
+            conds.append("snapshot_id=?")
+            args.append(snapshot_id)
+        if mode:
+            conds.append("mode=?")
+            args.append(mode)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["predictions"] = json.loads(row.pop("predictions_json")
+                                                or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["predictions"] = {}
+            out.append(row)
+        return out
+
     # ---- candidates ------------------------------------------------------------
     def log_candidate_snapshot(self, candidate_id: str, snapshot_id: str,
                                family: str, legs: list,
