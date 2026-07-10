@@ -187,9 +187,20 @@ def build_matrix(inp: MTFInput, scale_book=None,
     """
     Build the scored matrix from inp.
 
-    scale_book: optional ScaleBook (from regime_classifier).  When provided,
-    raw values are fed to Welford online estimation; the learned std replaces
-    the fixed prior_scale for S/N variables once enough samples accumulate.
+    scale_book: optional adaptive scale book. Two protocols are supported,
+    selected by the book's SCORE_BEFORE_UPDATE class marker:
+
+      * V2 (prediction.scalers.RobustScaleBook, SCORE_BEFORE_UPDATE=True):
+        NATIVE variables are keyed "{name}:{tf}" — the 1m distribution of a
+        feature can never pool with its 1d distribution — SNAPSHOT variables
+        by name; and every observation is scored against the EXISTING state
+        before it updates that state, so a value never influences its own
+        standardized score.
+
+      * legacy (regime_classifier.ScaleBook): name-only Welford keying with
+        update-before-score, preserved verbatim behind configuration
+        (UnifiedOrchestrator.use_legacy_scaler) for transition comparisons.
+
     Snapshot variables are updated once per tick (not once per TF) to avoid
     inflating the sample count.
 
@@ -197,25 +208,41 @@ def build_matrix(inp: MTFInput, scale_book=None,
     defaults to the process-wide set from set_disabled_vars().
     """
     off = _DISABLED_VARS if disabled_vars is None else frozenset(disabled_vars)
+    lagged = bool(getattr(scale_book, "SCORE_BEFORE_UPDATE", False))
     rows = []
     for v in VARS:
         if v.name in off:
             continue
         scores = {}
         sb_updated = False   # prevent 7x updates for broadcast snapshot values
+        snapshot_update = None   # (key, raw): applied AFTER all TFs are scored
         for tf in TIMEFRAMES:
             r = inp.raw(v, tf)
             if r is None:
                 scores[tf] = None
                 continue
             if scale_book is not None and v.adapt_fn is not None:
-                if v.kind == NATIVE or not sb_updated:
-                    scale_book.update(v.name, r)
-                    sb_updated = True
-                scale = scale_book.std(v.name, v.prior_scale)
-                scores[tf] = round(v.adapt_fn(r, scale), 1)
+                if lagged:
+                    key = v.name if v.kind == SNAPSHOT else f"{v.name}:{tf}"
+                    scale = scale_book.std(key, v.prior_scale)
+                    scores[tf] = round(v.adapt_fn(r, scale), 1)
+                    # Score first, update after: native keys update right
+                    # away (no other TF shares the key); the broadcast
+                    # snapshot key defers until every column is scored.
+                    if v.kind == NATIVE:
+                        scale_book.update(key, r)
+                    elif snapshot_update is None:
+                        snapshot_update = (key, r)
+                else:
+                    if v.kind == NATIVE or not sb_updated:
+                        scale_book.update(v.name, r)
+                        sb_updated = True
+                    scale = scale_book.std(v.name, v.prior_scale)
+                    scores[tf] = round(v.adapt_fn(r, scale), 1)
             else:
                 scores[tf] = round(v.std(r), 1)
+        if snapshot_update is not None:
+            scale_book.update(*snapshot_update)
         rows.append(MatrixRow(v.domain, v.name, v.kind, scores))
     return rows
 

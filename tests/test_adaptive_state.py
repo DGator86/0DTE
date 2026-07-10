@@ -109,6 +109,30 @@ def test_orchestrator_saves_and_reloads_state(tmp_path):
     feed2 = SyntheticUnifiedFeed(days=3)
     orch2 = UnifiedOrchestrator(feed=feed2, state_path=path)
     # the reloaded matrix scale book must carry the learned samples
-    stats = orch2._matrix_scale_book.to_dict()
+    stats = orch2._matrix_scale_book.to_dict()["stats"]
     assert stats, "reloaded scale book is empty"
     assert any(v[0] > 0 for v in stats.values())
+    # native keys are per-feature-AND-timeframe (V2 scaler repair)
+    assert any(":" in k for k in stats)
+
+
+def test_orchestrator_legacy_scaler_flag(tmp_path):
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    from unified_loop import UnifiedOrchestrator, SyntheticUnifiedFeed
+
+    ET = ZoneInfo("America/New_York")
+    path = os.path.join(tmp_path, "adaptive_state.json")
+
+    feed = SyntheticUnifiedFeed(days=3)
+    orch = UnifiedOrchestrator(feed=feed, state_path=path,
+                               use_legacy_scaler=True)
+    assert isinstance(orch._matrix_scale_book, ScaleBook)
+    start = dt.datetime(2026, 6, 26, 9, 30, tzinfo=ET)
+    orch.run_replay([start + dt.timedelta(minutes=i) for i in range(10)])
+    orch._save_state()
+
+    orch2 = UnifiedOrchestrator(feed=SyntheticUnifiedFeed(days=3),
+                                state_path=path, use_legacy_scaler=True)
+    stats = orch2._matrix_scale_book.to_dict()
+    assert stats and all(":" not in k for k in stats)   # legacy name-only keys
