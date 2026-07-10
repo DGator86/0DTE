@@ -77,6 +77,10 @@ class TradeDecision:
     # back into the density itself (independence rule §12.2).
     physical_density_mode: str = ""
     physical_moments: Optional[dict] = None
+    # Prediction Engine V2 / PR 8: full evaluated candidate set from the
+    # selector (for shadow ranking). Empty when the chain was unavailable.
+    # Never used to override `candidate` / `decision` until promotion.
+    all_candidates: list = field(default_factory=list)
 
     def as_row(self) -> dict:
         c = self.candidate
@@ -186,6 +190,7 @@ def decide(
     candidate = None
     selector_reason = ""
     edge_rich = float("nan")
+    all_candidates: list = []
     try:
         rnd = extract_rnd(chain, cfg.rnd)
         edge = compute_edge(rnd, chain, cfg.rnd, physical_pdf=physical_pdf)
@@ -193,6 +198,7 @@ def decide(
         ctx = GammaContext.from_market_snapshot(market)
         sel = select_spreads(chain, rnd, edge, ctx, cfg.selector, physical_pdf=physical_pdf,
                              target_families=fams)
+        all_candidates = list(sel.all_candidates or sel.ranked or [])
         candidate = sel.best
         if candidate is None:
             # keep the top-by-score would-be candidate for diagnostics if any exist
@@ -225,4 +231,5 @@ def decide(
         direction=direction, gate_kelly=gate.kelly_fraction,
         physical_density_mode=physical_density_mode or "",
         physical_moments=dict(physical_moments) if physical_moments else None,
+        all_candidates=all_candidates,
     )

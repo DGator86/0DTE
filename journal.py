@@ -60,6 +60,12 @@ OPTIONAL_COLUMNS = [
 # it earn a matrix weight or veto. Flexible JSON so adding a signal never
 # requires a schema migration.
 #
+# Prediction Engine V2 / PR 8 shadow ranker keys (observation-only):
+#   v2_rank_disagreement, v2_top_candidate_id, legacy_top_candidate_id,
+#   v2_utility_score, v2_expected_net_pnl, v2_p_profit,
+#   v2_expected_shortfall, candidate_model_version, v2_legacy_spearman,
+#   v2_vs_legacy_pnl_delta, legacy_top_score
+#
 # Prediction Engine V2 / PR 9 GEX variant keys (observation-only, §16.3):
 #   gex_oi_*, gex_weekly_*, gex_volume_*, gex_hybrid_*
 #     (net_gex, gamma_flip, call_wall, put_wall, gex_concentration,

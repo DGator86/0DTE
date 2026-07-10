@@ -108,6 +108,10 @@ class SpreadCandidate:
     # value for shadow comparison when V2 touch_probability_fn is active.
     touch_source: str = "reflection"                 # "v2" | "reflection"
     legacy_prob_touch_short: Optional[float] = None
+    # Prediction Engine V2 / PR 8: observation-only utility from the shadow
+    # ranker. Never replaces `score` for live ranking until promotion.
+    v2_utility_score: Optional[float] = None
+    v2_candidate_id: Optional[str] = None
 
 
 @dataclass
@@ -754,6 +758,9 @@ class SelectionResult:
     best: Optional[SpreadCandidate]
     ranked: list
     no_trade_reason: str = ""
+    # Full evaluated set (passing + vetoed) for V2 shadow ranking / audit.
+    # Legacy `ranked` remains the top_n slice used by diagnostics.
+    all_candidates: list = field(default_factory=list)
 
 
 def select_spreads(
@@ -833,9 +840,11 @@ def select_spreads(
         n_pos = sum(1 for c in cands if c.ev > 0)
         reason = ("no positive-EV structure" if n_pos == 0
                   else f"{n_pos} positive-EV structures all failed vetoes")
-        return SelectionResult(best=None, ranked=cands[:cfg.top_n], no_trade_reason=reason)
+        return SelectionResult(best=None, ranked=cands[:cfg.top_n],
+                               no_trade_reason=reason, all_candidates=cands)
 
-    return SelectionResult(best=passing[0], ranked=passing[:cfg.top_n])
+    return SelectionResult(best=passing[0], ranked=passing[:cfg.top_n],
+                           all_candidates=cands)
 
 
 # --------------------------------------------------------------------------- #
