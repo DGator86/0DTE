@@ -305,6 +305,8 @@ def _run_fold(
         ev_accuracy=ev_acc,
         gate_effectiveness=jrn.gate_effectiveness(),
         component_correlations=jrn.component_correlations(),
+        brier_skill=jrn.prob_calibration().get("brier_skill"),
+        regime_counts=jrn.regime_diversity().get("regimes", {}),
     )
 
 

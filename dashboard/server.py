@@ -19,11 +19,15 @@ from fastapi.staticfiles import StaticFiles
 
 from dashboard.auth import AuthMiddleware, ReadOnlyMiddleware, get_dashboard_token
 from dashboard.queries import (
+    candidate_configs,
+    feature_scores,
     journal_fetch,
     journal_max_id,
     journal_row,
+    learning_runs,
     paper_summary,
     paper_trades_journal,
+    promotions,
     ras_history,
     readiness_summary,
     report_summary,
@@ -43,10 +47,12 @@ app.add_middleware(AuthMiddleware)
 _config: dict = {}
 
 
-def _configure(db: str, paper_db: str, live_state: str) -> None:
+def _configure(db: str, paper_db: str, live_state: str,
+               configs_dir: str = "configs") -> None:
     _config["db"] = db
     _config["paper_db"] = paper_db
     _config["live_state"] = live_state
+    _config["configs_dir"] = configs_dir
 
 
 @app.get("/")
@@ -148,7 +154,9 @@ async def api_report():
 
 @app.get("/api/validation")
 async def api_validation(
-    report_type: Optional[str] = Query(None, pattern="^(daily|weekly|feature_impact)$"),
+    report_type: Optional[str] = Query(
+        None,
+        pattern="^(daily|weekly|feature_impact|drift|promotion_candidate)$"),
     limit: int = Query(50, ge=1, le=200),
 ):
     """Validation report history (daily/weekly pipeline runs and
@@ -167,6 +175,81 @@ async def api_validation_report(report_id: int):
     if report is None:
         raise HTTPException(status_code=404, detail="Validation report not found")
     return report
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive-learning routes (Learning tab)                                     #
+# --------------------------------------------------------------------------- #
+@app.get("/api/learning")
+async def api_learning(limit: int = Query(50, ge=1, le=200)):
+    """Learning-cycle history with decoded diagnostics + trial summaries."""
+    db = _config.get("db", "shadow.db")
+    if not os.path.isfile(db):
+        return {"runs": [], "note": "journal database not found"}
+    return {"runs": learning_runs(db, limit=limit)}
+
+
+@app.get("/api/candidates")
+async def api_candidates(
+    status: Optional[str] = Query(
+        None,
+        pattern="^(candidate|pending_review|promoted|rejected|archived)$"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Champion vs challenger configs: current champion (from the configs
+    directory) plus the candidate_configs history."""
+    db = _config.get("db", "shadow.db")
+    champion = None
+    champ_file = os.path.join(_config.get("configs_dir", "configs"),
+                              "champion.json")
+    if os.path.isfile(champ_file):
+        try:
+            import json as _json
+            with open(champ_file, encoding="utf-8") as f:
+                champion = _json.load(f)
+        except (OSError, ValueError):
+            champion = {"note": "champion.json unreadable"}
+    if not os.path.isfile(db):
+        return {"champion": champion, "candidates": [],
+                "note": "journal database not found"}
+    return {"champion": champion,
+            "candidates": candidate_configs(db, status=status, limit=limit)}
+
+
+@app.get("/api/promotions")
+async def api_promotions(
+    status: Optional[str] = Query(
+        None, pattern="^(pending_review|approved|rejected)$"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Promotion queue with the rule-by-rule decision breakdown."""
+    db = _config.get("db", "shadow.db")
+    if not os.path.isfile(db):
+        return {"promotions": [], "note": "journal database not found"}
+    return {"promotions": promotions(db, status=status, limit=limit)}
+
+
+@app.get("/api/feature-scores")
+async def api_feature_scores(
+    all_history: bool = Query(False),
+    limit: int = Query(500, ge=1, le=2000),
+):
+    """Latest feature-lab scores (Pearson/Spearman/MI/permutation importance,
+    stability, lifecycle status) per feature."""
+    db = _config.get("db", "shadow.db")
+    if not os.path.isfile(db):
+        return {"features": [], "note": "journal database not found"}
+    return {"features": feature_scores(db, latest_only=not all_history,
+                                       limit=limit)}
+
+
+@app.get("/api/drift")
+async def api_drift(limit: int = Query(30, ge=1, le=200)):
+    """Drift snapshots (validation_reports rows with report_type='drift')."""
+    db = _config.get("db", "shadow.db")
+    if not os.path.isfile(db):
+        return {"reports": [], "note": "journal database not found"}
+    return {"reports": validation_reports(db, report_type="drift", limit=limit)}
 
 
 @app.get("/api/readiness")
@@ -203,11 +286,13 @@ def main() -> None:
     parser.add_argument("--db", default="shadow.db", help="Journal SQLite path")
     parser.add_argument("--paper-db", default="paper.sqlite", help="Paper trades SQLite path")
     parser.add_argument("--live-state", default="live_state.json", help="Live state JSON path")
+    parser.add_argument("--configs-dir", default="configs",
+                        help="Directory holding champion.json (Learning tab)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
-    _configure(args.db, args.paper_db, args.live_state)
+    _configure(args.db, args.paper_db, args.live_state, args.configs_dir)
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

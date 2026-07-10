@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS validation_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     report_date TEXT NOT NULL,
     report_type TEXT NOT NULL,           -- 'daily' | 'weekly' | 'feature_impact'
+                                         -- | 'drift' | 'promotion_candidate'
     generated_at TEXT,
     metrics_json TEXT,                   -- all key metrics (JSON)
     summary TEXT,                        -- human-readable summary
@@ -117,6 +118,66 @@ CREATE TABLE IF NOT EXISTS validation_reports (
 );
 CREATE INDEX IF NOT EXISTS ix_vr_date ON validation_reports(report_date);
 CREATE INDEX IF NOT EXISTS ix_vr_type ON validation_reports(report_type);
+
+-- Adaptive Learning Engine (adaptive_learning/): full audit trail of every
+-- learning cycle, challenger config, promotion decision, and feature score.
+-- All flexible payloads are JSON so new metrics never need a migration.
+CREATE TABLE IF NOT EXISTS learning_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    mode TEXT,                           -- 'daily' | 'weekly' | 'manual'
+    started_at TEXT, finished_at TEXT,
+    diagnostics_json TEXT,               -- list of Diagnosis dicts
+    param_space_json TEXT,               -- searched space (dot-notation)
+    n_trials INTEGER,
+    best_score REAL, holdout_score REAL,
+    trials_json TEXT,                    -- ranked trial summaries
+    outcome TEXT,                        -- 'no_action' | 'candidate_generated'
+                                         -- | 'promotion_recommended' | 'rejected'
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_lr_run ON learning_runs(run_id);
+
+CREATE TABLE IF NOT EXISTS candidate_configs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    config_id TEXT NOT NULL UNIQUE,
+    created_at TEXT,
+    parent_id TEXT,
+    label TEXT,
+    overrides_json TEXT,                 -- flat dot-notation overrides
+    metrics_json TEXT,                   -- scores at creation time
+    status TEXT NOT NULL DEFAULT 'candidate'
+                                         -- candidate | pending_review
+                                         -- | promoted | rejected | archived
+);
+CREATE INDEX IF NOT EXISTS ix_cc_status ON candidate_configs(status);
+
+CREATE TABLE IF NOT EXISTS promotions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    config_id TEXT NOT NULL,
+    created_at TEXT,
+    decision_json TEXT,                  -- rule-by-rule pass/fail breakdown
+    status TEXT NOT NULL DEFAULT 'pending_review',
+                                         -- pending_review | approved | rejected
+    approved_by TEXT, approved_at TEXT,
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_pr_config ON promotions(config_id);
+CREATE INDEX IF NOT EXISTS ix_pr_status ON promotions(status);
+
+CREATE TABLE IF NOT EXISTS feature_scores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature TEXT NOT NULL,
+    as_of TEXT,
+    n INTEGER,
+    pearson REAL, spearman REAL, mutual_info REAL, perm_importance REAL,
+    stability REAL,
+    status TEXT NOT NULL DEFAULT 'observation',
+                                         -- observation | experimental
+                                         -- | candidate | production
+    details_json TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_fs_feature ON feature_scores(feature);
 """
 
 
@@ -262,6 +323,166 @@ class Journal:
                 except (json.JSONDecodeError, TypeError):
                     row[dest] = {} if dest == "metrics" else []
             out.append(row)
+        return out
+
+    # ---- adaptive learning (audit trail) --------------------------------------
+    # Persistence for the Adaptive Learning Engine: one row per learning cycle,
+    # per challenger config, per promotion decision, and per feature score.
+    # Same conventions as validation_reports: flexible JSON payloads, decoded
+    # on fetch, newest first.
+    @staticmethod
+    def _decode_json_cols(row: dict, cols: dict[str, str]) -> dict:
+        for src, dest in cols.items():
+            try:
+                row[dest] = json.loads(row.pop(src) or "null")
+            except (json.JSONDecodeError, TypeError):
+                row[dest] = None
+        return row
+
+    def log_learning_run(self, run_id: str, mode: str,
+                         started_at: str, finished_at: str,
+                         diagnostics: Optional[list] = None,
+                         param_space: Optional[dict] = None,
+                         n_trials: Optional[int] = None,
+                         best_score: Optional[float] = None,
+                         holdout_score: Optional[float] = None,
+                         trials: Optional[list] = None,
+                         outcome: str = "no_action",
+                         notes: Optional[str] = None) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO learning_runs (run_id, mode, started_at, finished_at, "
+            "diagnostics_json, param_space_json, n_trials, best_score, "
+            "holdout_score, trials_json, outcome, notes) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, mode, started_at, finished_at,
+             json.dumps(diagnostics or []), json.dumps(param_space or {}),
+             n_trials, best_score, holdout_score,
+             json.dumps(trials or []), outcome, notes),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_learning_runs(self, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM learning_runs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [self._decode_json_cols(dict(r), {
+            "diagnostics_json": "diagnostics",
+            "param_space_json": "param_space",
+            "trials_json": "trials",
+        }) for r in rows]
+
+    def log_candidate_config(self, config_id: str, created_at: str,
+                             overrides: dict,
+                             parent_id: Optional[str] = None,
+                             label: str = "",
+                             metrics: Optional[dict] = None,
+                             status: str = "candidate") -> int:
+        cur = self.conn.execute(
+            "INSERT INTO candidate_configs (config_id, created_at, parent_id, "
+            "label, overrides_json, metrics_json, status) VALUES (?,?,?,?,?,?,?)",
+            (config_id, created_at, parent_id, label,
+             json.dumps(overrides or {}), json.dumps(metrics or {}), status),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_candidate_status(self, config_id: str, status: str) -> int:
+        cur = self.conn.execute(
+            "UPDATE candidate_configs SET status=? WHERE config_id=?",
+            (status, config_id))
+        self.conn.commit()
+        return cur.rowcount
+
+    def fetch_candidate_configs(self, status: Optional[str] = None,
+                                limit: int = 50) -> list[dict]:
+        sql = "SELECT * FROM candidate_configs"
+        args: list = []
+        if status:
+            sql += " WHERE status=?"
+            args.append(status)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        rows = self.conn.execute(sql, args).fetchall()
+        return [self._decode_json_cols(dict(r), {
+            "overrides_json": "overrides",
+            "metrics_json": "metrics",
+        }) for r in rows]
+
+    def log_promotion(self, config_id: str, decision: dict,
+                      status: str = "pending_review",
+                      notes: Optional[str] = None) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO promotions (config_id, created_at, decision_json, "
+            "status, notes) VALUES (?,?,?,?,?)",
+            (config_id, dt.datetime.now(dt.timezone.utc).isoformat(),
+             json.dumps(decision or {}), status, notes),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_promotion(self, config_id: str, status: str,
+                         approved_by: Optional[str] = None) -> int:
+        cur = self.conn.execute(
+            "UPDATE promotions SET status=?, approved_by=?, approved_at=? "
+            "WHERE config_id=? AND status='pending_review'",
+            (status, approved_by,
+             dt.datetime.now(dt.timezone.utc).isoformat(), config_id))
+        self.conn.commit()
+        return cur.rowcount
+
+    def fetch_promotions(self, status: Optional[str] = None,
+                         limit: int = 50) -> list[dict]:
+        sql = "SELECT * FROM promotions"
+        args: list = []
+        if status:
+            sql += " WHERE status=?"
+            args.append(status)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        rows = self.conn.execute(sql, args).fetchall()
+        return [self._decode_json_cols(dict(r), {"decision_json": "decision"})
+                for r in rows]
+
+    def log_feature_score(self, feature: str, as_of: str, n: int,
+                          pearson: Optional[float] = None,
+                          spearman: Optional[float] = None,
+                          mutual_info: Optional[float] = None,
+                          perm_importance: Optional[float] = None,
+                          stability: Optional[float] = None,
+                          status: str = "observation",
+                          details: Optional[dict] = None) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO feature_scores (feature, as_of, n, pearson, spearman, "
+            "mutual_info, perm_importance, stability, status, details_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (feature, as_of, n, pearson, spearman, mutual_info,
+             perm_importance, stability, status, json.dumps(details or {})),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_feature_scores(self, feature: Optional[str] = None,
+                             latest_only: bool = False,
+                             limit: int = 200) -> list[dict]:
+        sql = "SELECT * FROM feature_scores"
+        args: list = []
+        if feature:
+            sql += " WHERE feature=?"
+            args.append(feature)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        rows = self.conn.execute(sql, args).fetchall()
+        out = [self._decode_json_cols(dict(r), {"details_json": "details"})
+               for r in rows]
+        if latest_only:
+            seen: set = set()
+            latest = []
+            for r in out:                      # newest first
+                if r["feature"] not in seen:
+                    seen.add(r["feature"])
+                    latest.append(r)
+            out = latest
         return out
 
     # ---- settle ----

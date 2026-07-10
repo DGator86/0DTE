@@ -1214,11 +1214,14 @@
     $("tab-command").classList.toggle("active", tab === "command");
     $("tab-journal").classList.toggle("active", tab === "journal");
     $("tab-validation").classList.toggle("active", tab === "validation");
+    $("tab-learning").classList.toggle("active", tab === "learning");
     $("view-command").classList.toggle("hidden", tab !== "command");
     $("view-journal").classList.toggle("hidden", tab !== "journal");
     $("view-validation").classList.toggle("hidden", tab !== "validation");
+    $("view-learning").classList.toggle("hidden", tab !== "learning");
     if (tab === "journal") refreshJournal();
     if (tab === "validation") refreshValidation();
+    if (tab === "learning") refreshLearning();
   }
 
   function entryLogicLine(ctx) {
@@ -1568,12 +1571,205 @@
     $("tab-validation-dot").classList.toggle("hidden", !hasAlert);
   }
 
+  /* ---------------- learning tab (adaptive learning engine) ---------------- */
+  const SEV_CLS = { alert: "veto", warn: "warn", info: "" };
+
+  function renderLearningDiagnostics(runs) {
+    const latest = runs.find((r) => (r.diagnostics || []).length) || runs[0];
+    const diags = (latest && latest.diagnostics) || [];
+    $("lrn-diag-sub").textContent = latest
+      ? `run ${String(latest.run_id || "").slice(0, 8)} · ${latest.mode || ""}`
+      : "—";
+    if (!diags.length) {
+      $("lrn-diagnostics").innerHTML =
+        '<p class="empty">Latest learning run found no diagnosable failure</p>';
+      return;
+    }
+    $("lrn-diagnostics").innerHTML = diags.map((d) => `
+      <div class="lrn-card">
+        <div class="lrn-card-head">
+          <span class="chip ${SEV_CLS[d.severity] || ""}">${esc(d.severity || "info")}</span>
+          <b class="mono">${esc(d.issue || "?")}</b>
+          <span class="tj-dim">conf ${pct(d.confidence)}</span>
+        </div>
+        <div class="tj-sub">${esc(d.likely_cause || "")}</div>
+        <div class="tj-sub lrn-reco">→ ${esc(d.recommendation || "")}</div>
+      </div>`).join("");
+  }
+
+  function renderLearningPromotions(promos) {
+    $("lrn-promo-sub").textContent = String(promos.length);
+    if (!promos.length) {
+      $("lrn-promotions").innerHTML = '<p class="empty">No promotion decisions yet</p>';
+      return;
+    }
+    $("lrn-promotions").innerHTML = promos.slice(0, 8).map((p) => {
+      const rules = ((p.decision || {}).rules) || [];
+      const stCls = p.status === "pending_review" ? "warn"
+                  : p.status === "approved" ? "ok" : "veto";
+      const pending = p.status === "pending_review";
+      return `<div class="lrn-card ${pending ? "lrn-pending" : ""}">
+        <div class="lrn-card-head">
+          <b class="mono">${esc(String(p.config_id || "").slice(0, 8))}</b>
+          <span class="chip ${stCls}">${esc(p.status || "?")}</span>
+          <span class="tj-dim mono">${esc((p.created_at || "").slice(0, 16).replace("T", " "))}</span>
+        </div>
+        <div class="lrn-rules">${rules.map((r) =>
+          `<span class="lrn-rule ${r.passed ? "ok" : "bad"}" title="${esc(r.detail || "")}">${r.passed ? "✓" : "✗"} ${esc(r.name)}</span>`).join("")}</div>
+        ${pending ? `<div class="tj-sub lrn-reco">awaiting human review — <span class="mono">python3 -m adaptive_learning.promoter --approve ${esc(String(p.config_id || "").slice(0, 8))}</span></div>` : ""}
+      </div>`;
+    }).join("");
+  }
+
+  function renderLearningDrift(reports) {
+    $("lrn-drift-sub").textContent = String(reports.length);
+    if (!reports.length) {
+      $("lrn-drift").innerHTML = '<p class="empty">No drift snapshots yet</p>';
+      return;
+    }
+    $("lrn-drift").innerHTML = reports.slice(0, 6).map((r) => {
+      const drifts = ((r.metrics || {}).drifts) || [];
+      const chips = drifts.length
+        ? drifts.map((d) => `<span class="chip warn" title="${esc(d.detail || "")}">${esc(d.kind)}: ${esc(d.metric)} ${sign(d.rel_change, 2)}</span>`).join("")
+        : '<span class="chip">no drift</span>';
+      return `<div class="lrn-card">
+        <div class="lrn-card-head"><b class="mono">${esc(r.report_date || "?")}</b></div>
+        <div class="chips">${chips}</div>
+      </div>`;
+    }).join("");
+  }
+
+  function overridesLine(ov) {
+    const entries = Object.entries(ov || {});
+    if (!entries.length) return '<span class="tj-dim">defaults</span>';
+    return entries.map(([k, v]) =>
+      `<span class="mono lrn-ov">${esc(k)}=${esc(String(v))}</span>`).join(" ");
+  }
+
+  function renderLearningCandidates(data) {
+    const champ = data.champion;
+    const cands = data.candidates || [];
+    $("lrn-cand-sub").textContent = String(cands.length);
+    $("lrn-champion").innerHTML = champ
+      ? `<div class="lrn-card lrn-champ">
+          <div class="lrn-card-head">
+            <span class="chip ok">CHAMPION</span>
+            <b class="mono">${esc(String(champ.config_id || "").slice(0, 8))}</b>
+            <span class="tj-dim">${esc(champ.label || "")}</span>
+          </div>
+          <div class="tj-sub">${overridesLine(champ.overrides)}</div>
+        </div>`
+      : '<p class="empty">No champion config — dataclass defaults live</p>';
+    if (!cands.length) {
+      $("lrn-candidates").innerHTML = '<p class="empty">No candidate configs yet</p>';
+      return;
+    }
+    const rows = cands.slice(0, 10).map((c) => {
+      const m = c.metrics || {};
+      const stCls = c.status === "pending_review" ? "warn"
+                  : c.status === "promoted" ? "good"
+                  : c.status === "rejected" ? "bad" : "";
+      return `<tr>
+        <td class="mono">${esc(String(c.config_id || "").slice(0, 8))}</td>
+        <td>${esc(c.label || "")}<div class="tj-sub">${overridesLine(c.overrides)}</div></td>
+        <td class="mono">${m.search_score != null ? sign(m.search_score, 3) : "—"}</td>
+        <td class="mono">${m.holdout_score != null ? sign(m.holdout_score, 3) : "—"}</td>
+        <td class="mono">${m.champion_score != null ? sign(m.champion_score, 3) : "—"}</td>
+        <td><span class="tj-reason ${stCls}">${esc(c.status || "?")}</span></td>
+      </tr>`;
+    }).join("");
+    $("lrn-candidates").innerHTML = `<table class="val-table"><thead><tr>
+      <th>Config</th><th>Label / overrides</th><th>Score</th><th>Holdout</th>
+      <th>Champion</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  function renderLearningRuns(runs) {
+    $("lrn-runs-sub").textContent = String(runs.length);
+    if (!runs.length) {
+      $("lrn-runs").innerHTML = '<p class="empty">No learning runs yet</p>';
+      return;
+    }
+    const rows = runs.slice(0, 10).map((r) => {
+      const outCls = r.outcome === "promotion_recommended" ? "good"
+                   : r.outcome === "rejected" ? "bad" : "";
+      return `<tr>
+        <td class="mono">${esc((r.started_at || "").slice(0, 16).replace("T", " "))}</td>
+        <td>${esc(r.mode || "?")}</td>
+        <td class="mono">${(r.diagnostics || []).length}</td>
+        <td class="mono">${r.n_trials != null ? r.n_trials : "—"}</td>
+        <td class="mono">${r.best_score != null ? sign(r.best_score, 3) : "—"}</td>
+        <td class="mono">${r.holdout_score != null ? sign(r.holdout_score, 3) : "—"}</td>
+        <td><span class="tj-reason ${outCls}">${esc(r.outcome || "?")}</span></td>
+      </tr>`;
+    }).join("");
+    $("lrn-runs").innerHTML = `<table class="val-table"><thead><tr>
+      <th>Started</th><th>Mode</th><th>Diag</th><th>Trials</th><th>Best</th>
+      <th>Holdout</th><th>Outcome</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  function renderLearningFeatures(features) {
+    $("lrn-feat-sub").textContent = String(features.length);
+    if (!features.length) {
+      $("lrn-features").innerHTML = '<p class="empty">No feature scores yet</p>';
+      return;
+    }
+    const order = { production: 0, candidate: 1, experimental: 2, observation: 3 };
+    const sorted = features.slice().sort((a, b) =>
+      (order[a.status] ?? 9) - (order[b.status] ?? 9)
+      || Math.abs(b.pearson || 0) - Math.abs(a.pearson || 0));
+    const rows = sorted.slice(0, 20).map((f) => {
+      const stCls = f.status === "candidate" || f.status === "production" ? "good"
+                  : f.status === "experimental" ? "warn" : "";
+      return `<tr>
+        <td class="mono">${esc(f.feature)}</td>
+        <td class="mono ${num(f.pearson) > 0 ? "pos" : num(f.pearson) < 0 ? "neg" : ""}">${f.pearson != null ? sign(f.pearson, 3) : "—"}</td>
+        <td class="mono">${f.spearman != null ? sign(f.spearman, 3) : "—"}</td>
+        <td class="mono">${f.mutual_info != null ? fmt(f.mutual_info, 3) : "—"}</td>
+        <td class="mono">${f.perm_importance != null ? sign(f.perm_importance, 3) : "—"}</td>
+        <td class="mono">${f.stability != null ? fmt(f.stability, 2) : "—"}</td>
+        <td><span class="tj-reason ${stCls}">${esc(f.status || "observation")}</span></td>
+      </tr>`;
+    }).join("");
+    $("lrn-features").innerHTML = `<table class="val-table"><thead><tr>
+      <th>Feature</th><th>Pearson</th><th>Spearman</th><th>MI</th>
+      <th>Perm</th><th>Stability</th><th>Lifecycle</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+
+  async function refreshLearning() {
+    try {
+      const [learning, cands, promos, feats, drift] = await Promise.all([
+        api("/api/learning?limit=50").catch(() => ({})),
+        api("/api/candidates?limit=50").catch(() => ({})),
+        api("/api/promotions?limit=50").catch(() => ({})),
+        api("/api/feature-scores").catch(() => ({})),
+        api("/api/drift?limit=10").catch(() => ({})),
+      ]);
+      renderLearningDiagnostics(learning.runs || []);
+      renderLearningRuns(learning.runs || []);
+      renderLearningCandidates(cands || {});
+      renderLearningPromotions(promos.promotions || []);
+      renderLearningFeatures(feats.features || []);
+      renderLearningDrift(drift.reports || []);
+    } catch (e) {
+      if (e.message !== "Unauthorized") console.warn("learning", e);
+    }
+  }
+
+  // Light the Learning tab dot when a candidate awaits human review.
+  function renderLearningBadge(promos) {
+    const pending = ((promos && promos.promotions) || [])
+      .some((p) => p.status === "pending_review");
+    $("tab-learning-dot").classList.toggle("hidden", !pending);
+  }
+
   /* ---------------- refresh loop ---------------- */
   async function refresh() {
     if (activeTab === "journal") refreshJournal();
     if (activeTab === "validation") refreshValidation();
+    if (activeTab === "learning") refreshLearning();
     try {
-      let [live, market, history, report, paper, readiness, trades, valLatest] = await Promise.all([
+      let [live, market, history, report, paper, readiness, trades, valLatest, pendingPromos] = await Promise.all([
         api("/api/live"),
         api("/api/market-status"),
         api("/api/ticks?limit=200"),
@@ -1582,8 +1778,10 @@
         api("/api/readiness").catch(() => ({})),
         api("/api/trades?limit=100").catch(() => ({})),
         api("/api/validation?limit=1").catch(() => ({})),
+        api("/api/promotions?status=pending_review&limit=1").catch(() => ({})),
       ]);
       renderValidationBadge(valLatest);
+      renderLearningBadge(pendingPromos);
       const ticks = history.ticks || [];
       const latest = ticks.length ? ticks[ticks.length - 1] : null;
       // Playbook should show the live candidate: prefer the newest tick, but if it
@@ -1789,6 +1987,7 @@
     $("tab-command").addEventListener("click", () => switchTab("command"));
     $("tab-journal").addEventListener("click", () => switchTab("journal"));
     $("tab-validation").addEventListener("click", () => switchTab("validation"));
+    $("tab-learning").addEventListener("click", () => switchTab("learning"));
     initValidationControls();
     initChartControls();
     loadMarketStatus();

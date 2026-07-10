@@ -181,6 +181,87 @@ def validation_report_by_id(db_path: str, report_id: int) -> Optional[dict]:
     return d
 
 
+# --------------------------------------------------------------------------- #
+# Adaptive-learning readouts (Learning tab). All read-only; every function    #
+# degrades to [] on legacy databases without the tables.                      #
+# --------------------------------------------------------------------------- #
+def _ro_rows(db_path: str, sql: str, args: tuple = ()) -> list:
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return []
+    try:
+        return conn.execute(sql, args).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def _decode(d: dict, mapping: dict[str, str]) -> dict:
+    for src, dest in mapping.items():
+        try:
+            d[dest] = json.loads(d.pop(src) or "null")
+        except (json.JSONDecodeError, TypeError):
+            d[dest] = None
+    return d
+
+
+def learning_runs(db_path: str, limit: int = 50) -> list[dict]:
+    """Learning-cycle history (newest first) with diagnostics decoded."""
+    rows = _ro_rows(db_path,
+                    "SELECT * FROM learning_runs ORDER BY id DESC LIMIT ?",
+                    (limit,))
+    return [_decode(dict(r), {"diagnostics_json": "diagnostics",
+                              "param_space_json": "param_space",
+                              "trials_json": "trials"}) for r in rows]
+
+
+def candidate_configs(db_path: str, status: Optional[str] = None,
+                      limit: int = 50) -> list[dict]:
+    sql = "SELECT * FROM candidate_configs"
+    args: list = []
+    if status:
+        sql += " WHERE status = ?"
+        args.append(status)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    rows = _ro_rows(db_path, sql, tuple(args))
+    return [_decode(dict(r), {"overrides_json": "overrides",
+                              "metrics_json": "metrics"}) for r in rows]
+
+
+def promotions(db_path: str, status: Optional[str] = None,
+               limit: int = 50) -> list[dict]:
+    sql = "SELECT * FROM promotions"
+    args: list = []
+    if status:
+        sql += " WHERE status = ?"
+        args.append(status)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    rows = _ro_rows(db_path, sql, tuple(args))
+    return [_decode(dict(r), {"decision_json": "decision"}) for r in rows]
+
+
+def feature_scores(db_path: str, latest_only: bool = True,
+                   limit: int = 500) -> list[dict]:
+    rows = _ro_rows(db_path,
+                    "SELECT * FROM feature_scores ORDER BY id DESC LIMIT ?",
+                    (limit,))
+    out = [_decode(dict(r), {"details_json": "details"}) for r in rows]
+    if latest_only:
+        seen: set = set()
+        latest = []
+        for r in out:                        # newest first
+            if r["feature"] not in seen:
+                seen.add(r["feature"])
+                latest.append(r)
+        out = latest
+    return out
+
+
 def report_summary(db_path: str) -> dict:
     jrn = Journal(db_path)
     try:
