@@ -97,10 +97,13 @@ class RNDConfig:
     rv_max_gap_min: float = 3.0     # drop returns spanning gaps longer than this (overnight)
     rv_scale_min: float = 0.5       # squeeze floor: phys_std never below 0.5*rn_std
     rv_scale_max: float = 1.5       # squeeze cap: phys_std never above 1.5*rn_std
-    # Directional drift tilt (used ONLY when the regime router emits a resolved
-    # direction). A debit structure is a bet on drift; a drift-less physical
-    # density prices every debit at EV<=0 by construction, so the momentum
-    # belief must be explicit — and journal-calibrated — not implicit.
+    # Directional drift tilt (LEGACY — Prediction Engine V2 §12.5).
+    # Used ONLY when UnifiedOrchestrator.use_legacy_directional_tilt is True
+    # (the migration default) AND the regime router emits a resolved direction.
+    # V2 replaces this circular policy→density feedback with an independent
+    # PhysicalForecast built from PredictionBundle
+    # (prediction/physical_distribution.py). Do not raise the default; prefer
+    # disabling the flag once V2 passes promotion criteria.
     # Shift = dir_drift_frac * conviction_size_mult * phys_std, signed.
     dir_drift_frac: float = 0.30
 

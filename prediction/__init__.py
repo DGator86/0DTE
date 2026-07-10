@@ -26,4 +26,8 @@ Currently implemented:
   training  — session-grouped, embargoed walk-forward training with naive
               baselines, PredictionBundle assembly, and journaled shadow
               inference with zero policy effect (PR 4).
+  physical_distribution — independent physical density from
+              PredictionBundle / PhysicalForecast: center, scale, shift,
+              uncertainty-blend toward RND; replaces the circular
+              dir_drift_frac tilt (PR 5).
 """
