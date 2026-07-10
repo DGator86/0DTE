@@ -270,10 +270,92 @@ def report_summary(db_path: str) -> dict:
             "component_correlations": jrn.component_correlations(),
             "calibration": jrn.calibration(),
             "decision_funnel": jrn.decision_funnel(),
+            "gex_variant_comparison": jrn.gex_variant_comparison(),
             "unsettled_dates": jrn.unsettled_dates(),
         }
     finally:
         jrn.close()
+
+
+def gex_variant_summary(db_path: str,
+                        session_date: Optional[str] = None) -> dict:
+    """PR 9 readout — Journal.gex_variant_comparison over HTTP."""
+    if not _db_exists(db_path):
+        return {"note": "journal database not found"}
+    jrn = Journal(db_path)
+    try:
+        return jrn.gex_variant_comparison(session_date=session_date)
+    finally:
+        jrn.close()
+
+
+def _db_exists(path: str) -> bool:
+    import os
+    return bool(path) and os.path.isfile(path)
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def fetch_prediction_for_snapshot(
+    snapshot_id: str,
+    *,
+    prediction_db: str = "",
+    journal_db: str = "",
+) -> dict:
+    """
+    Load the latest PredictionBundle row for a journal snapshot_id
+    (PR 4+ / prediction_outputs). Tries prediction_db first, then the
+    journal DB if it hosts the same table. Read-only; never creates tables.
+    """
+    if not snapshot_id:
+        return {"note": "snapshot_id required", "prediction": None}
+
+    candidates = []
+    if prediction_db:
+        candidates.append(prediction_db)
+    if journal_db and journal_db not in candidates:
+        candidates.append(journal_db)
+
+    for path in candidates:
+        if not _db_exists(path):
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            continue
+        try:
+            if not _table_exists(conn, "prediction_outputs"):
+                continue
+            row = conn.execute(
+                "SELECT * FROM prediction_outputs WHERE snapshot_id=? "
+                "ORDER BY id DESC LIMIT 1",
+                (snapshot_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            d = dict(row)
+            try:
+                preds = json.loads(d.pop("predictions_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                preds = {}
+            d["predictions"] = preds if isinstance(preds, dict) else {}
+            d["source_db"] = path
+            return {"snapshot_id": snapshot_id, "prediction": d}
+        finally:
+            conn.close()
+
+    return {
+        "snapshot_id": snapshot_id,
+        "prediction": None,
+        "note": "no prediction_outputs row for snapshot",
+    }
 
 
 def paper_trades_journal(paper_db_path: str, live_state_path: str = "",
