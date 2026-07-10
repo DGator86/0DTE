@@ -59,6 +59,13 @@ class CompositeFeed:
                 if self._last_source != name:
                     log.info("snapshot served by %s", name)
                     self._last_source = name
+                # Tag provenance for GEX variant journaling (PR 9); does not
+                # alter MarketSnapshot policy fields.
+                try:
+                    if not getattr(snap, "gex_feed_source", ""):
+                        snap.gex_feed_source = name
+                except Exception:
+                    pass
                 return snap
         return None
 
