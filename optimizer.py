@@ -67,7 +67,12 @@ _NEG_INF = float("-inf")
 
 
 def _score(wf: WalkForwardResult, metric: str) -> float:
-    folds = wf.folds
+    # Score only VALID folds (a fold that dropped too many test ticks on
+    # exceptions must not flatter the search). getattr keeps duck-typed
+    # walk-forward fakes in tests working.
+    folds = getattr(wf, "valid_folds", None)
+    if folds is None:
+        folds = wf.folds
     if not folds:
         return _NEG_INF
 
@@ -116,7 +121,9 @@ def composite_score(wf: WalkForwardResult) -> float:
     """
     import math as _math
 
-    folds = wf.folds
+    folds = getattr(wf, "valid_folds", None)
+    if folds is None:
+        folds = wf.folds
     if not folds:
         return _NEG_INF
 
@@ -362,11 +369,20 @@ def run_optimizer(
     base = base_engine_cfg or EngineConfig()
 
     # Carve off the untouched holdout BEFORE the search sees anything.
+    # With session-unit folds (the default) the holdout is the final fraction
+    # of COMPLETE sessions — never a partial session — so the boundary cannot
+    # split a trading day between search and holdout. The legacy tick cut is
+    # kept only for fold_unit="tick" comparisons.
     holdout_ts: list[dt.datetime] = []
     search_ts = timestamps
     if opt.holdout_frac > 0.0:
-        cut = int(len(timestamps) * (1.0 - opt.holdout_frac))
-        search_ts, holdout_ts = timestamps[:cut], timestamps[cut:]
+        if wf.fold_unit == "session":
+            from validation.session_folds import split_holdout_by_sessions
+            search_ts, holdout_ts = split_holdout_by_sessions(
+                timestamps, opt.holdout_frac)
+        else:
+            cut = int(len(timestamps) * (1.0 - opt.holdout_frac))
+            search_ts, holdout_ts = timestamps[:cut], timestamps[cut:]
 
     param_list: Optional[list[dict]]
     if opt.search == "grid":
@@ -413,18 +429,30 @@ def run_optimizer(
     trials.sort(key=lambda t: t.score, reverse=True)
 
     # Evaluate ONLY the winner, ONCE, on the untouched window: warm-up on the
-    # full search timeline, one test fold on the holdout.
+    # search timeline, one test fold covering exactly the holdout sessions.
     holdout_score = holdout_result = None
     if holdout_ts:
         print(f"  Holdout: evaluating winner on final {len(holdout_ts):,} ticks "
               f"(never seen by the search)")
+        if wf.fold_unit == "session":
+            from validation.session_folds import session_spans
+            hold_cfg = WalkForwardConfig(
+                mode="expanding", n_folds=1,
+                fold_unit="session",
+                embargo_sessions=wf.embargo_sessions,
+                max_failed_tick_frac=wf.max_failed_tick_frac,
+                # Pin the test window to exactly the held-out sessions.
+                initial_warm_sessions=len(session_spans(search_ts)),
+            )
+        else:
+            hold_cfg = WalkForwardConfig(
+                mode="expanding", n_folds=1, fold_unit="tick",
+                train_frac=len(search_ts) / max(1, len(search_ts) + len(holdout_ts)),
+            )
         holdout_result = run_walk_forward(
             feed_factory=feed_factory,
             timestamps=search_ts + holdout_ts,
-            wf_cfg=WalkForwardConfig(
-                mode="expanding", n_folds=1,
-                train_frac=len(search_ts) / max(1, len(search_ts) + len(holdout_ts)),
-            ),
+            wf_cfg=hold_cfg,
             engine_cfg=trials[0].engine_cfg,
             risk_cfg=risk_cfg,
         )
