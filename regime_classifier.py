@@ -29,8 +29,9 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from gate_scorer import MarketSnapshot
+from gate_scorer import GateConfig, MarketSnapshot
 from rnd_extractor import RiskNeutralDensity, EdgeReport
+from volatility_channel_features import donchian_breakout_strength
 
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +107,10 @@ class ClassifierContext:
     rnd: Optional[RiskNeutralDensity] = None
     edge: Optional[EdgeReport] = None
     feature_ages: dict = field(default_factory=dict)   # name -> seconds since update
+    # Raw Bollinger/Keltner/Donchian dict from
+    # volatility_channel_features.channel_features_from_bars (the caller owns
+    # the bar stream). Empty dict -> channel features read None (reliability 0).
+    channel: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +200,36 @@ def _build_features() -> list[FeatureSpec]:
     F.append(_f("tick_two_sided", "flow",
                 lambda c, sb: clip100(100.0 * math.exp(-c.market.tick_abs_mean / 600.0))))
 
+    # Volatility channels (Bollinger / Keltner / Donchian). Raw values come
+    # from ctx.channel (volatility_channel_features.channel_features_from_bars,
+    # single working TF); missing dict/keys -> None -> reliability 0.
+    def _chan(c: ClassifierContext, key: str):
+        return c.channel.get(key) if c.channel else None
+
+    F.append(_f("bb_squeeze", "channel",              # graded TTM squeeze 0..1
+                lambda c, sb: P(v) if (v := _chan(c, "bb_squeeze")) is not None else None))
+    F.append(_f("bb_expansion", "channel",            # signed width rate of change
+                lambda c, sb: S(v, 0.25) if (v := _chan(c, "bb_expansion")) is not None else None))
+    F.append(_f("keltner_position", "channel",        # 0=lower band, 100=upper band
+                lambda c, sb: clip100(100.0 * v)
+                if (v := _chan(c, "keltner_position")) is not None else None))
+    # Direction-agnostic trend persistence: 0 = hugging the midline, 100 =
+    # pinned at either Keltner band for KC_TREND_LB bars. Folded here (not in
+    # the weights) because REGIME_WEIGHTS only supports invert.
+    F.append(_f("keltner_trend_strength", "channel",
+                lambda c, sb: clip100(100.0 * abs(math.tanh(v / 0.25)))
+                if (v := _chan(c, "keltner_trend_strength")) is not None else None))
+    F.append(_f("donchian_width", "channel",          # percentile rank of range width
+                lambda c, sb: P(v) if (v := _chan(c, "donchian_width")) is not None else None))
+    # 50 = no breakout; >50 = penetration beyond the prior channel, in ATRs.
+    F.append(_f("donchian_breakout", "channel",       # either direction (max leg)
+                lambda c, sb: S(v, 0.5)
+                if (v := donchian_breakout_strength(c.channel or {})) is not None else None))
+    F.append(_f("donchian_breakout_up", "channel",
+                lambda c, sb: S(v, 0.5) if (v := _chan(c, "donchian_breakout_up")) is not None else None))
+    F.append(_f("donchian_breakout_down", "channel",
+                lambda c, sb: S(v, 0.5) if (v := _chan(c, "donchian_breakout_down")) is not None else None))
+
     return F
 
 
@@ -205,12 +240,17 @@ FEATURES = _build_features()
 # Regime definitions: (feature_name, weight, invert)                           #
 # invert=True uses (100 - value). Confidence = Σ w·rel·v / Σ w·rel.            #
 # --------------------------------------------------------------------------- #
+# Channel features (bb_squeeze, donchian_*, keltner_*, bb_expansion) enter at
+# 0.6-0.8 weights — below the incumbent features — to limit blast radius while
+# paper trading proves them out. Graceful degradation means they contribute
+# nothing when the caller supplies no ctx.channel dict.
 REGIME_WEIGHTS: dict[str, list[tuple]] = {
     "compression": [
         ("gamma_sign", 1.5, False), ("flip_cushion", 1.0, False),
         ("channel_tightness", 1.2, False), ("bb_compression", 1.0, False),
         ("adx_strength", 1.3, True), ("tick_two_sided", 0.8, False),
         ("richness", 0.6, False),
+        ("bb_squeeze", 0.8, False), ("donchian_width", 0.6, True),
     ],
     "range_confidence": [
         ("gamma_sign", 1.2, False), ("channel_tightness", 1.0, False),
@@ -226,6 +266,7 @@ REGIME_WEIGHTS: dict[str, list[tuple]] = {
         ("adx_strength", 1.5, False), ("bb_compression", 1.0, True),
         ("cvd_persistence", 0.8, False), ("rsi_centered", 0.8, True),
         ("rv_expansion", 0.8, False),
+        ("keltner_trend_strength", 0.8, False), ("bb_squeeze", 0.6, True),
     ],
     "directional_confidence": [
         ("adx_strength", 1.2, False), ("cvd_persistence", 1.0, False),
@@ -235,11 +276,14 @@ REGIME_WEIGHTS: dict[str, list[tuple]] = {
         ("gamma_sign", 1.3, True), ("flip_proximity", 1.0, False),
         ("rv_expansion", 1.2, False), ("vvix_elevation", 1.0, False),
         ("tail_heaviness", 0.8, False), ("term_structure", 0.8, True),
+        ("bb_expansion", 0.8, False), ("donchian_breakout", 0.6, False),
     ],
     "breakout_confidence": [
         ("gamma_sign", 1.2, True), ("flip_proximity", 1.1, False),
         ("adx_strength", 1.0, False), ("rv_expansion", 1.0, False),
         ("tick_two_sided", 0.8, True),
+        ("donchian_breakout", 0.8, False), ("bb_expansion", 0.6, False),
+        ("bb_squeeze", 0.6, True),
     ],
     "dealer_stability": [
         ("gamma_sign", 1.5, False), ("gamma_magnitude", 1.0, False),
@@ -267,9 +311,11 @@ SUPPORT_REGIMES = ["dealer_stability", "volatility_confidence"]
 ALL_ENGINES = {"premium_selling", "directional", "vol_expansion"}
 
 
-def _vetoes(ctx: ClassifierContext) -> list[tuple]:
+def _vetoes(ctx: ClassifierContext,
+            cfg: Optional["ClassifierConfig"] = None) -> list[tuple]:
     """Return (reason, blocked_engines). Catalyst is a true hard stop; the rest
     block premium selling but PERMIT directional / vol-expansion engines."""
+    cfg = cfg or ClassifierConfig()
     m = ctx.market
     v = []
     if m.has_catalyst:
@@ -278,9 +324,9 @@ def _vetoes(ctx: ClassifierContext) -> list[tuple]:
         v.append(("short_gamma_regime", {"premium_selling"}))
     if m.spot < m.gamma_flip:
         v.append(("below_gamma_flip", {"premium_selling"}))
-    if m.vix >= m.vix3m:
+    if m.vix >= m.vix3m * cfg.term_backwardation_ratio:
         v.append(("term_backwardation", {"premium_selling"}))
-    if m.adx >= 25:
+    if m.adx >= cfg.adx_no_premium:
         v.append(("trending", {"premium_selling"}))
     return v
 
@@ -319,6 +365,20 @@ class ClassifierConfig:
     ig_stand_down: float = 70.0        # global IG above this => regime unstable, stand down
     update_scales: bool = True
 
+    # -- premium-selling veto thresholds (journal-calibratable) --
+    # "A trend is present" is ONE fact, but it used to be measured with TWO
+    # thresholds: the premium gate kills at ADX >= GateConfig.max_adx (20)
+    # while this veto was hardcoded at 25. In the 20-25 dead zone the matrix
+    # kept routing credit cells straight into a guaranteed TRENDING gate fail
+    # instead of flipping them to their debit cousins. Default to the gate's
+    # own threshold so routing and gating agree; calibrate them TOGETHER from
+    # the journal, never separately.
+    adx_no_premium: float = GateConfig.max_adx
+    # Backwardation veto fires when vix >= vix3m * ratio. 1.0 is the plain
+    # inversion test (unchanged default); tune from decision_funnel() data if
+    # marginal inversions prove sellable (or dangerous even in mild contango).
+    term_backwardation_ratio: float = 1.0
+
 
 @dataclass
 class RegimeClassifier:
@@ -355,7 +415,7 @@ class RegimeClassifier:
             self._update_scales(ctx)
 
         std = self._standardize(ctx)
-        vetoes = _vetoes(ctx)
+        vetoes = _vetoes(ctx, self.cfg)
         blocked_engines = set()
         for _, eng in vetoes:
             blocked_engines |= eng

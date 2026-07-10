@@ -1,0 +1,23 @@
+# Baseline for feature-impact comparisons: the system's default dataclass
+# configuration WITHOUT the volatility-channel matrix variables
+# (Bollinger/Keltner/Donchian). Pair with with_channels.yaml to measure what
+# the channel features contribute end to end.
+name: baseline
+description: >
+  Default engine/classifier configuration with the volatility-channel matrix
+  variables (Bollinger, Keltner, Donchian) disabled. Reference point for the
+  channel feature-impact evaluation.
+
+mtf:
+  disabled_vars:
+    - bb_width
+    - bb_position
+    - bb_squeeze
+    - bb_expansion
+    - keltner_width
+    - keltner_position
+    - keltner_trend_strength
+    - donchian_width
+    - donchian_position
+    - donchian_breakout_up
+    - donchian_breakout_down

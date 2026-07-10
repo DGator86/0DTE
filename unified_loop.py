@@ -57,6 +57,7 @@ from regime_alignment import (
 from journal import Journal
 from market_dynamics import DynamicsWindow, session_open_from_bars
 from risk_manager import RiskManager
+from volatility_channel_features import channel_features_from_bars
 
 ET = ZoneInfo("America/New_York")
 
@@ -215,8 +216,9 @@ class UnifiedOrchestrator:
     @staticmethod
     def _signals_with_ras(signals: dict, ras_results: list) -> tuple[dict, Optional[str]]:
         if not ras_results:
-            return signals, (json.dumps({k: round(v, 6) for k, v in signals.items()
-                                        if isinstance(v, (int, float))})
+            return signals, (json.dumps({k: (v if isinstance(v, str) else round(v, 6))
+                                        for k, v in signals.items()
+                                        if isinstance(v, (int, float, str))})
                              if signals else None)
         merged = dict(signals)
         # Flatten only the WORST-scoring position: with several open positions
@@ -298,8 +300,18 @@ class UnifiedOrchestrator:
         snap_dict.update(signals)
         # signals_json finalized after RAS merge below
 
+        # ---- Volatility channels (Bollinger / Keltner / Donchian) ----
+        # One classifier-TF computation per tick, shared by the classifier
+        # (ctx.channel), RAS (via RegimeState.standardized), and the journal
+        # (chan_* keys in signals_json for component_correlations).
+        channel = channel_features_from_bars(snap.bars)
+        for k, v in channel.items():
+            if isinstance(v, (int, float)) and math.isfinite(v):
+                signals[f"chan_{k}"] = float(v)
+
         # ---- Track B: regime classifier ----
-        clf_ctx = ClassifierContext(market=snap.market, rnd=rnd, edge=edge)
+        clf_ctx = ClassifierContext(market=snap.market, rnd=rnd, edge=edge,
+                                    channel=channel)
         regime_state = self._classifier.classify(clf_ctx, self._prev_std)
         self._prev_std = regime_state.standardized
 
@@ -325,6 +337,7 @@ class UnifiedOrchestrator:
         if isinstance(dom_conf, (int, float)) and math.isfinite(dom_conf):
             signals["regime_dominant_conf"] = float(dom_conf)
 
+<<<<<<< HEAD
         # Raw fast/slow direction composites plus the crossover event. The fast
         # composite is the turn-detection channel (leads the 60%-slow blend at
         # intraday reversals); bias_cross = +/-1 only on the tick where the
@@ -341,6 +354,18 @@ class UnifiedOrchestrator:
             signals["bias_cross"] = cross
             log.info("Direction composite crossover: fast %s slow (fast=%.1f slow=%.1f)",
                      "above" if cross > 0 else "below", bf, bs)
+=======
+        # Routing provenance for journal.decision_funnel(): what Track B
+        # actually routed, whether a dealer veto flipped a credit cell to its
+        # debit cousin, and which regime vetoes were active. Without this the
+        # journal only sees the FINAL family, so a forced LCS is
+        # indistinguishable from a trend-cell LCS — exactly the distinction
+        # needed to answer "why is premium not trading?".
+        signals["routed_structure"] = intent.decision.structure
+        signals["premium_flip"] = 1.0 if "premium veto" in intent.note else 0.0
+        if regime_state.vetoes:
+            signals["regime_vetoes"] = ",".join(regime_state.vetoes)
+>>>>>>> origin/main
 
         ras_results = self._compute_ras(
             regime_state, intent, snap.market, position_contexts)

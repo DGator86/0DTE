@@ -27,6 +27,8 @@ from dashboard.queries import (
     ras_history,
     readiness_summary,
     report_summary,
+    validation_report_by_id,
+    validation_reports,
 )
 from dashboard.state import read_live_state
 from market_calendar import market_status
@@ -142,6 +144,29 @@ async def api_report():
     if not os.path.isfile(db):
         return {"note": "journal database not found"}
     return report_summary(db)
+
+
+@app.get("/api/validation")
+async def api_validation(
+    report_type: Optional[str] = Query(None, pattern="^(daily|weekly|feature_impact)$"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Validation report history (daily/weekly pipeline runs and
+    feature-impact reports), newest first."""
+    db = _config.get("db", "shadow.db")
+    if not os.path.isfile(db):
+        return {"reports": [], "note": "journal database not found"}
+    return {"report_type": report_type,
+            "reports": validation_reports(db, report_type=report_type, limit=limit)}
+
+
+@app.get("/api/validation/{report_id}")
+async def api_validation_report(report_id: int):
+    db = _config.get("db", "shadow.db")
+    report = validation_report_by_id(db, report_id) if os.path.isfile(db) else None
+    if report is None:
+        raise HTTPException(status_code=404, detail="Validation report not found")
+    return report
 
 
 @app.get("/api/readiness")

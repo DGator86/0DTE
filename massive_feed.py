@@ -646,6 +646,7 @@ class MassiveDataFeed:
             call_wall=gm.call_wall,
             put_wall=gm.put_wall,
             gex_pct_rank=gex_rank,
+            gex_rank_warm=self._gex_window.is_warm,
             vix9d=self._vix9d,
             vix=self._vix,
             vix3m=self._vix3m,

@@ -530,6 +530,77 @@
     ].join("");
   }
 
+  /* ---------------- decision funnel ---------------- */
+  const CREDIT_KEYS = new Set([
+    "put_credit", "call_credit", "iron_condor", "iron_fly", "broken_wing",
+    "PCS", "CCS", "IC", "IF",
+  ]);
+  function fnHistCol(title, obj, { creditTint = false, warnKeys = null, fmtRow = null } = {}) {
+    const entries = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    const rows = entries.length
+      ? (() => {
+          const max = entries[0][1] || 1;
+          return entries.map(([k, v]) => {
+            const cls = creditTint && CREDIT_KEYS.has(k) ? "credit"
+              : (warnKeys && warnKeys.has(k) ? "warn" : "");
+            const label = fmtRow ? fmtRow(k) : k;
+            return `<div class="fn-row ${cls}">
+              <span class="lbl" title="${esc(k)}">${esc(label)}</span>
+              <span class="track"><span style="width:${Math.max(4, (v / max) * 100)}%"></span></span>
+              <span class="num">${v}</span>
+            </div>`;
+          }).join("");
+        })()
+      : '<div class="fn-empty">none</div>';
+    return `<div class="fn-col"><div class="fn-title">${esc(title)}</div>${rows}</div>`;
+  }
+  function renderFunnel(report) {
+    const f = report && report.decision_funnel;
+    if (!f || !f.n) {
+      $("funnel-sub").textContent = "—";
+      $("funnel-metrics").innerHTML = "";
+      $("funnel-hists").innerHTML = '<p class="empty">No funnel data yet</p>';
+      return;
+    }
+    $("funnel-sub").textContent = `${f.n} ticks · ${f.sessions} session${f.sessions === 1 ? "" : "s"}`;
+
+    const cm = f.class_mix || {};
+    const credit = cm.credit || {}, debit = cm.debit || {}, stand = cm.stand_down || {};
+    const flips = (f.premium_flips || {}).n;
+    const gex = f.gex_rank || {};
+    const warmFrac = gex.frac_at_warmup_neutral;
+    $("funnel-metrics").innerHTML = [
+      metricCard("Credit routed · traded", `${credit.n || 0} · ${credit.traded || 0}`,
+        (credit.traded || 0) > 0 ? "pos" : "warn"),
+      metricCard("Debit routed · traded", `${debit.n || 0} · ${debit.traded || 0}`),
+      metricCard("Stand-down ticks", `${stand.n || 0}`),
+      metricCard("Credit→debit flips", flips != null ? String(flips) : "—",
+        num(flips) > 0 ? "warn" : ""),
+      metricCard("GEX rank in warm-up", warmFrac != null ? pct(warmFrac) : "—",
+        num(warmFrac) > 0.2 ? "warn" : ""),
+      metricCard("GEX rank < gate floor", gex.frac_below_gate_floor != null
+        ? `${pct(gex.frac_below_gate_floor)} of ticks` : "—"),
+    ].join("");
+
+    const mixCounts = Object.fromEntries(
+      Object.entries(f.structure_mix || {}).map(([k, s]) => [k, (s && s.n) || 0]));
+    $("funnel-hists").innerHTML = [
+      fnHistCol("Routed by regime (Track B)", f.routed_structures, { creditTint: true }),
+      fnHistCol("Final structure · traded/total", mixCounts, {
+        creditTint: true,
+        fmtRow: (k) => {
+          const s = (f.structure_mix || {})[k] || {};
+          return `${k} ${s.traded || 0}/${s.n || 0}`;
+        },
+      }),
+      fnHistCol("Which layer said no", f.no_trade_reasons),
+      fnHistCol("Gate failures", f.gate_failures,
+        { warnKeys: new Set(["GEX_WEAK", "TRENDING"]) }),
+      fnHistCol("Dealer vetoes", f.regime_vetoes),
+      fnHistCol("Selector vetoes", f.selector_vetoes),
+    ].join("");
+  }
+
   /* ---------------- live-readiness checklist ---------------- */
   function fmtNum(x) {
     return Number.isInteger(x) ? String(x) : fmt(x, 3);
@@ -1142,9 +1213,12 @@
     activeTab = tab;
     $("tab-command").classList.toggle("active", tab === "command");
     $("tab-journal").classList.toggle("active", tab === "journal");
+    $("tab-validation").classList.toggle("active", tab === "validation");
     $("view-command").classList.toggle("hidden", tab !== "command");
     $("view-journal").classList.toggle("hidden", tab !== "journal");
+    $("view-validation").classList.toggle("hidden", tab !== "validation");
     if (tab === "journal") refreshJournal();
+    if (tab === "validation") refreshValidation();
   }
 
   function entryLogicLine(ctx) {
@@ -1273,11 +1347,224 @@
     }
   }
 
+  /* ---------------- validation tab ---------------- */
+  let valFilter = "";
+  let valSelectedId = null;
+  let valReports = [];
+
+  function valStatus(rep) {
+    const flags = rep.flags || [];
+    if (flags.some((f) => f && f.severity === "alert")) return "alert";
+    if (flags.some((f) => f && f.severity === "warn")) return "warn";
+    return "ok";
+  }
+
+  const VAL_TYPE_LABEL = { daily: "Daily", weekly: "Weekly", feature_impact: "Feature" };
+
+  function renderValList() {
+    $("val-count").textContent = String(valReports.length);
+    if (!valReports.length) {
+      $("val-list").innerHTML = '<p class="empty">No validation reports yet — the scheduled pipeline will populate this after its first run</p>';
+      return;
+    }
+    $("val-list").innerHTML = valReports.map((r) => {
+      const st = valStatus(r);
+      const sel = r.id === valSelectedId ? " selected" : "";
+      return `<button class="val-row${sel}" type="button" data-id="${r.id}">
+        <span class="val-dot ${st}"></span>
+        <span class="mono val-date">${esc(r.report_date || "—")}</span>
+        <span class="val-type ${esc(r.report_type)}">${esc(VAL_TYPE_LABEL[r.report_type] || r.report_type)}</span>
+        <span class="val-sum">${esc((r.summary || "").slice(0, 90))}</span>
+      </button>`;
+    }).join("");
+    document.querySelectorAll("#val-list .val-row").forEach((el) => {
+      el.addEventListener("click", () => {
+        valSelectedId = +el.dataset.id;
+        renderValList();
+        const rep = valReports.find((r) => r.id === valSelectedId);
+        if (rep) renderValDetail(rep);
+      });
+    });
+  }
+
+  function valDelta(v, invert) {
+    const n = num(v);
+    if (n == null || n === 0) return "";
+    const good = invert ? n < 0 : n > 0;
+    return `<span class="val-delta ${good ? "pos" : "neg"}">${sign(n, 3)}</span>`;
+  }
+
+  function renderValDetail(rep) {
+    $("val-detail-date").textContent = `${rep.report_date || "—"} · ${rep.report_type || ""}`;
+    const m = rep.metrics || {};
+    const jm = m.journal || {};
+    const wf = m.walk_forward || null;
+    const deltas = m.deltas || {};
+    const parts = [];
+
+    parts.push(`<p class="val-summary">${esc(rep.summary || "—")}</p>`);
+
+    const flags = rep.flags || [];
+    if (flags.length) {
+      parts.push('<div class="chips">' + flags.map((f) => {
+        const sev = (f && f.severity) || "info";
+        const cls = sev === "alert" ? "veto" : sev === "warn" ? "warn" : "";
+        const label = typeof f === "string" ? f : `${f.flag}: ${f.detail}`;
+        return `<span class="chip ${cls}" title="${esc(label)}">${esc(typeof f === "string" ? f : f.flag)}</span>`;
+      }).join("") + "</div>");
+    }
+
+    if (rep.report_type === "feature_impact") {
+      parts.push(renderFeatureImpactDetail(m));
+    } else {
+      const gate = jm.gate_effectiveness || {};
+      const taken = (gate.trades_taken || {}).mean;
+      const blocked = (gate.blocked_by_gate || {}).mean;
+      const gateEdge = (taken != null && blocked != null) ? taken - blocked : null;
+      const cards = [
+        metricCard("Win rate", pct(jm.win_rate) + valDelta(deltas.win_rate)),
+        metricCard("Mean P&L / trade", sign(jm.mean_pnl_per_trade, 4) + valDelta(deltas.mean_pnl_per_trade)),
+        metricCard("Settled trades", jm.n_settled_trades != null ? String(jm.n_settled_trades) : "—"),
+        metricCard("WF Sharpe", wf ? sign(wf.mean_sharpe, 2) + valDelta(deltas.mean_sharpe) : "—"),
+        metricCard("WF folds profitable", wf ? `${wf.n_profitable}/${wf.n_folds}` : "—"),
+        metricCard("Gate edge", gateEdge != null ? sign(gateEdge, 4) : "—",
+                   gateEdge != null ? (gateEdge >= 0 ? "pos" : "neg") : ""),
+        metricCard("Brier skill", sign(jm.brier_skill, 3) + valDelta(deltas.brier_skill),
+                   num(jm.brier_skill) != null ? (jm.brier_skill >= 0 ? "pos" : "neg") : ""),
+        metricCard("EV bias", sign(jm.ev_bias, 4)),
+        metricCard("Directional hit", pct(jm.directional_hit_rate)),
+        metricCard("Distinct regimes", ((jm.regime_diversity || {}).distinct != null)
+                   ? String(jm.regime_diversity.distinct) : "—"),
+      ];
+      parts.push(`<div class="metrics">${cards.join("")}</div>`);
+
+      const ras = jm.ras || {};
+      if (ras.n) {
+        const acts = Object.entries(ras.actions || {})
+          .map(([k, v]) => `${esc(k)} ×${v}`).join(" · ");
+        parts.push(`<p class="val-note">RAS: ${ras.n} evaluations, mean score ${fmt(ras.score_mean, 1)} — ${acts}</p>`);
+      }
+
+      if (m.per_regime && Object.keys(m.per_regime).length) {
+        const rows = Object.entries(m.per_regime).map(([regime, b]) => {
+          const t = b.taken || {}, bl = b.blocked || {};
+          return `<tr><td>${esc(regime)}</td>
+            <td class="mono">${t.n || 0}</td>
+            <td class="mono ${num(t.mean_pnl) > 0 ? "pos" : num(t.mean_pnl) < 0 ? "neg" : ""}">${t.mean_pnl != null ? sign(t.mean_pnl, 4) : "—"}</td>
+            <td class="mono">${t.win_rate != null ? pct(t.win_rate, 0) : "—"}</td>
+            <td class="mono">${bl.n || 0}</td>
+            <td class="mono">${bl.mean_pnl != null ? sign(bl.mean_pnl, 4) : "—"}</td></tr>`;
+        }).join("");
+        parts.push(`<h3 class="val-h3">Per-regime performance</h3>
+          <table class="val-table"><thead><tr>
+            <th>Regime</th><th>Taken n</th><th>Mean P&amp;L</th><th>Win%</th>
+            <th>Blocked n</th><th>Blocked P&amp;L</th>
+          </tr></thead><tbody>${rows}</tbody></table>`);
+      }
+
+      if (Array.isArray(m.recommendations) && m.recommendations.length) {
+        parts.push('<h3 class="val-h3">Recommendations</h3><ul class="val-recs">'
+          + m.recommendations.map((r) => `<li>${esc(r)}</li>`).join("") + "</ul>");
+      }
+
+      if (m.feature_contributions && typeof m.feature_contributions === "object") {
+        const entries = Object.entries(m.feature_contributions)
+          .filter(([k, v]) => k !== "n" && k !== "note" && typeof v === "number")
+          .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 12);
+        if (entries.length) {
+          parts.push('<h3 class="val-h3">Feature contributions (r vs realized P&amp;L)</h3>'
+            + '<div class="val-corr">' + entries.map(([k, v]) =>
+              `<div class="val-corr-row"><span class="mono">${esc(k)}</span>
+               <span class="mono ${v >= 0 ? "pos" : "neg"}">${sign(v, 3)}</span></div>`).join("") + "</div>");
+        }
+      }
+    }
+
+    if (rep.notes) parts.push(`<p class="val-note">${esc(rep.notes)}</p>`);
+    if (rep.generated_at) {
+      parts.push(`<p class="val-note">generated ${esc(rep.generated_at.slice(0, 19).replace("T", " "))} UTC</p>`);
+    }
+    $("val-detail").innerHTML = parts.join("");
+  }
+
+  function renderFeatureImpactDetail(m) {
+    const parts = [];
+    if (m.feature) parts.push(`<p class="val-note">Feature: <b class="mono">${esc(m.feature)}</b></p>`);
+    if (m.recommendation) {
+      const cls = /strong positive|positive/i.test(m.recommendation) ? "pos"
+                : /negative/i.test(m.recommendation) ? "neg" : "";
+      parts.push(`<p class="val-reco ${cls}">Recommendation: ${esc(m.recommendation)}</p>`);
+    }
+    const d = m.deltas || {};
+    const cards = Object.entries(d)
+      .filter(([, v]) => typeof v === "number")
+      .map(([k, v]) => {
+        const invert = /drawdown/.test(k);
+        const good = invert ? v <= 0 : v >= 0;
+        return metricCard("Δ " + k.replace(/_/g, " "), sign(v, 4), v === 0 ? "" : good ? "pos" : "neg");
+      });
+    if (cards.length) parts.push(`<div class="metrics">${cards.join("")}</div>`);
+
+    const side = (label, s) => {
+      if (!s) return "";
+      return `<div class="val-side"><h3 class="val-h3">${esc(label)}</h3><div class="metrics">`
+        + metricCard("Sharpe", sign((s.backtest || {}).sharpe, 2))
+        + metricCard("Win rate", pct((s.backtest || {}).win_rate))
+        + metricCard("Total P&L", sign((s.backtest || {}).total_pnl, 4))
+        + metricCard("Max DD", fmt((s.backtest || {}).max_drawdown, 4))
+        + metricCard("WF Sharpe", s.walk_forward ? sign(s.walk_forward.mean_sharpe, 2) : "—")
+        + metricCard("WF profitable", s.walk_forward ? `${s.walk_forward.n_profitable}/${s.walk_forward.n_folds}` : "—")
+        + "</div></div>";
+    };
+    parts.push('<div class="val-sides">' + side("Baseline", m.baseline) + side("With feature", m.variant) + "</div>");
+    return parts.join("");
+  }
+
+  async function refreshValidation() {
+    try {
+      const q = valFilter ? `?report_type=${valFilter}&limit=100` : "?limit=100";
+      const data = await api("/api/validation" + q);
+      valReports = data.reports || [];
+      // default selection: most recent daily report, else the most recent
+      if (valSelectedId == null || !valReports.some((r) => r.id === valSelectedId)) {
+        const daily = valReports.find((r) => r.report_type === "daily");
+        valSelectedId = (daily || valReports[0] || {}).id ?? null;
+      }
+      renderValList();
+      const rep = valReports.find((r) => r.id === valSelectedId);
+      if (rep) renderValDetail(rep);
+      else $("val-detail").innerHTML = '<p class="empty">Select a report</p>';
+    } catch (e) {
+      if (e.message !== "Unauthorized") console.warn("validation", e);
+    }
+  }
+
+  function initValidationControls() {
+    document.querySelectorAll("#val-filters .val-filter").forEach((el) => {
+      el.addEventListener("click", () => {
+        valFilter = el.dataset.type || "";
+        document.querySelectorAll("#val-filters .val-filter")
+          .forEach((b) => b.classList.toggle("active", b === el));
+        valSelectedId = null;
+        refreshValidation();
+      });
+    });
+  }
+
+  // Command-center awareness: light the Validation tab dot when the most
+  // recent report carries an alert-severity degradation flag.
+  function renderValidationBadge(latest) {
+    const reports = (latest && latest.reports) || [];
+    const hasAlert = reports.length > 0 && valStatus(reports[0]) === "alert";
+    $("tab-validation-dot").classList.toggle("hidden", !hasAlert);
+  }
+
   /* ---------------- refresh loop ---------------- */
   async function refresh() {
     if (activeTab === "journal") refreshJournal();
+    if (activeTab === "validation") refreshValidation();
     try {
-      let [live, market, history, report, paper, readiness, trades] = await Promise.all([
+      let [live, market, history, report, paper, readiness, trades, valLatest] = await Promise.all([
         api("/api/live"),
         api("/api/market-status"),
         api("/api/ticks?limit=200"),
@@ -1285,7 +1572,9 @@
         api("/api/paper").catch(() => ({})),
         api("/api/readiness").catch(() => ({})),
         api("/api/trades?limit=100").catch(() => ({})),
+        api("/api/validation?limit=1").catch(() => ({})),
       ]);
+      renderValidationBadge(valLatest);
       const ticks = history.ticks || [];
       const latest = ticks.length ? ticks[ticks.length - 1] : null;
       // Playbook should show the live candidate: prefer the newest tick, but if it
@@ -1315,6 +1604,7 @@
       }
       renderPaper(paper);
       renderEdge(report);
+      renderFunnel(report);
       renderPredict(report);
       renderReadiness(readiness);
       renderTimeline(history);
@@ -1489,6 +1779,8 @@
     showApp();
     $("tab-command").addEventListener("click", () => switchTab("command"));
     $("tab-journal").addEventListener("click", () => switchTab("journal"));
+    $("tab-validation").addEventListener("click", () => switchTab("validation"));
+    initValidationControls();
     initChartControls();
     loadMarketStatus();
     refresh();

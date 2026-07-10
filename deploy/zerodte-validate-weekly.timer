@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the 0DTE weekly validation report on Sunday evening
+
+[Timer]
+OnCalendar=Sun 18:00 America/New_York
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

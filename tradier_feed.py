@@ -357,6 +357,7 @@ class TradierDataFeed:
         market = MarketSnapshot(
             spot=spot, net_gex=gm.net_gex, gamma_flip=gm.gamma_flip,
             call_wall=gm.call_wall, put_wall=gm.put_wall, gex_pct_rank=gex_rank,
+            gex_rank_warm=self._gex_window.is_warm,
             vix9d=self._vix9d, vix=self._vix, vix3m=self._vix3m,
             vvix=self._vvix, vvix_baseline=self._vvix_baseline,
             straddle_breakeven=straddle_be, expected_range=straddle_be / 1.25,

@@ -75,6 +75,15 @@ install -m 644 "$APP_DIR/deploy/zerodte-update.timer" /etc/systemd/system/zerodt
 systemctl daemon-reload
 systemctl enable --now zerodte-update.timer >/dev/null 2>&1 || true
 
+log "Validation timers (daily post-close + weekly deep review)"
+for unit in zerodte-validate-daily zerodte-validate-weekly; do
+    install -m 644 "$APP_DIR/deploy/$unit.service" "/etc/systemd/system/$unit.service"
+    install -m 644 "$APP_DIR/deploy/$unit.timer" "/etc/systemd/system/$unit.timer"
+done
+systemctl daemon-reload
+systemctl enable --now zerodte-validate-daily.timer >/dev/null 2>&1 || true
+systemctl enable --now zerodte-validate-weekly.timer >/dev/null 2>&1 || true
+
 if [ ! -f "$ENV_FILE" ]; then
     # printf renders the color; a plain heredoc can't interpret \033 escapes
     # and would print them literally — and this is the first-run message.

@@ -261,7 +261,8 @@ def test_new_matrix_rows_are_observation_only():
     names = {v.name for v in VARS}
     assert new <= names                                    # present in the matrix
 
-    consumed = {vname for weights in _REGIME_DEF.values() for vname, _, _ in weights}
+    # entries are (variable, weight, invert) with an optional 4th "fold" flag
+    consumed = {spec[0] for weights in _REGIME_DEF.values() for spec in weights}
     assert not (new & consumed)                            # no regime blend uses them
     assert not (new & set(decision_matrix.DIR_VARS))       # no direction bias either
     src = inspect.getsource(decision_matrix)

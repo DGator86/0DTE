@@ -50,6 +50,30 @@ COLUMNS = [
 
 _SETTLE_COLUMNS = ["settle_price", "realized_pnl", "ev_error", "settled"]
 
+# --------------------------------------------------------------------------- #
+# Structure vocabulary for decision_funnel().                                  #
+# selected_family holds spread_selector family names on engine rows but        #
+# decision_matrix structure CODES on no-trade stub rows (unified_loop).        #
+# These are LOCAL mirrors of spread_selector.STRUCTURE_TO_FAMILIES /           #
+# DEBIT_FAMILIES so this module stays stdlib-only (importing spread_selector   #
+# would pull scipy into the persistence layer). tests/test_funnel.py asserts   #
+# they stay in sync with the source of truth.                                  #
+# --------------------------------------------------------------------------- #
+STRUCTURE_CODE_TO_FAMILY = {
+    "IC": "iron_condor", "PCS": "put_credit", "CCS": "call_credit",
+    "IF": "iron_fly", "LCS": "long_call_spread", "LPS": "long_put_spread",
+    "LC": "long_call", "LP": "long_put", "STG": "long_strangle",
+    "BKS": "backspread",
+}
+CREDIT_FAMILIES = frozenset({
+    "put_credit", "call_credit", "iron_condor", "iron_fly", "broken_wing",
+})
+DEBIT_FAMILIES = frozenset({
+    "long_call_spread", "long_put_spread", "long_call", "long_put",
+    "long_strangle", "backspread", "backspread_call", "backspread_put",
+})
+UNDEFINED_RISK_FAMILIES = frozenset({"naked_defended_call", "cash_secured_put"})
+
 
 def _coltype(col: str) -> str:
     if col in ("session_date", "ts", "gex_regime", "selected_family",
@@ -80,6 +104,19 @@ CREATE TABLE IF NOT EXISTS ras_evaluations (
 );
 CREATE INDEX IF NOT EXISTS ix_ras_position ON ras_evaluations(position_id);
 CREATE INDEX IF NOT EXISTS ix_ras_session ON ras_evaluations(session_date);
+
+CREATE TABLE IF NOT EXISTS validation_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_date TEXT NOT NULL,
+    report_type TEXT NOT NULL,           -- 'daily' | 'weekly' | 'feature_impact'
+    generated_at TEXT,
+    metrics_json TEXT,                   -- all key metrics (JSON)
+    summary TEXT,                        -- human-readable summary
+    flags_json TEXT,                     -- alerts / degradation flags (JSON list)
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_vr_date ON validation_reports(report_date);
+CREATE INDEX IF NOT EXISTS ix_vr_type ON validation_reports(report_type);
 """
 
 
@@ -170,6 +207,63 @@ class Journal:
             out.append(row)
         return out
 
+    # ---- validation reports -------------------------------------------------
+    # Persistent record of the scheduled validation pipeline (daily/weekly)
+    # and the feature-impact workflow. One row per generated report; metrics
+    # and flags are flexible JSON so new metrics never need a migration.
+    def log_validation_report(self, report_date: str, report_type: str,
+                              metrics: dict, summary: str,
+                              flags: Optional[list] = None,
+                              notes: Optional[str] = None) -> int:
+        """
+        Persist one validation report.
+          report_date  — session/report date, YYYY-MM-DD
+          report_type  — 'daily' | 'weekly' | 'feature_impact'
+          metrics      — dict of all key metrics (JSON-serialized)
+          summary      — human-readable summary text
+          flags        — list of alert/degradation flags (each a dict or str)
+          notes        — optional freeform notes
+        """
+        cur = self.conn.execute(
+            "INSERT INTO validation_reports "
+            "(report_date, report_type, generated_at, metrics_json, summary, "
+            "flags_json, notes) VALUES (?,?,?,?,?,?,?)",
+            (report_date, report_type,
+             dt.datetime.now(dt.timezone.utc).isoformat(),
+             json.dumps(metrics or {}), summary,
+             json.dumps(flags or []), notes),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_validation_reports(self, report_type: Optional[str] = None,
+                                 limit: int = 50,
+                                 since: Optional[str] = None) -> list[dict]:
+        """Validation report history, newest first. metrics_json/flags_json are
+        decoded into `metrics` / `flags` per row."""
+        sql = "SELECT * FROM validation_reports"
+        clauses, args = [], []
+        if report_type:
+            clauses.append("report_type=?")
+            args.append(report_type)
+        if since:
+            clauses.append("report_date>=?")
+            args.append(since)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY report_date DESC, id DESC LIMIT ?"
+        args.append(limit)
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            for src, dest in (("metrics_json", "metrics"), ("flags_json", "flags")):
+                try:
+                    row[dest] = json.loads(row.pop(src) or "null") or ({} if dest == "metrics" else [])
+                except (json.JSONDecodeError, TypeError):
+                    row[dest] = {} if dest == "metrics" else []
+            out.append(row)
+        return out
+
     # ---- settle ----
     def settle_session(self, session_date: str, settle_price: float) -> int:
         """
@@ -251,6 +345,160 @@ class Journal:
                        if b["mean"] < t["mean"]
                        else "gate may be COSTING edge (blocked trades better than taken)")
         return {"trades_taken": t, "blocked_by_gate": b, "verdict": verdict}
+
+    def decision_funnel(self, session_date: Optional[str] = None,
+                        last_sessions: Optional[int] = None,
+                        gate_gex_floor: float = 0.60) -> dict:
+        """
+        Where do trades come from and where do they die? Aggregates the
+        routing/gating funnel over journaled ticks so "why is premium (or
+        directional) not trading?" is answerable from data instead of ad-hoc
+        SQL:
+
+          routed_structures  what Track B asked for, per tick
+                             (signals_json.routed_structure; new rows only)
+          structure_mix      final family per row: traded vs blocked
+          class_mix          credit / debit / undefined-risk / stand-down
+          no_trade_reasons   which layer said no (gate / selector / risk /
+                             regime_nt / stand_down / no_chain)
+          gate_failures      which hard gate fired (GEX_WEAK, TRENDING, ...)
+          selector_vetoes    per-candidate selector vetoes (rows with a candidate)
+          regime_vetoes      dealer-state vetoes (stand-down rows' veto_reasons
+                             plus signals_json.regime_vetoes on engine rows)
+          premium_flips      credit cells forced to a debit cousin by a dealer
+                             veto (signals_json.premium_flip; new rows only)
+          gex_rank           gex_pct_rank distribution: warm-up-neutral share
+                             and share below the premium gate's floor
+        """
+        rows = self.fetch(session_date=session_date)
+        if last_sessions:
+            keep = set(sorted({r["session_date"] for r in rows})[-last_sessions:])
+            rows = [r for r in rows if r["session_date"] in keep]
+
+        def bump(d: dict, k: str, n: int = 1) -> None:
+            d[k] = d.get(k, 0) + n
+
+        def load_list(txt) -> list:
+            try:
+                v = json.loads(txt) if txt else []
+                return v if isinstance(v, list) else []
+            except (json.JSONDecodeError, TypeError):
+                return []
+
+        structure_mix: dict = {}
+        class_mix = {c: {"n": 0, "traded": 0}
+                     for c in ("credit", "debit", "undefined_risk",
+                               "stand_down", "other")}
+        routed: dict = {}
+        no_trade_reasons: dict = {}
+        gate_failures: dict = {}
+        selector_vetoes: dict = {}
+        regime_vetoes: dict = {}
+        flips = 0
+        rows_with_provenance = 0
+        gex_vals: list = []
+        gex_warmup = 0
+
+        for r in rows:
+            fam_raw = r.get("selected_family")
+            fam = STRUCTURE_CODE_TO_FAMILY.get(fam_raw, fam_raw)
+            if fam is None:
+                cls = "stand_down"
+            elif fam in CREDIT_FAMILIES:
+                cls = "credit"
+            elif fam in DEBIT_FAMILIES:
+                cls = "debit"
+            elif fam in UNDEFINED_RISK_FAMILIES:
+                cls = "undefined_risk"
+            else:
+                cls = "other"
+            traded = r.get("was_traded") == 1
+            if fam is not None:
+                slot = structure_mix.setdefault(fam, {"n": 0, "traded": 0, "blocked": 0})
+                slot["n"] += 1
+                slot["traded" if traded else "blocked"] += 1
+            class_mix[cls]["n"] += 1
+            if traded:
+                class_mix[cls]["traded"] += 1
+
+            # "gate:GEX_WEAK,TRENDING | selector:no positive-EV structure",
+            # "risk:daily_stop", "regime_nt", "stand_down:compression", "no_chain"
+            if not traded and r.get("no_trade_reason"):
+                for part in str(r["no_trade_reason"]).split(" | "):
+                    key = part.split(":", 1)[0].strip()
+                    if key:
+                        bump(no_trade_reasons, key)
+
+            # Real hard-gate names are UPPERCASE (GEX_WEAK, TRENDING, ...);
+            # no-trade stub rows reuse gate_failed for their stand-down marker
+            # (regime_nt / stand_down:x / no_chain), which is already counted
+            # in no_trade_reasons and must not pollute the gate histogram.
+            if not r.get("gate_pass"):
+                for g in load_list(r.get("gate_failed")):
+                    token = str(g).split(":", 1)[0].strip()
+                    if token and token.isupper():
+                        bump(gate_failures, token)
+
+            # veto_reasons carries SELECTOR vetoes on rows with a candidate and
+            # REGIME vetoes on stand-down stub rows — split them accordingly.
+            veto_bucket = (selector_vetoes if r.get("candidate_present") == 1
+                           else regime_vetoes)
+            for v in load_list(r.get("veto_reasons")):
+                token = str(v).split()[0] if str(v).strip() else ""
+                if token:
+                    bump(veto_bucket, token.split(":", 1)[0])
+
+            try:
+                sig = json.loads(r["signals_json"]) if r.get("signals_json") else {}
+            except (json.JSONDecodeError, TypeError):
+                sig = {}
+            if isinstance(sig, dict):
+                rs = sig.get("routed_structure")
+                if isinstance(rs, str) and rs:
+                    bump(routed, rs)
+                    rows_with_provenance += 1
+                if sig.get("premium_flip") == 1:
+                    flips += 1
+                rv = sig.get("regime_vetoes")
+                if isinstance(rv, str) and rv:
+                    for v in rv.split(","):
+                        bump(regime_vetoes, v.split(":", 1)[0])
+
+            g = r.get("gex_pct_rank")
+            if isinstance(g, (int, float)):
+                gex_vals.append(float(g))
+                if abs(g - 0.5) < 1e-12:
+                    gex_warmup += 1
+
+        gex: dict = {"n": len(gex_vals)}
+        if gex_vals:
+            gex.update({
+                "mean": round(sum(gex_vals) / len(gex_vals), 4),
+                "frac_at_warmup_neutral": round(gex_warmup / len(gex_vals), 4),
+                "frac_below_gate_floor": round(
+                    sum(1 for v in gex_vals if v < gate_gex_floor) / len(gex_vals), 4),
+                "gate_floor": gate_gex_floor,
+                "note": ("exactly 0.5 is the GexRankWindow warm-up sentinel "
+                         "(can rarely also be a genuine median print)"),
+            })
+
+        return {
+            "n": len(rows),
+            "sessions": len({r["session_date"] for r in rows}),
+            "routed_structures": routed,
+            "structure_mix": structure_mix,
+            "class_mix": class_mix,
+            "no_trade_reasons": no_trade_reasons,
+            "gate_failures": gate_failures,
+            "selector_vetoes": selector_vetoes,
+            "regime_vetoes": regime_vetoes,
+            "premium_flips": {
+                "n": flips,
+                "rows_with_provenance": rows_with_provenance,
+                "note": "credit cell forced to a debit cousin by a dealer veto",
+            },
+            "gex_rank": gex,
+        }
 
     def component_correlations(self) -> dict:
         """Pearson corr of each score component vs realized P&L over settled rows

@@ -1,0 +1,28 @@
+[Unit]
+# Weekly validation: full-window walk-forward across more folds, per-regime
+# and feature-contribution analysis, trend vs prior weeks, recommendations.
+Description=0DTE weekly validation report (weekend deep review)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zerodte
+Group=zerodte
+WorkingDirectory=/opt/zerodte
+EnvironmentFile=/etc/zerodte/zerodte.env
+ExecStart=/opt/zerodte/venv/bin/python /opt/zerodte/validation_pipeline.py \
+    --mode weekly \
+    --db /var/lib/zerodte/shadow.db \
+    --record-dir /var/lib/zerodte/ticks \
+    --notify
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zerodte
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-validate-weekly

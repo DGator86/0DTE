@@ -1,0 +1,12 @@
+[Unit]
+# Weekday post-close run: settlement happens at 4:15 PM ET (shadow runner
+# auto-settles), so 5:15 PM ET leaves an hour of buffer for late settles.
+Description=Run the 0DTE daily validation report after market close
+
+[Timer]
+OnCalendar=Mon..Fri 17:15 America/New_York
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

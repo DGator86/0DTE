@@ -4,6 +4,8 @@ pandas
 fastapi
 uvicorn[standard]
 exchange-calendars
+# YAML run-config overlays for the feature-impact workflow (config_loader.py).
+pyyaml
 # Optional: enables the Tastytrade chain fallback (composite_feed/tastytrade_feed).
 # Safe to keep — it is lazy-imported and only activates when TASTYTRADE_* creds
 # are set. Yahoo backstop + Tradier/Massive feeds need nothing beyond the above.

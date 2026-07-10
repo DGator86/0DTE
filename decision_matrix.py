@@ -137,15 +137,29 @@ DECISION_TABLE: dict[tuple, Decision] = {
 
 PREMIUM_STRUCTURES = {"PCS", "CCS", "IC", "IF"}
 
+# ---- channel-based conviction adjustment (post-table size multiplier) ------
+# Fast-TF Bollinger/Keltner/Donchian cells nudge the table-defined size.
+# Scores are the standardized 0..100 matrix cells (donchian breakouts read 50
+# when price is inside the prior channel).
+CH_SQUEEZE_BOOST_MIN = 60.0   # avg fast-TF bb_squeeze at/above this = strong squeeze
+CH_BREAKOUT_MIN = 65.0        # avg fast-TF donchian breakout leg at/above this = active break
+CH_BOOST = 1.15               # credit-structure boost in squeeze-with-no-breakout
+CH_TRIM = 0.75                # trim when a breakout opposes the trade
+
 # Veto names that forbid premium selling. Both naming conventions are accepted:
 # gate_scorer.dealer_vetoes emits "short_gamma"/"below_flip" while
 # regime_classifier._vetoes (the one wired into the live loop) emits
 # "short_gamma_regime"/"below_gamma_flip". Matching only one set silently
 # disabled the credit->debit flip below for the live path.
+# "trending" (classifier, ADX >= adx_no_premium) belongs here for the same
+# reason: the premium gate hard-fails TRENDING at the same threshold, so a
+# credit cell routed under it was a guaranteed NO_TRADE — flipping to the
+# debit cousin takes what the trending tape is actually giving.
 NO_PREMIUM_VETOES = {
     "short_gamma", "short_gamma_regime",
     "below_flip", "below_gamma_flip",
     "term_backwardation",
+    "trending",
 }
 
 
@@ -194,6 +208,55 @@ def _direction_bias(rows: list, tfs_fast, tfs_slow) -> tuple:
     bias = 0.4 * fast + 0.6 * slow            # context-weighted
     label = "bull" if bias >= 58 else ("bear" if bias <= 42 else "neutral")
     return label, round(bias, 1), round(fast, 1), round(slow, 1)
+
+
+def _avg_cell(by: dict, var: str, tfs: list) -> Optional[float]:
+    r = by.get(var)
+    if not r:
+        return None
+    vals = [r.scores[t] for t in tfs if r.scores.get(t) is not None]
+    return (sum(vals) / len(vals)) if vals else None
+
+
+# Structures hurt by a downside / upside Donchian break, respectively.
+# STG/BKS want expansion and NT has no size, so none of them are trimmed.
+_BULL_EXPOSED = {"PCS", "LCS", "LC"}
+_BEAR_EXPOSED = {"CCS", "LPS", "LP"}
+
+
+def _channel_size_adjust(rows: list, structure: str) -> tuple[float, str]:
+    """Post-table conviction multiplier from fast-TF channel cells.
+
+    Returns (multiplier in [CH_TRIM, CH_BOOST], reason). Neutral 1.0 whenever
+    channel cells are unavailable (short history) so behavior is unchanged.
+
+      * Boost credit structures when the fast tape shows a strong TTM squeeze
+        (avg bb_squeeze >= CH_SQUEEZE_BOOST_MIN) with no active Donchian
+        breakout -- the highest-quality theta-harvest environment.
+      * Trim any directionally exposed structure when an active Donchian
+        breakout (avg leg >= CH_BREAKOUT_MIN) opposes it; neutral premium
+        (IC/IF) is trimmed on a strong break in either direction.
+    """
+    by = {r.variable: r for r in rows}
+    squeeze = _avg_cell(by, "bb_squeeze", FAST)
+    brk_up = _avg_cell(by, "donchian_breakout_up", FAST)
+    brk_dn = _avg_cell(by, "donchian_breakout_down", FAST)
+    brk_max = max(brk_up or 50.0, brk_dn or 50.0)
+
+    hostile_break = (
+        (structure in _BULL_EXPOSED and (brk_dn or 50.0) >= CH_BREAKOUT_MIN)
+        or (structure in _BEAR_EXPOSED and (brk_up or 50.0) >= CH_BREAKOUT_MIN)
+        or (structure in {"IC", "IF"} and brk_max >= CH_BREAKOUT_MIN)
+    )
+    if hostile_break:
+        side = "down" if (brk_dn or 50.0) >= (brk_up or 50.0) else "up"
+        return CH_TRIM, f"channel trim: donchian breakout {side} opposes {structure}"
+
+    if (structure in PREMIUM_STRUCTURES and squeeze is not None
+            and squeeze >= CH_SQUEEZE_BOOST_MIN and brk_max < CH_BREAKOUT_MIN):
+        return CH_BOOST, f"channel boost: fast-TF squeeze {squeeze:.0f}, no breakout"
+
+    return 1.0, ""
 
 
 # --------------------------------------------------------------------------- #
@@ -253,19 +316,28 @@ def decide_from_matrix(rows: list, regimes: dict,
         note = "catalyst veto: all engines blocked"
     elif no_premium and decision.structure in PREMIUM_STRUCTURES:
         # flip a credit structure to its directional debit cousin or stand down
+        matched = ",".join(sorted(v for v in vetoes if v in NO_PREMIUM_VETOES))
         flip = {"PCS": "LCS", "CCS": "LPS", "IC": "NT", "IF": "NT"}[decision.structure]
         if flip == "NT":
             decision = Decision("NT", "none", "NONE",
-                                "premium forbidden (short gamma) and no clean direction",
+                                "premium forbidden and no clean direction",
                                 "stand down", "—")
             size = 0.0
         else:
             d = "call" if flip == "LCS" else "put"
             decision = Decision(flip, d, "LOW",
-                                "premium forbidden by dealer state; express bias as debit",
+                                "premium forbidden by dealer/tape state; express bias as debit",
                                 "small directional spread in bias direction", decision.anchor_tf)
             size = SIZE["LOW"]
-        note = "premium veto: short-gamma/below-flip forces directional or stand-down"
+        note = f"premium veto ({matched}): forces directional or stand-down"
+
+    # channel-based conviction adjustment (post-table, post-veto): fast-TF
+    # squeeze/breakout cells nudge size, never resurrect a vetoed trade
+    if size > 0:
+        ch_mult, ch_note = _channel_size_adjust(rows, decision.structure)
+        if ch_mult != 1.0:
+            size *= ch_mult
+            note = f"{note}; {ch_note}" if note else ch_note
 
     return TradeIntent(
         exec_regime=exec_r, context_regime=ctx_r,
