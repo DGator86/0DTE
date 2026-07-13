@@ -289,6 +289,22 @@ class PaperBroker:
         dec = getattr(result, "decision", None)
         if dec is None or getattr(dec, "decision", None) != "TRADE" or not getattr(dec, "gate_pass", False):
             return None
+        # Belt-and-suspenders: never open during session warmup even if a
+        # misconfigured gate somehow passed. GateConfig.morning_entry_time is
+        # the single source of truth (default 10:00 ET = 30m after the open).
+        try:
+            from gate_scorer import GateConfig
+            entry_open = GateConfig().morning_entry_time
+            sig = getattr(result, "signals", None) or {}
+            if float(sig.get("session_warmup") or 0.0) >= 1.0:
+                log.info("paper entry suppressed: session_warmup")
+                return None
+            if now.astimezone(ET).time() < entry_open:
+                log.info("paper entry suppressed: before morning_entry_time %s",
+                         entry_open.strftime("%H:%M"))
+                return None
+        except Exception:
+            pass
         cand = getattr(dec, "candidate", None)
         if cand is None:
             return None
