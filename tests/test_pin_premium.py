@@ -88,10 +88,26 @@ class TestMatrixPinOverride:
         pin = assess_pin(_pin_market())
         raw = decide_from_matrix(rows, regimes, vetoes=[], pin=None)
         pinned = decide_from_matrix(rows, regimes, vetoes=[], pin=pin)
-        # When raw would have been breakout on either axis, pin remaps it.
-        if raw.exec_regime == "breakout" or raw.context_regime == "breakout":
-            assert pinned.exec_regime != "breakout"
-            assert "pin override" in pinned.note
+        assert pinned.exec_regime == "compression"
+        assert pinned.context_regime == "compression"
+        assert pinned.decision.structure in PREMIUM_STRUCTURES
+        if (raw.exec_regime, raw.context_regime) != ("compression", "compression"):
+            assert "pin force" in pinned.note
+
+    def test_trend_compression_bear_becomes_credit_under_pin(self):
+        """Dashboard failure mode: trend×compression×bear → LPS while pinned."""
+        rows, regimes = self._rows_regimes()
+        pin = assess_pin(_pin_market())
+        assert pin.is_pin
+        pinned = decide_from_matrix(
+            rows, regimes,
+            vetoes=["short_gamma_regime"],
+            pin=pin,
+        )
+        assert pinned.exec_regime == "compression"
+        assert pinned.context_regime == "compression"
+        assert pinned.decision.structure in PREMIUM_STRUCTURES
+        assert pinned.decision.structure != "LPS"
 
 
 class TestGatePinExempt:
