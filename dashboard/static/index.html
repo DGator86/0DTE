@@ -46,7 +46,8 @@
 
     <!-- ===================== TABS ===================== -->
     <nav class="tabbar">
-      <button class="tab active" id="tab-command" type="button">Command Center</button>
+      <button class="tab active" id="tab-legacy" type="button">Legacy</button>
+      <button class="tab" id="tab-v2" type="button">V2</button>
       <button class="tab" id="tab-journal" type="button">Trade Journal</button>
       <button class="tab" id="tab-validation" type="button">Validation
         <span class="val-alert-dot hidden" id="tab-validation-dot"></span>
@@ -56,8 +57,8 @@
       </button>
     </nav>
 
-    <!-- ===================== GRID ===================== -->
-    <div class="grid" id="view-command">
+    <!-- ===================== LEGACY GRID ===================== -->
+    <div class="grid" id="view-legacy">
 
       <!-- ---------- LEFT: the decision ---------- -->
       <div class="col col-left">
@@ -79,13 +80,6 @@
           </div>
         </section>
 
-        <section class="panel" id="policy-panel">
-          <h2>Policy shadow <span class="h2-right" id="policy-mode">—</span></h2>
-          <div class="policy-compare" id="policy-compare"></div>
-          <div class="metrics" id="policy-metrics"></div>
-          <div class="chips" id="policy-chips" style="margin-top:10px"></div>
-        </section>
-
         <section class="panel hidden" id="open-positions-panel">
           <h2>Open position <span class="h2-right" id="open-positions-count">—</span></h2>
           <div id="open-positions-list"></div>
@@ -97,11 +91,6 @@
             <span class="h2-right" id="playbook-fam">—</span>
           </h2>
           <div class="metrics" id="playbook-metrics"></div>
-        </section>
-
-        <section class="panel" id="forecast-panel">
-          <h2>V2 forecast <span class="h2-right" id="forecast-sub">—</span></h2>
-          <div class="metrics" id="forecast-metrics"></div>
         </section>
 
         <section class="panel" id="regime-panel">
@@ -172,11 +161,6 @@
           <div class="metrics" id="tech-metrics"></div>
         </section>
 
-        <section class="panel" id="gex-panel">
-          <h2>GEX variants <span class="h2-right" id="gex-auth">—</span></h2>
-          <div class="metrics" id="gex-metrics"></div>
-        </section>
-
         <section class="panel" id="dynamics-panel">
           <h2>Dealer dynamics</h2>
           <div class="metrics" id="dynamics-metrics"></div>
@@ -195,11 +179,6 @@
         <section class="panel" id="predict-panel">
           <h2>Predictive power</h2>
           <div class="metrics" id="predict-metrics"></div>
-        </section>
-
-        <section class="panel" id="sigcorr-panel">
-          <h2>Signal correlations <span class="h2-right">V2 · settled</span></h2>
-          <div id="sigcorr-rows"><p class="empty">No correlation sample yet</p></div>
         </section>
 
       </div>
@@ -226,6 +205,61 @@
         <section class="panel">
           <h2>Session log <span class="h2-right" id="log-date">—</span></h2>
           <div class="tl" id="timeline"><p class="empty">No evaluations yet</p></div>
+        </section>
+      </div>
+
+    </div>
+
+    <!-- ===================== V2 GRID ===================== -->
+    <div class="grid hidden" id="view-v2">
+
+      <div class="col col-left">
+        <section class="panel accent" id="parallel-panel">
+          <h2>Parallel decisions <span class="h2-right" id="parallel-mode">—</span></h2>
+          <div class="policy-compare" id="parallel-compare"></div>
+          <div class="metrics" id="parallel-metrics"></div>
+          <div class="chips" id="parallel-chips" style="margin-top:10px"></div>
+        </section>
+
+        <section class="panel" id="policy-panel">
+          <h2>Policy shadow <span class="h2-right" id="policy-mode">—</span></h2>
+          <div class="policy-compare" id="policy-compare"></div>
+          <div class="metrics" id="policy-metrics"></div>
+          <div class="chips" id="policy-chips" style="margin-top:10px"></div>
+        </section>
+
+        <section class="panel" id="forecast-panel">
+          <h2>V2 forecast <span class="h2-right" id="forecast-sub">—</span></h2>
+          <div class="metrics" id="forecast-metrics"></div>
+        </section>
+      </div>
+
+      <div class="col col-mid">
+        <section class="panel" id="phys-panel">
+          <h2>Physical density <span class="h2-right" id="phys-mode">—</span></h2>
+          <div class="metrics" id="phys-metrics"></div>
+        </section>
+
+        <section class="panel" id="ranker-panel">
+          <h2>Candidate ranker <span class="h2-right">shadow</span></h2>
+          <div class="metrics" id="ranker-metrics"></div>
+        </section>
+
+        <section class="panel" id="sigcorr-panel">
+          <h2>Signal correlations <span class="h2-right">V2 · settled</span></h2>
+          <div id="sigcorr-rows"><p class="empty">No correlation sample yet</p></div>
+        </section>
+      </div>
+
+      <div class="col col-right">
+        <section class="panel" id="gex-panel">
+          <h2>GEX variants <span class="h2-right" id="gex-auth">—</span></h2>
+          <div class="metrics" id="gex-metrics"></div>
+        </section>
+
+        <section class="panel" id="v2-playbook-panel">
+          <h2>V2 economics <span class="h2-right">observation</span></h2>
+          <div class="metrics" id="v2-playbook-metrics"></div>
         </section>
       </div>
 

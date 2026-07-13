@@ -131,18 +131,28 @@ def check_promotion(champion_eval: dict, challenger_eval: dict,
     def rule(name: str, passed: bool, detail: str) -> None:
         rules.append(PromotionRule(name, bool(passed), detail))
 
-    # 1. holdout must improve (fall back to search score when the champion was
-    #    never holdout-scored, e.g. the very first cycle)
-    champ_ref = champion_eval.get("holdout_score")
-    ref_label = "holdout"
-    if champ_ref is None:
-        champ_ref = champion_eval.get("score")
-        ref_label = "search score (champion has no holdout)"
+    # 1. holdout must improve vs champion holdout (no search-score fallback
+    #    unless BOTH sides lack holdout — first cycle only).
+    champ_hold = champion_eval.get("holdout_score")
     chall_hold = challenger_eval.get("holdout_score")
-    rule("holdout_improves",
-         chall_hold is not None and champ_ref is not None and chall_hold > champ_ref,
-         f"challenger holdout {_fmt(chall_hold)} vs champion {ref_label} "
-         f"{_fmt(champ_ref)}")
+    if champ_hold is None and chall_hold is None:
+        # First cycle with no holdout on either side: compare search scores.
+        champ_ref = champion_eval.get("score")
+        chall_ref = challenger_eval.get("score")
+        rule("holdout_improves",
+             chall_ref is not None and champ_ref is not None and chall_ref > champ_ref,
+             f"no holdout on either side; challenger search {_fmt(chall_ref)} "
+             f"vs champion search {_fmt(champ_ref)}")
+    elif champ_hold is None:
+        rule("holdout_improves",
+             chall_hold is not None,
+             f"challenger holdout {_fmt(chall_hold)}; champion has no holdout "
+             f"(require challenger holdout present)")
+    else:
+        rule("holdout_improves",
+             chall_hold is not None and chall_hold > champ_hold,
+             f"challenger holdout {_fmt(chall_hold)} vs champion holdout "
+             f"{_fmt(champ_hold)}")
 
     # 2. walk-forward consistency
     n_folds = challenger_eval.get("n_folds") or 0
@@ -169,7 +179,7 @@ def check_promotion(champion_eval: dict, challenger_eval: dict,
         rule("gate_edge_improves", che > ce,
              f"challenger gate edge {_fmt(che)} vs champion {_fmt(ce)}")
 
-    # 4. Brier skill must remain positive
+    # 4. Brier skill must remain positive AND improve when champion measurable
     cs, chs = champion_eval.get("brier_skill"), challenger_eval.get("brier_skill")
     if cs is None and chs is None:
         rule("brier_skill_positive", True,
@@ -177,19 +187,26 @@ def check_promotion(champion_eval: dict, challenger_eval: dict,
     elif chs is None:
         rule("brier_skill_positive", False,
              f"champion Brier skill {_fmt(cs)} but challenger's is unmeasurable")
-    else:
+    elif cs is None:
         rule("brier_skill_positive", chs > cfg["min_brier_skill"],
              f"challenger Brier skill {_fmt(chs)} "
              f"(need > {cfg['min_brier_skill']})")
+    else:
+        rule("brier_skill_positive",
+             chs > cfg["min_brier_skill"] and chs >= cs,
+             f"challenger Brier skill {_fmt(chs)} vs champion {_fmt(cs)} "
+             f"(need > {cfg['min_brier_skill']} and not regress)")
 
-    # 5. trade count must not collapse
+    # 5. trade count must not collapse (absolute floor when champion traded)
     ct = champion_eval.get("trade_count") or 0
     cht = challenger_eval.get("trade_count") or 0
     need = ct * cfg["min_trade_count_ratio"]
+    min_abs = 5 if ct > 0 else 0
     rule("trade_count_maintained",
-         ct == 0 or cht >= need,
+         (ct == 0 and cht >= 0) or (cht >= need and cht >= min_abs),
          f"challenger {cht} trades vs champion {ct} "
-         f"(need >= {need:.0f})")
+         f"(need >= {need:.0f}"
+         + (f" and >= {min_abs}" if min_abs else "") + ")")
 
     # 6. drawdown must not get worse
     cd = champion_eval.get("max_drawdown")

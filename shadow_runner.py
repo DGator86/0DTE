@@ -105,10 +105,15 @@ class ShadowRunner:
         record_dir: Optional[str] = None,   # None = <db_dir>/ticks; "" disables
         ras_exit: bool = True,              # False = RAS observation-only (no auto-exits)
         champion_path: Optional[str] = None,  # None = configs/champion.json; "" disables
+        policy_mode: str = "shadow",          # legacy | shadow | champion
+        prediction_db: Optional[str] = None,  # None = <state_dir>/prediction_store.sqlite
+        use_legacy_directional_tilt: bool = True,
+        enable_v2_parallel: bool = True,      # heuristic bundle + ranker always on
     ) -> None:
         self.symbol = symbol
         self.interval_s = interval_s
         self.live_state_path = live_state_path
+        self.policy_mode = policy_mode
 
         self._jrn = Journal(db_path)
         # Adaptive state (GEX percentile window, scale books) lives next to the
@@ -152,12 +157,44 @@ class ShadowRunner:
                      "%d overrides, %d regime overrides)",
                      champion_path, rec.config_id[:8], rec.label,
                      len(rec.overrides), len(rec.regime_overrides or {}))
+
+        # Prediction Engine V2 parallel path (shadow by default).
+        pred_db = prediction_db
+        if pred_db is None:
+            pred_db = os.path.join(state_dir, "prediction_store.sqlite")
+        self._prediction_store = None
+        bundle_provider = None
+        physical_provider = None
+        candidate_model = None
+        if enable_v2_parallel and pred_db:
+            from prediction.storage import PredictionStore
+            from prediction.inference import (
+                HeuristicCandidateValueModel,
+                make_bundle_provider,
+                make_physical_forecast_provider,
+            )
+            self._prediction_store = PredictionStore(db_path=pred_db)
+            bundle_provider = make_bundle_provider(
+                symbol=symbol, store=self._prediction_store)
+            physical_provider = make_physical_forecast_provider(bundle_provider)
+            candidate_model = HeuristicCandidateValueModel()
+            log.info("V2 parallel enabled: policy_mode=%s prediction_db=%s "
+                     "legacy_tilt=%s",
+                     policy_mode, pred_db, use_legacy_directional_tilt)
+
         self._orch = UnifiedOrchestrator(
             feed=self._feed, journal=self._jrn, risk_manager=self._risk,
             engine_cfg=engine_cfg, classifier_cfg=classifier_cfg,
             state_path=os.path.join(state_dir, "adaptive_state.json"),
             ras_cfg=self._ras_cfg,
             regime_overrides=regime_overrides,
+            symbol=symbol,
+            policy_mode=policy_mode,
+            prediction_store=self._prediction_store,
+            prediction_bundle_provider=bundle_provider,
+            physical_forecast_provider=physical_provider,
+            candidate_value_model=candidate_model,
+            use_legacy_directional_tilt=use_legacy_directional_tilt,
         )
         # Record every tick (market + chain + incremental bars) so a REAL-data
         # walk-forward becomes possible. ~1 MB/session gzipped; you cannot
@@ -456,6 +493,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--champion", dest="champion_path", default=None,
                    help="Champion config JSON (default: configs/champion.json "
                         "when present; pass an empty string to force defaults)")
+    p.add_argument("--policy-mode", dest="policy_mode", default="shadow",
+                   choices=["legacy", "shadow", "champion"],
+                   help="Policy promotion mode (default: shadow = dual-run, "
+                        "legacy authoritative)")
+    p.add_argument("--prediction-db", dest="prediction_db", default=None,
+                   help="PredictionStore sqlite path "
+                        "(default: <db dir>/prediction_store.sqlite)")
+    p.add_argument("--no-legacy-directional-tilt",
+                   dest="use_legacy_directional_tilt", action="store_false",
+                   help="Price candidates with V2 physical density instead of "
+                        "legacy directional tilt")
+    p.add_argument("--no-v2-parallel", dest="enable_v2_parallel",
+                   action="store_false",
+                   help="Disable V2 heuristic bundle / ranker / prediction store")
     return p
 
 
@@ -487,6 +538,10 @@ if __name__ == "__main__":
         record_dir=args.record_dir,
         ras_exit=args.ras_exit,
         champion_path=args.champion_path,
+        policy_mode=args.policy_mode,
+        prediction_db=args.prediction_db,
+        use_legacy_directional_tilt=args.use_legacy_directional_tilt,
+        enable_v2_parallel=args.enable_v2_parallel,
     )
 
     if args.report:

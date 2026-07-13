@@ -246,15 +246,19 @@ def _channel_size_adjust(rows: list, structure: str) -> tuple[float, str]:
     squeeze = _avg_cell(by, "bb_squeeze", FAST)
     brk_up = _avg_cell(by, "donchian_breakout_up", FAST)
     brk_dn = _avg_cell(by, "donchian_breakout_down", FAST)
-    brk_max = max(brk_up or 50.0, brk_dn or 50.0)
+    # Missing cells → neutral (no boost / no trim), not implicit 50.
+    if squeeze is None and brk_up is None and brk_dn is None:
+        return 1.0, "channels unavailable"
+    brk_max = max(brk_up if brk_up is not None else 0.0,
+                  brk_dn if brk_dn is not None else 0.0)
 
     hostile_break = (
-        (structure in _BULL_EXPOSED and (brk_dn or 50.0) >= CH_BREAKOUT_MIN)
-        or (structure in _BEAR_EXPOSED and (brk_up or 50.0) >= CH_BREAKOUT_MIN)
+        (structure in _BULL_EXPOSED and (brk_dn or 0.0) >= CH_BREAKOUT_MIN)
+        or (structure in _BEAR_EXPOSED and (brk_up or 0.0) >= CH_BREAKOUT_MIN)
         or (structure in {"IC", "IF"} and brk_max >= CH_BREAKOUT_MIN)
     )
     if hostile_break:
-        side = "down" if (brk_dn or 50.0) >= (brk_up or 50.0) else "up"
+        side = "down" if (brk_dn or 0.0) >= (brk_up or 0.0) else "up"
         return CH_TRIM, f"channel trim: donchian breakout {side} opposes {structure}"
 
     if (structure in PREMIUM_STRUCTURES and squeeze is not None

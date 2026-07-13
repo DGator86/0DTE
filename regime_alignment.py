@@ -478,12 +478,30 @@ def _score_gamma_alignment(regime: RegimeState, market: MarketSnapshot,
     )
 
 
-def _veto_undermines(veto: str, structure_class: str) -> bool:
+# Directional positions are NOT undermined by short_gamma / trending — those
+# amplify debits. They ARE undermined by catalyst risk, term-structure stress,
+# and (for bullish debits) falling below the gamma flip.
+DIRECTIONAL_ALWAYS_HOSTILE = frozenset({
+    "term_backwardation",
+})
+BULLISH_HOSTILE_VETOES = frozenset({
+    "below_flip", "below_gamma_flip",
+})
+
+
+def _veto_undermines(veto: str, entry: "EntrySnapshot") -> bool:
+    """Return True when a newly-appeared veto undermines the open position."""
     if veto.startswith("catalyst"):
         return True
-    if structure_class == "premium":
+    if entry.structure_class == "premium":
         return veto in PREMIUM_VETOES
-    return veto.startswith("catalyst")
+    # Directional / vol: direction-aware hostility.
+    if veto in DIRECTIONAL_ALWAYS_HOSTILE:
+        return True
+    bias = entry.direction_bias or "neutral"
+    if bias in ("bull", "bullish") and veto in BULLISH_HOSTILE_VETOES:
+        return True
+    return False
 
 
 def _score_veto_escalation(regime: RegimeState,
@@ -493,7 +511,7 @@ def _score_veto_escalation(regime: RegimeState,
     new_vetoes = cur - ent
     if not new_vetoes:
         return 0.0, "no new vetoes"
-    hits = [v for v in new_vetoes if _veto_undermines(v, entry.structure_class)]
+    hits = [v for v in new_vetoes if _veto_undermines(v, entry)]
     if not hits:
         return 0.0, f"new vetoes benign: {sorted(new_vetoes)}"
     return _clip_unit(-len(hits) / max(len(hits), 1)), f"new hostile vetoes: {hits}"

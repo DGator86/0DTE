@@ -136,7 +136,8 @@ def serialize_tick_result(
 
     ras_results = getattr(result, "ras_results", None) or []
     if ras_results:
-        primary = ras_results[0]
+        # Match unified_loop worst-position selection for multi-position ticks.
+        primary = min(ras_results, key=lambda r: float(getattr(r, "score", 0.0)))
         why["position_health"] = {
             "ras_score": primary.score,
             "ras_action": primary.action,
@@ -146,6 +147,8 @@ def serialize_tick_result(
                 for c in primary.components
             ],
         }
+        if len(ras_results) > 1:
+            why["position_health"]["n_positions"] = len(ras_results)
     elif paper_summary and paper_summary.get("open"):
         open_pos = paper_summary["open"][0]
         ctx = (open_pos.get("entry_ctx") or {})
@@ -159,6 +162,47 @@ def serialize_tick_result(
 
     inputs = _market_inputs(market) if market else {}
 
+    # V2 / policy / GEX observation signals for the dashboard V2 tab.
+    raw_signals = getattr(result, "signals", None) or {}
+    v2_keys = (
+        "policy_", "v2_", "phys_", "gex_", "legacy_policy_",
+    )
+    v2_signals = {
+        k: v for k, v in raw_signals.items()
+        if any(k.startswith(p) for p in v2_keys) or k in (
+            "gex_rank_warm", "routed_structure", "premium_flip",
+        )
+    }
+
+    # Parallel decision summary for Legacy vs V2 tabs.
+    parallel = {
+        "legacy": {
+            "structure": intent.decision.structure,
+            "direction": intent.decision.direction,
+            "size_mult": intent.size_mult,
+            "gate_pass": doing.get("gate_pass"),
+            "gate_score": doing.get("gate_score"),
+            "decision": doing.get("decision"),
+        },
+        "v2": {
+            "structure": raw_signals.get("v2_policy_structure")
+            or raw_signals.get("policy_structure"),
+            "direction": raw_signals.get("v2_policy_direction")
+            or raw_signals.get("policy_direction"),
+            "action": raw_signals.get("v2_policy_action")
+            or raw_signals.get("policy_action"),
+            "confidence": raw_signals.get("v2_policy_confidence")
+            or raw_signals.get("policy_confidence"),
+            "uncertainty": raw_signals.get("v2_policy_uncertainty")
+            or raw_signals.get("policy_uncertainty"),
+            "size_cap": raw_signals.get("policy_size_cap"),
+            "source": raw_signals.get("policy_source"),
+            "mode": raw_signals.get("policy_mode"),
+            "disagreement": raw_signals.get("policy_disagreement"),
+            "fallback_used": raw_signals.get("policy_fallback_used"),
+        },
+    }
+
     payload = {
         "ts": result.ts.isoformat(),
         "status": "live",
@@ -170,6 +214,8 @@ def serialize_tick_result(
         "inputs": inputs,
         "why": why,
         "paper": paper_summary or {},
+        "v2_signals": v2_signals,
+        "parallel": parallel,
     }
     return payload
 

@@ -286,7 +286,108 @@
     $("playbook-metrics").innerHTML = cards.join("");
   }
 
-  /* ---------------- policy shadow (PR 10) ---------------- */
+  /* ---------------- parallel Legacy vs V2 ---------------- */
+  function renderParallel(live, latest) {
+    const p = (live && live.parallel) || {};
+    const leg = p.legacy || {};
+    const v2 = p.v2 || {};
+    const s = tickSignals(latest) || (live && live.v2_signals) || {};
+    const mode = v2.mode || s.policy_mode || "—";
+    $("parallel-mode").textContent = mode;
+    const disagree = num(v2.disagreement) === 1 || num(s.policy_disagreement) === 1;
+    const fallback = num(v2.fallback_used) === 1 || num(s.policy_fallback_used) === 1;
+
+    $("parallel-compare").innerHTML = `
+      <div class="policy-side${disagree ? " disagree" : ""}">
+        <div class="ps-label">Legacy (matrix)</div>
+        <div class="ps-struct">${esc(leg.structure || "NT")}</div>
+        <div class="ps-meta">${esc(leg.decision || "—")}${leg.direction ? " · " + esc(leg.direction) : ""}</div>
+      </div>
+      <div class="policy-side${disagree ? " disagree" : ""}">
+        <div class="ps-label">V2 policy</div>
+        <div class="ps-struct">${esc(v2.structure || s.v2_policy_structure || "—")}</div>
+        <div class="ps-meta">${esc(v2.action || s.v2_policy_action || "—")}${(v2.direction || s.v2_policy_direction) ? " · " + esc(v2.direction || s.v2_policy_direction) : ""}</div>
+      </div>`;
+
+    $("parallel-metrics").innerHTML = [
+      metricCard("Legacy gate", leg.gate_pass == null ? "—" : (leg.gate_pass ? "PASS" : "FAIL"),
+        leg.gate_pass ? "pos" : (leg.gate_pass === false ? "warn" : "")),
+      metricCard("Legacy size", fmt(leg.size_mult, 2)),
+      metricCard("V2 size cap", fmt(v2.size_cap != null ? v2.size_cap : s.policy_size_cap, 2)),
+      metricCard("V2 conf.", fmt(v2.confidence != null ? v2.confidence : s.v2_policy_confidence, 2)),
+      metricCard("V2 unc.", fmt(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty, 2),
+        num(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty) > 0.5 ? "warn" : ""),
+      metricCard("Source", esc(v2.source || s.policy_source || "—")),
+    ].join("");
+
+    const chips = [];
+    if (disagree) chips.push('<span class="chip disagree">disagreement</span>');
+    if (fallback) chips.push('<span class="chip fallback">fallback legacy</span>');
+    if (!chips.length) chips.push('<span class="chip ok">aligned / dual-run</span>');
+    $("parallel-chips").innerHTML = chips.join("");
+  }
+
+  function renderPhysDensity(latest, live) {
+    const s = tickSignals(latest) || (live && live.v2_signals) || {};
+    $("phys-mode").textContent = s.phys_density_mode || "—";
+    if (s.phys_density_mode == null && s.phys_v2_mean == null && s.phys_live_ev == null) {
+      $("phys-metrics").innerHTML = '<p class="empty">No physical-density signals yet</p>';
+      return;
+    }
+    $("phys-metrics").innerHTML = [
+      metricCard("Mode", esc(s.phys_density_mode || "—")),
+      metricCard("Live EV", fmt(s.phys_live_ev, 3)),
+      metricCard("V2 shadow EV", fmt(s.phys_v2_shadow_ev, 3)),
+      metricCard("V2 mean", fmt(s.phys_v2_mean, 4)),
+      metricCard("V2 std", fmt(s.phys_v2_std, 4)),
+      metricCard("Var ratio", fmt(s.phys_v2_var_ratio, 3)),
+      metricCard("Exp. return", fmt(s.phys_v2_expected_return, 5)),
+      metricCard("Uncertainty", fmt(s.phys_v2_uncertainty, 2)),
+    ].join("");
+  }
+
+  function renderRanker(latest, live) {
+    const s = tickSignals(latest) || (live && live.v2_signals) || {};
+    const has = s.v2_top_candidate_id != null || s.v2_rank_disagreement != null
+      || s.v2_utility_score != null;
+    if (!has) {
+      $("ranker-metrics").innerHTML = '<p class="empty">No candidate-ranker signals yet</p>';
+      return;
+    }
+    $("ranker-metrics").innerHTML = [
+      metricCard("Disagreement", s.v2_rank_disagreement == null ? "—"
+        : (s.v2_rank_disagreement ? "yes" : "no"),
+        s.v2_rank_disagreement ? "warn" : "pos"),
+      metricCard("V2 top", esc(String(s.v2_top_candidate_id || "—").slice(0, 12))),
+      metricCard("Legacy top", esc(String(s.legacy_top_candidate_id || "—").slice(0, 12))),
+      metricCard("V2 utility", fmt(s.v2_utility_score, 3)),
+      metricCard("V2 top family", esc(s.v2_top_family || "—")),
+      metricCard("Legacy top fam.", esc(s.legacy_top_family || "—")),
+    ].join("");
+  }
+
+  function renderV2Playbook(latest) {
+    const s = tickSignals(latest) || {};
+    const t = latest || {};
+    const cards = [];
+    if (num(s.phys_v2_shadow_ev) != null) {
+      cards.push(metricCard("V2 shadow EV", fmt(s.phys_v2_shadow_ev, 3)));
+    }
+    if (num(t.v2_utility_score) != null || num(s.v2_utility_score) != null) {
+      cards.push(metricCard("Utility", fmt(t.v2_utility_score != null
+        ? t.v2_utility_score : s.v2_utility_score, 3)));
+    }
+    if (num(t.credit_expected) != null) {
+      cards.push(metricCard("Credit exp.", "$" + fmt(t.credit_expected, 2)));
+    }
+    if (num(s.gex_rank_warm) != null) {
+      cards.push(metricCard("GEX warm", num(s.gex_rank_warm) ? "yes" : "no",
+        num(s.gex_rank_warm) ? "pos" : "warn"));
+    }
+    $("v2-playbook-metrics").innerHTML = cards.length
+      ? cards.join("")
+      : '<p class="empty">No V2 economics on latest tick</p>';
+  }
   function renderPolicy(latest) {
     const s = tickSignals(latest) || {};
     const mode = s.policy_mode || "—";
@@ -1455,15 +1556,17 @@
   }
 
   /* ---------------- trade journal tab ---------------- */
-  let activeTab = "command";
+  let activeTab = "legacy";
 
   function switchTab(tab) {
     activeTab = tab;
-    $("tab-command").classList.toggle("active", tab === "command");
+    $("tab-legacy").classList.toggle("active", tab === "legacy");
+    $("tab-v2").classList.toggle("active", tab === "v2");
     $("tab-journal").classList.toggle("active", tab === "journal");
     $("tab-validation").classList.toggle("active", tab === "validation");
     $("tab-learning").classList.toggle("active", tab === "learning");
-    $("view-command").classList.toggle("hidden", tab !== "command");
+    $("view-legacy").classList.toggle("hidden", tab !== "legacy");
+    $("view-v2").classList.toggle("hidden", tab !== "v2");
     $("view-journal").classList.toggle("hidden", tab !== "journal");
     $("view-validation").classList.toggle("hidden", tab !== "validation");
     $("view-learning").classList.toggle("hidden", tab !== "learning");
@@ -1683,7 +1786,9 @@
         metricCard("Mean P&L / trade", sign(jm.mean_pnl_per_trade, 4) + valDelta(deltas.mean_pnl_per_trade)),
         metricCard("Settled trades", jm.n_settled_trades != null ? String(jm.n_settled_trades) : "—"),
         metricCard("WF Sharpe", wf ? sign(wf.mean_sharpe, 2) + valDelta(deltas.mean_sharpe) : "—"),
-        metricCard("WF folds profitable", wf ? `${wf.n_profitable}/${wf.n_folds}` : "—"),
+        metricCard("WF folds profitable", wf
+          ? `${wf.n_profitable}/${wf.n_valid_folds != null ? wf.n_valid_folds : wf.n_folds}`
+          : "—"),
         metricCard("Gate edge", gateEdge != null ? sign(gateEdge, 4) : "—",
                    gateEdge != null ? (gateEdge >= 0 ? "pos" : "neg") : ""),
         metricCard("Brier skill", sign(jm.brier_skill, 3) + valDelta(deltas.brier_skill),
@@ -1770,7 +1875,9 @@
         + metricCard("Total P&L", sign((s.backtest || {}).total_pnl, 4))
         + metricCard("Max DD", fmt((s.backtest || {}).max_drawdown, 4))
         + metricCard("WF Sharpe", s.walk_forward ? sign(s.walk_forward.mean_sharpe, 2) : "—")
-        + metricCard("WF profitable", s.walk_forward ? `${s.walk_forward.n_profitable}/${s.walk_forward.n_folds}` : "—")
+        + metricCard("WF profitable", s.walk_forward
+          ? `${s.walk_forward.n_profitable}/${s.walk_forward.n_valid_folds != null ? s.walk_forward.n_valid_folds : s.walk_forward.n_folds}`
+          : "—")
         + "</div></div>";
     };
     parts.push('<div class="val-sides">' + side("Baseline", m.baseline) + side("With feature", m.variant) + "</div>");
@@ -2046,7 +2153,11 @@
       renderSignal(live);
       renderOpenPositions(live.paper);
       renderPlaybook(candidate, live);
+      renderParallel(live, latest);
       renderPolicy(latest);
+      renderPhysDensity(latest, live);
+      renderRanker(latest, live);
+      renderV2Playbook(candidate);
       renderRegime(live);
       renderReason(live, candidate);
       renderWhy(live);
@@ -2245,7 +2356,8 @@
   /* ---------------- boot ---------------- */
   function boot() {
     showApp();
-    $("tab-command").addEventListener("click", () => switchTab("command"));
+    $("tab-legacy").addEventListener("click", () => switchTab("legacy"));
+    $("tab-v2").addEventListener("click", () => switchTab("v2"));
     $("tab-journal").addEventListener("click", () => switchTab("journal"));
     $("tab-validation").addEventListener("click", () => switchTab("validation"));
     $("tab-learning").addEventListener("click", () => switchTab("learning"));

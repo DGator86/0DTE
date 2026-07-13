@@ -667,7 +667,11 @@ class MassiveDataFeed:
             catalyst_label=self.catalyst_label,
             pcr_volume=flow["pcr_volume"], volume_oi_ratio=flow["volume_oi_ratio"],
         )
-        return TickSnapshot(market=market, bars=raw, chain=chain)
+        return TickSnapshot(
+            market=market, bars=raw, chain=chain,
+            option_rows=rows,
+            gex_feed_source="MassiveDataFeed",
+        )
 
     def settlement_price(self, session_date: str) -> float | None:
         return get_settlement(self.underlying, session_date)

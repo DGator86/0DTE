@@ -319,7 +319,11 @@ class TastytradeDataFeed:
             now=now, has_catalyst=self.has_catalyst, catalyst_label=self.catalyst_label,
             pcr_volume=flow["pcr_volume"], volume_oi_ratio=flow["volume_oi_ratio"],
         )
-        return TickSnapshot(market=market, bars=raw, chain=chain)
+        return TickSnapshot(
+            market=market, bars=raw, chain=chain,
+            option_rows=rows,
+            gex_feed_source="TastytradeDataFeed",
+        )
 
     def settlement_price(self, session_date: str) -> Optional[float]:
         return self._backstop.settlement(session_date)

@@ -711,6 +711,7 @@ class Journal:
         rows_with_provenance = 0
         gex_vals: list = []
         gex_warmup = 0
+        gex_weak_warm = 0
 
         for r in rows:
             fam_raw = r.get("selected_family")
@@ -780,8 +781,19 @@ class Journal:
             g = r.get("gex_pct_rank")
             if isinstance(g, (int, float)):
                 gex_vals.append(float(g))
-                if abs(g - 0.5) < 1e-12:
+                warm_flag = None
+                try:
+                    sig = json.loads(r["signals_json"]) if r.get("signals_json") else {}
+                except (json.JSONDecodeError, TypeError):
+                    sig = {}
+                if isinstance(sig, dict) and "gex_rank_warm" in sig:
+                    warm_flag = bool(sig.get("gex_rank_warm"))
+                    if not warm_flag:
+                        gex_warmup += 1
+                elif abs(g - 0.5) < 1e-12:
                     gex_warmup += 1
+                if warm_flag is True and float(g) < gate_gex_floor:
+                    gex_weak_warm += 1
 
         gex: dict = {"n": len(gex_vals)}
         if gex_vals:
@@ -790,9 +802,11 @@ class Journal:
                 "frac_at_warmup_neutral": round(gex_warmup / len(gex_vals), 4),
                 "frac_below_gate_floor": round(
                     sum(1 for v in gex_vals if v < gate_gex_floor) / len(gex_vals), 4),
+                "frac_gex_weak_when_warm": round(
+                    gex_weak_warm / len(gex_vals), 4) if gex_vals else 0.0,
                 "gate_floor": gate_gex_floor,
-                "note": ("exactly 0.5 is the GexRankWindow warm-up sentinel "
-                         "(can rarely also be a genuine median print)"),
+                "note": ("gex_rank_warm=0 (or exact 0.5 when flag absent) is "
+                         "the GexRankWindow warm-up sentinel"),
             })
 
         return {

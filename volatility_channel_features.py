@@ -49,7 +49,10 @@ def channel_features_from_bars(bars, tf: str = CLASSIFIER_TF) -> dict:
         l = rs["low"].to_numpy(float)
         c = rs["close"].to_numpy(float)
         return _channel_features(h, l, c)
-    except Exception:
+    except Exception as exc:
+        import logging
+        logging.getLogger("volatility_channel_features").warning(
+            "channel_features_from_bars failed: %s", exc)
         return {}
 
 

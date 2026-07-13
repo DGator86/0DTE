@@ -92,6 +92,8 @@ class TickResult:
     vetoes: list
     snapshot: Optional[TickSnapshot] = None   # live market data for paper marking
     ras_results: list = field(default_factory=list)
+    # Observation signals (policy / phys / gex / v2) for live_state + dashboard.
+    signals: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -299,11 +301,15 @@ class UnifiedOrchestrator:
 
     @staticmethod
     def _signals_with_ras(signals: dict, ras_results: list) -> tuple[dict, Optional[str]]:
+        # Keep internal keys (e.g. _snapshot_id) in the in-memory dict for
+        # providers, but never journal them.
         if not ras_results:
+            public = {k: v for k, v in signals.items()
+                      if not str(k).startswith("_")}
             return signals, (json.dumps({k: (v if isinstance(v, str) else round(v, 6))
-                                        for k, v in signals.items()
+                                        for k, v in public.items()
                                         if isinstance(v, (int, float, str))})
-                             if signals else None)
+                             if public else None)
         merged = dict(signals)
         # Flatten only the WORST-scoring position: with several open positions
         # the ras_* keys would otherwise overwrite each other arbitrarily, and
@@ -311,11 +317,12 @@ class UnifiedOrchestrator:
         # Full per-position detail lands in journal.ras_evaluations.
         worst = min(ras_results, key=lambda r: r.score)
         merged.update(ras_to_signals(worst))
+        public = {k: v for k, v in merged.items() if not str(k).startswith("_")}
         signals_json = json.dumps(
             {k: (v if isinstance(v, str) else round(v, 6))
-             for k, v in merged.items()
+             for k, v in public.items()
              if isinstance(v, (int, float, str))}
-        ) if merged else None
+        ) if public else None
         return merged, signals_json
 
     def _resolve_physical_forecast(self, snap, signals: dict, intent) -> Optional[object]:
@@ -418,11 +425,21 @@ class UnifiedOrchestrator:
 
             bundle = self._resolve_prediction_bundle(
                 snap, signals, intent, regime_state)
+            implied = signals.get("implied_move")
+            if implied is None:
+                # Prefer dollar/spot move fractions — never chan_bb_width
+                # (that is a 0-1 percentile rank, not a move).
+                spot = float(getattr(snap.market, "spot", 0.0) or 0.0)
+                for attr in ("expected_range", "straddle_breakeven"):
+                    v = getattr(snap.market, attr, None)
+                    if (isinstance(v, (int, float)) and math.isfinite(float(v))
+                            and float(v) > 0 and spot > 0):
+                        implied = float(v) / spot
+                        break
             op_risk = {
                 "hard_vetoes": list(regime_state.vetoes or []),
                 "stand_down": bool(regime_state.stand_down),
-                "implied_remaining_move": signals.get("implied_move")
-                or signals.get("chan_bb_width"),
+                "implied_remaining_move": implied,
             }
             pin = PolicyInput(
                 predictions=bundle,
@@ -439,6 +456,38 @@ class UnifiedOrchestrator:
             return PolicyRouter(cfg).route(pin)
         except Exception as exc:
             log.warning("policy router failed: %s", exc)
+            # Champion mode must not silently fail-open: emit an explicit
+            # fallback_legacy route so the journal records the failure.
+            if str(self.policy_mode).lower() == "champion":
+                try:
+                    from policy.contracts import (
+                        PolicyInput, StructuralState, SOURCE_FALLBACK_LEGACY,
+                    )
+                    from policy.legacy_matrix import (
+                        LegacyMatrixPolicy, intent_to_decision,
+                    )
+                    from policy.router import PolicyRouteResult
+                    legacy = intent_to_decision(intent, regime_state=regime_state)
+                    fallback = intent_to_decision(
+                        intent, regime_state=regime_state,
+                        source=SOURCE_FALLBACK_LEGACY)
+                    fallback = dataclasses.replace(
+                        fallback,
+                        rationale=(f"router exception: {exc}",
+                                   *tuple(fallback.rationale or ())),
+                    )
+                    return PolicyRouteResult(
+                        mode="champion",
+                        authoritative=fallback,
+                        legacy=legacy,
+                        v2=None,
+                        disagreement=False,
+                        fallback_used=True,
+                        diagnostics={"v2_unavailable_reason":
+                                     f"router_exception:{type(exc).__name__}"},
+                    )
+                except Exception as exc2:
+                    log.warning("champion fallback also failed: %s", exc2)
             return None
 
     def _next_snapshot_id(self, now: dt.datetime) -> str:
@@ -456,17 +505,38 @@ class UnifiedOrchestrator:
     def _log_feature_snapshot(self, now: dt.datetime, snapshot_id: str,
                               snap: TickSnapshot, snap_dict: dict,
                               signals: dict, mat_rows: list) -> None:
-        """Best-effort canonical feature_snapshots row (PR 3). Raw features =
-        the mtf snapshot dict + observation-only signals; standardized = the
-        0-100 matrix scores keyed variable:tf. Never breaks a tick."""
+        """Best-effort canonical feature_snapshots row (PR 3).
+
+        Train/serve parity: capture the same as-of market + MTF snapshot
+        features as offline `prediction.dataset._tick_features`. Routing /
+        policy / RAS diagnostics stay in journal signals_json only — they
+        must not enter the training feature set.
+        """
         if self.prediction_store is None:
             return
         try:
-            from prediction.asof import AsOfFeatureBuilder
+            from prediction.asof import AsOfFeatureBuilder, bars_asof
             from prediction.dataset import build_observation
+            from prediction.inference import live_feature_row
             b = AsOfFeatureBuilder(observation_ts=now)
-            for name, v in {**snap_dict, **signals}.items():
-                b.add(name, v)
+            # Pre-routing model features only (aligned with offline builder).
+            for name, v in live_feature_row(snap, signals).items():
+                b.add(name, v, source_ts=now)
+            # Also capture raw snap_dict keys not already present.
+            for name, v in snap_dict.items():
+                if name not in b.features:
+                    b.add(name, v, source_ts=now)
+            # Native multi-TF indicators (same as offline _tick_features).
+            if snap.bars is not None and len(snap.bars.ts):
+                try:
+                    safe_bars = bars_asof(snap.bars, now)
+                    if len(safe_bars.ts):
+                        mtf = build_mtf_input(safe_bars, {})
+                        for name, per_tf in mtf.native.items():
+                            for tf, v in per_tf.items():
+                                b.add(f"{name}:{tf}", v, source_ts=now)
+                except Exception:
+                    pass
             built = b.build()
             standardized = {}
             for row in mat_rows:
@@ -560,11 +630,12 @@ class UnifiedOrchestrator:
         if getattr(snap, "option_rows", None):
             try:
                 from gex.base import compute_all_variants
+                from prediction.dataset import session_metadata
                 mos = None
                 try:
-                    if snap.bars is not None and len(snap.bars.ts):
-                        # minutes since first bar of the session snapshot
-                        mos = float(len(snap.bars.ts))  # coarse proxy
+                    mos = session_metadata(now).get("minutes_since_open")
+                    if mos is not None:
+                        mos = float(mos)
                 except Exception:
                     mos = None
                 vor = getattr(m, "volume_oi_ratio", None)
@@ -665,6 +736,11 @@ class UnifiedOrchestrator:
         signals["premium_flip"] = 1.0 if "premium veto" in intent.note else 0.0
         if regime_state.vetoes:
             signals["regime_vetoes"] = ",".join(regime_state.vetoes)
+        # Warm-up provenance for funnel / validation honesty.
+        signals["gex_rank_warm"] = 1.0 if bool(
+            getattr(snap.market, "gex_rank_warm", True)) else 0.0
+        # Internal: let bundle provider reuse the journal-linked snapshot id.
+        signals["_snapshot_id"] = snapshot_id
 
         ras_results = self._compute_ras(
             regime_state, intent, snap.market, position_contexts)
@@ -710,11 +786,14 @@ class UnifiedOrchestrator:
 
         # ---- Stand-down: regime unstable or NT cell (or champion NO_TRADE) ----
         if stand_down_now:
+            pub_signals = {k: v for k, v in signals.items()
+                           if not str(k).startswith("_")}
             result = TickResult(
                 ts=now, regime=regime_state, intent=intent,
                 decision=None, final_size_mult=0.0,
                 vetoes=regime_state.vetoes, snapshot=snap,
                 ras_results=ras_results,
+                signals=pub_signals,
             )
             if self.journal:
                 row = _no_trade_row(snap.market, intent, regime_state,
@@ -930,12 +1009,15 @@ class UnifiedOrchestrator:
                       if (decision is not None
                           and decision.decision == "TRADE") else 0.0)
 
+        pub_signals = {k: v for k, v in signals.items()
+                       if not str(k).startswith("_")}
         return TickResult(
             ts=now, regime=regime_state, intent=intent,
             decision=decision,
             final_size_mult=round(final_size, 2),
             vetoes=regime_state.vetoes, snapshot=snap,
             ras_results=ras_results,
+            signals=pub_signals,
         )
 
     def run_replay(self, timestamps: Sequence[dt.datetime]) -> list[TickResult]:
