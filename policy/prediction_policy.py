@@ -99,11 +99,14 @@ class PredictionPolicy:
         op = inp.operational_risk_state or {}
         hard_vetoes = tuple(op.get("hard_vetoes") or ())
         # Operational hard stops always win.
-        if op.get("stand_down") or any(
-                str(v).startswith("catalyst") for v in hard_vetoes):
+        if (op.get("stand_down") or op.get("session_warmup")
+                or any(str(v).startswith("catalyst")
+                       or str(v) in ("session_warmup", "WARMUP")
+                       or str(v).startswith("WARMUP")
+                       for v in hard_vetoes)):
             return self._no_trade(
                 bundle, hard_vetoes,
-                rationale=("operational hard veto / stand_down",),
+                rationale=("operational hard veto / stand_down / session_warmup",),
                 confidence=0.0)
 
         uncertainty = float(bundle.uncertainty if bundle.uncertainty is not None

@@ -436,10 +436,25 @@ class UnifiedOrchestrator:
                             and float(v) > 0 and spot > 0):
                         implied = float(v) / spot
                         break
+            hard_vetoes = list(regime_state.vetoes or [])
+            # Mirror the Track A session-warmup hard gate into policy so V2
+            # dual-run also stands down until entry open.
+            try:
+                from gate_scorer import GateConfig
+                entry_open = (self.engine_cfg.gate.morning_entry_time
+                              if self.engine_cfg is not None
+                              else GateConfig().morning_entry_time)
+            except Exception:
+                from gate_scorer import GateConfig
+                entry_open = GateConfig().morning_entry_time
+            in_warmup = snap.market.et_time() < entry_open
+            if in_warmup and "session_warmup" not in hard_vetoes:
+                hard_vetoes.append("session_warmup")
             op_risk = {
-                "hard_vetoes": list(regime_state.vetoes or []),
-                "stand_down": bool(regime_state.stand_down),
+                "hard_vetoes": hard_vetoes,
+                "stand_down": bool(regime_state.stand_down) or in_warmup,
                 "implied_remaining_move": implied,
+                "session_warmup": in_warmup,
             }
             pin = PolicyInput(
                 predictions=bundle,
@@ -739,6 +754,18 @@ class UnifiedOrchestrator:
         # Warm-up provenance for funnel / validation honesty.
         signals["gex_rank_warm"] = 1.0 if bool(
             getattr(snap.market, "gex_rank_warm", True)) else 0.0
+        # Session entry warmup (first ~30m): hard gate blocks new tickets;
+        # journal the flag so the funnel/dashboard can show why.
+        try:
+            from gate_scorer import GateConfig
+            entry_open = (self.engine_cfg.gate.morning_entry_time
+                          if self.engine_cfg is not None
+                          else GateConfig().morning_entry_time)
+        except Exception:
+            from gate_scorer import GateConfig
+            entry_open = GateConfig().morning_entry_time
+        signals["session_warmup"] = (
+            1.0 if snap.market.et_time() < entry_open else 0.0)
         # Internal: let bundle provider reuse the journal-linked snapshot id.
         signals["_snapshot_id"] = snapshot_id
 

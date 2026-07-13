@@ -157,7 +157,12 @@ class GateConfig:
     require_no_catalyst: bool = True
 
     # --- timing ---
-    morning_resolve_time: dt.time = dt.time(10, 30)   # before this, discovery unresolved
+    # Hard: no NEW entries before this clock time. Regular open is 09:30 ET, so
+    # the default is a 30-minute session warmup for GEX rank, MTF scales, and
+    # channel features to settle before any ticket can fire. Soft timing score
+    # (morning_resolve_time) still haircuts confidence until 10:30.
+    morning_entry_time: dt.time = dt.time(10, 0)
+    morning_resolve_time: dt.time = dt.time(10, 30)   # before this, discovery unresolved (score haircut)
     late_lockout_time: dt.time = dt.time(15, 30)      # after this, close-gamma too hot to initiate
 
     # --- scoring weights (sum to 100) ---
@@ -279,7 +284,16 @@ def evaluate_gates(s: MarketSnapshot, cfg: GateConfig) -> list[str]:
         label = s.catalyst_label or "scheduled event"
         failed.append(f"CATALYST: {label} in window (range-breaking)")
 
-    # 6. Timing lockout (initiating too late into close-gamma)
+    # 6. Session warmup — no new entries in the first ~30 minutes after open.
+    #    Rank windows, MTF scales, and channel features are still fleshing out.
+    if s.et_time() < cfg.morning_entry_time:
+        failed.append(
+            f"WARMUP: {s.et_time():%H:%M} ET before entry open "
+            f"{cfg.morning_entry_time:%H:%M} (session warmup — wait for "
+            f"GEX/MTF/channels to settle)"
+        )
+
+    # 7. Timing lockout (initiating too late into close-gamma)
     if s.et_time() >= cfg.late_lockout_time:
         failed.append(
             f"LATE: {s.et_time():%H:%M} ET past lockout {cfg.late_lockout_time:%H:%M} "
@@ -294,12 +308,19 @@ def evaluate_directional_gates(s: MarketSnapshot, cfg: GateConfig) -> list[str]:
 
     GEX_SHORT / BELOW_FLIP / TRENDING / TERM_INVERTED are reasons premium
     selling dies — they are the tape a directional debit trade *wants* — so
-    they must not veto it. Catalyst and the late-day lockout stop everything.
+    they must not veto it. Catalyst, the morning warmup, and the late-day
+    lockout stop everything.
     """
     failed: list[str] = []
     if cfg.require_no_catalyst and s.has_catalyst:
         label = s.catalyst_label or "scheduled event"
         failed.append(f"CATALYST: {label} in window (range-breaking)")
+    if s.et_time() < cfg.morning_entry_time:
+        failed.append(
+            f"WARMUP: {s.et_time():%H:%M} ET before entry open "
+            f"{cfg.morning_entry_time:%H:%M} (session warmup — wait for "
+            f"GEX/MTF/channels to settle)"
+        )
     if s.et_time() >= cfg.late_lockout_time:
         failed.append(
             f"LATE: {s.et_time():%H:%M} ET past lockout {cfg.late_lockout_time:%H:%M} "
