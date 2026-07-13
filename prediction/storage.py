@@ -94,6 +94,31 @@ CREATE TABLE IF NOT EXISTS candidate_outcomes (
     first_event TEXT,
     outcome_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS sigma_cone_journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    spot REAL NOT NULL,
+    model_version TEXT NOT NULL,
+    sigma REAL NOT NULL,
+    horizon_min REAL NOT NULL,
+    lo REAL NOT NULL,
+    hi REAL NOT NULL,
+    mid REAL,
+    settle_by TEXT NOT NULL,
+    settled INTEGER NOT NULL DEFAULT 0,
+    realized_spot REAL,
+    realized_ts TEXT,
+    inside INTEGER,
+    error_mid REAL,
+    coverage_note TEXT,
+    UNIQUE(snapshot_id, timeframe, sigma)
+);
+CREATE INDEX IF NOT EXISTS ix_cone_session ON sigma_cone_journal(session_date);
+CREATE INDEX IF NOT EXISTS ix_cone_settle ON sigma_cone_journal(settled, settle_by);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -296,6 +321,121 @@ class PredictionStore:
                     row[dest] = None
             out.append(row)
         return out
+
+    # ---- sigma cone journal (MTF outward-looking predictions) ----------------
+    def log_sigma_cones(self, cones) -> int:
+        """Persist ConeForecast panes (one row per timeframe × σ). Idempotent."""
+        n = 0
+        for cone in cones or []:
+            for band in getattr(cone, "bands", ()) or ():
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO sigma_cone_journal "
+                    "(snapshot_id, session_date, ts, timeframe, spot, "
+                    "model_version, sigma, horizon_min, lo, hi, mid, settle_by, "
+                    "settled, realized_spot, realized_ts, inside, error_mid, "
+                    "coverage_note) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL,NULL,NULL)",
+                    (cone.snapshot_id, cone.session_date, cone.ts,
+                     cone.timeframe, float(cone.spot), cone.model_version,
+                     float(band.sigma), float(band.horizon_min),
+                     float(band.lo), float(band.hi), float(band.mid),
+                     band.settle_by),
+                )
+                n += 1
+        self.conn.commit()
+        return n
+
+    def settle_sigma_cones(self, now_iso: str, realized_spot: float,
+                           *, realized_ts: Optional[str] = None) -> int:
+        """
+        Match due cone bands against the true spot.
+
+        Any unsettled row with settle_by <= now_iso is scored: inside [lo,hi],
+        error vs mid, coverage note. Returns count newly settled.
+        """
+        from prediction.sigma_cone import ConeBand, settle_band
+
+        px = float(realized_spot)
+        rts = realized_ts or now_iso
+        rows = self.conn.execute(
+            "SELECT id, sigma, lo, hi, mid, horizon_min, settle_by "
+            "FROM sigma_cone_journal "
+            "WHERE settled=0 AND settle_by<=?",
+            (now_iso,),
+        ).fetchall()
+        n = 0
+        for r in rows:
+            band = ConeBand(
+                sigma=float(r["sigma"]), lo=float(r["lo"]), hi=float(r["hi"]),
+                horizon_min=float(r["horizon_min"]), mid=float(r["mid"]),
+                settle_by=r["settle_by"],
+            )
+            s = settle_band(band, realized_spot=px, realized_ts=rts)
+            self.conn.execute(
+                "UPDATE sigma_cone_journal SET settled=1, realized_spot=?, "
+                "realized_ts=?, inside=?, error_mid=?, coverage_note=? "
+                "WHERE id=?",
+                (s.realized_spot, s.realized_ts, 1 if s.inside else 0,
+                 s.error_mid, s.coverage_note, r["id"]),
+            )
+            n += 1
+        if n:
+            self.conn.commit()
+        return n
+
+    def fetch_sigma_cones(self, *, session_date: Optional[str] = None,
+                          settled: Optional[bool] = None,
+                          timeframe: Optional[str] = None,
+                          limit: int = 200) -> list[dict]:
+        sql = "SELECT * FROM sigma_cone_journal"
+        conds, args = [], []
+        if session_date:
+            conds.append("session_date=?")
+            args.append(session_date)
+        if settled is not None:
+            conds.append("settled=?")
+            args.append(1 if settled else 0)
+        if timeframe:
+            conds.append("timeframe=?")
+            args.append(timeframe)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY ts DESC, timeframe, sigma LIMIT ?"
+        args.append(int(limit))
+        return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+
+    def sigma_cone_coverage(self, *, session_date: Optional[str] = None) -> dict:
+        """Hit-rate of settled cones by σ level (and overall)."""
+        sql = ("SELECT sigma, COUNT(*) AS n, "
+               "SUM(CASE WHEN inside=1 THEN 1 ELSE 0 END) AS n_inside, "
+               "AVG(error_mid) AS mean_error_mid, "
+               "AVG(ABS(error_mid)) AS mae_mid "
+               "FROM sigma_cone_journal WHERE settled=1")
+        args: list = []
+        if session_date:
+            sql += " AND session_date=?"
+            args.append(session_date)
+        sql += " GROUP BY sigma ORDER BY sigma"
+        by_sigma = {}
+        total_n = total_in = 0
+        for r in self.conn.execute(sql, args).fetchall():
+            n = int(r["n"] or 0)
+            nin = int(r["n_inside"] or 0)
+            total_n += n
+            total_in += nin
+            by_sigma[str(r["sigma"])] = {
+                "n": n,
+                "n_inside": nin,
+                "hit_rate": (nin / n) if n else None,
+                "mean_error_mid": r["mean_error_mid"],
+                "mae_mid": r["mae_mid"],
+            }
+        return {
+            "n_settled": total_n,
+            "n_inside": total_in,
+            "hit_rate": (total_in / total_n) if total_n else None,
+            "by_sigma": by_sigma,
+        }
 
     # ---- deterministic rebuild check --------------------------------------------
     def dataset_hash(self) -> str:

@@ -48,6 +48,7 @@
     <nav class="tabbar">
       <button class="tab active" id="tab-legacy" type="button">Legacy</button>
       <button class="tab" id="tab-v2" type="button">V2</button>
+      <button class="tab" id="tab-prediction" type="button">Prediction</button>
       <button class="tab" id="tab-journal" type="button">Trade Journal</button>
       <button class="tab" id="tab-validation" type="button">Validation
         <span class="val-alert-dot hidden" id="tab-validation-dot"></span>
@@ -324,6 +325,50 @@
         </section>
       </div>
 
+    </div>
+
+    <!-- ===================== PREDICTION VIEW (MTF sigma cones) ===================== -->
+    <div class="journal-view hidden" id="view-prediction">
+      <section class="panel accent" style="grid-column:1/-1">
+        <h2>Outward-looking cones <span class="h2-right" id="pred-live-sub">live · MTF</span></h2>
+        <p class="empty" id="pred-live-note" style="margin-bottom:10px">
+          From spot now: 0.5σ / 1σ / 2σ bands with endogenous horizons (wider σ looks further).
+          Settled rows match each band to the <b>true spot</b> at settle_by.
+        </p>
+        <div id="pred-cone-panes"><p class="empty">Awaiting first cone tick</p></div>
+      </section>
+
+      <section class="panel">
+        <h2>Coverage vs realized <span class="h2-right" id="pred-cov-sub">—</span></h2>
+        <div class="metrics" id="pred-coverage-metrics"></div>
+        <div id="pred-coverage-by-sigma" style="margin-top:10px"></div>
+      </section>
+
+      <section class="panel" style="grid-column:1/-1">
+        <h2>Prediction journal <span class="h2-right" id="pred-jrn-count">—</span></h2>
+        <div class="val-filters" id="pred-filters" style="margin-bottom:10px">
+          <button class="val-filter active" data-settled="" type="button">All</button>
+          <button class="val-filter" data-settled="0" type="button">Open</button>
+          <button class="val-filter" data-settled="1" type="button">Settled</button>
+          <button class="val-filter" data-tf="1m" type="button">1m</button>
+          <button class="val-filter" data-tf="5m" type="button">5m</button>
+          <button class="val-filter" data-tf="15m" type="button">15m</button>
+          <button class="val-filter" data-tf="30m" type="button">30m</button>
+        </div>
+        <div class="tj-scroll">
+          <table class="tj-table" id="pred-table">
+            <thead>
+              <tr>
+                <th>Emitted</th><th>TF</th><th>σ</th><th>Spot</th>
+                <th>Band</th><th>Horizon</th><th>Settle by</th>
+                <th>Realized</th><th>Match</th><th>Error</th>
+              </tr>
+            </thead>
+            <tbody id="pred-body"></tbody>
+          </table>
+        </div>
+        <p class="empty hidden" id="pred-empty">No cone rows yet — enable V2 parallel so prediction_store journals cones</p>
+      </section>
     </div>
 
     <!-- ===================== TRADE JOURNAL VIEW ===================== -->
