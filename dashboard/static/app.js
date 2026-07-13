@@ -388,6 +388,293 @@
       ? cards.join("")
       : '<p class="empty">No V2 economics on latest tick</p>';
   }
+
+  /* ---------------- V2 signal (policy shadow, mirrors Legacy signal panel) ---------------- */
+  function renderV2Signal(live, latest) {
+    const p = (live && live.parallel) || {};
+    const v2 = p.v2 || {};
+    const s = mergeV2Signals(latest, live);
+    $("v2-signal-time").textContent = live && live.ts ? etTime(live.ts) + " ET" : "—";
+
+    const feedDown = live && (live.status === "feed_not_ready" || live.status === "feed_error");
+    const idle = !live || !live.ts || (live.status && live.status !== "live");
+    const action = String(v2.action || s.v2_policy_action || s.policy_action || "").toUpperCase();
+    const struct = v2.structure || s.v2_policy_structure || s.policy_structure || "";
+    const mode = v2.mode || s.policy_mode || "—";
+    const disagree = num(v2.disagreement) === 1 || num(s.policy_disagreement) === 1;
+    const fallback = num(v2.fallback_used) === 1 || num(s.policy_fallback_used) === 1;
+    const conf = num(v2.confidence != null ? v2.confidence : s.v2_policy_confidence);
+
+    let cls = "wait", word = "WAIT", sub = "";
+    if (feedDown) {
+      cls = "stop"; word = "NO FEED";
+      sub = "feed not ready — check data source";
+    } else if (idle) {
+      cls = "wait"; word = "STANDBY";
+      sub = (live.market && live.market.is_open) ? "pipeline idle — awaiting tick" : "market closed — awaiting session";
+    } else if (fallback) {
+      cls = "wait"; word = "FALLBACK";
+      sub = "V2 unavailable · using legacy";
+    } else if (action === "TRADE" || (struct && struct !== "NT" && action !== "NO_TRADE" && action !== "STAND_DOWN")) {
+      cls = "go"; word = "TRADE";
+      sub = `policy ${mode}` + (disagree ? " · disagrees with legacy" : " · dual-run");
+    } else if (action === "STAND_DOWN" || action === "STANDDOWN") {
+      cls = "stop"; word = "STAND DOWN";
+      sub = (s.policy_rationale || "policy veto").toString().replace(/_/g, " ");
+    } else if (action === "NO_TRADE" || struct === "NT" || !struct) {
+      cls = "wait"; word = "NO TRADE";
+      sub = (s.policy_rationale || "conditions not met").toString().replace(/_/g, " ");
+    } else {
+      cls = "wait"; word = action || "WAIT";
+      sub = `policy ${mode}`;
+    }
+    const v = $("v2-verdict");
+    v.className = "verdict " + cls;
+    $("v2-verdict-word").textContent = word;
+    $("v2-verdict-sub").textContent = sub || "—";
+
+    const dir = String(v2.direction || s.v2_policy_direction || "").toLowerCase();
+    const dirCls = dir.includes("call") || dir.includes("bull") ? "call"
+      : dir.includes("put") || dir.includes("bear") ? "put" : "";
+    const chips = [];
+    if (struct && struct !== "NT") chips.push(`<span class="tag-chip big">${esc(struct)}</span>`);
+    if (v2.direction || s.v2_policy_direction) {
+      chips.push(`<span class="tag-chip big ${dirCls}">${esc(v2.direction || s.v2_policy_direction)}</span>`);
+    }
+    chips.push(`<span class="tag-chip">${esc(mode)}</span>`);
+    if (disagree) chips.push('<span class="tag-chip">≠ legacy</span>');
+    $("v2-dirline").innerHTML = chips.join("");
+
+    $("v2-conf-num").textContent = conf != null ? conf.toFixed(2) : "—";
+    const confPct = conf != null ? Math.max(0, Math.min(100, conf * 100)) : 0;
+    const confBar = $("v2-conf-bar");
+    confBar.style.width = confPct + "%";
+    confBar.parentElement.className = "bar " + (conf != null && conf >= 0.6 ? "green"
+      : conf != null && conf >= 0.4 ? "amber" : "red");
+
+    const size = num(v2.size_cap != null ? v2.size_cap : s.policy_size_cap);
+    $("v2-size-num").textContent = size != null ? "×" + size.toFixed(2) : "—";
+    $("v2-size-bar").style.width = (size != null ? Math.max(0, Math.min(100, (size / 1.5) * 100)) : 0) + "%";
+  }
+
+  function renderPin(latest, live) {
+    const s = mergeV2Signals(latest, live);
+    const active = num(s.pin_active) === 1;
+    $("pin-sub").textContent = active ? "active" : "inactive";
+    if (s.pin_active == null && s.pin_score == null) {
+      $("pin-metrics").innerHTML = '<p class="empty">No pin-regime signals yet</p>';
+      $("pin-chips").innerHTML = "";
+      return;
+    }
+    $("pin-metrics").innerHTML = [
+      metricCard("Active", active ? "yes" : "no", active ? "pos" : ""),
+      metricCard("Score", fmt(s.pin_score, 2), active ? "pos" : ""),
+      metricCard("|zg| %", fmt(s.pin_zg_pct != null ? s.pin_zg_pct * 100 : null, 3)),
+      metricCard("Prefer fly", num(s.pin_prefer_fly) ? "yes" : "no"),
+      metricCard("Inside walls", num(s.pin_inside_walls) ? "yes" : "no",
+        num(s.pin_inside_walls) ? "pos" : "warn"),
+    ].join("");
+    const chips = [];
+    if (active) chips.push('<span class="chip ok">pin active</span>');
+    String(s.pin_reasons || "").split(",").filter(Boolean).forEach((r) =>
+      chips.push(`<span class="chip info">${esc(r.trim())}</span>`));
+    if (!chips.length) chips.push('<span class="chip">no pin</span>');
+    $("pin-chips").innerHTML = chips.join("");
+  }
+
+  function renderV2Why(live, latest) {
+    const s = mergeV2Signals(latest, live);
+    const p = (live && live.parallel) || {};
+    const v2 = p.v2 || {};
+    const leg = p.legacy || {};
+    const disagree = num(v2.disagreement) === 1 || num(s.policy_disagreement) === 1;
+    const rationale = s.policy_rationale || "";
+    let html = "";
+    if (!live || !live.ts || (live.status && live.status !== "live")) {
+      html = "<b>Standing by.</b> No live V2 observation yet.";
+    } else if (rationale) {
+      html = `<b>Policy.</b> ${esc(String(rationale).replace(/_/g, " "))}.`;
+    } else if (disagree) {
+      html = `<b>Disagreement.</b> Legacy ${esc(leg.structure || "NT")} vs V2 ${esc(v2.structure || s.v2_policy_structure || "—")}.`;
+    } else {
+      html = `<b>Aligned.</b> V2 ${esc(v2.structure || s.v2_policy_structure || "NT")} · ${esc(v2.action || s.v2_policy_action || "—")}.`;
+    }
+    $("v2-reason").innerHTML = html;
+    $("v2-why-metrics").innerHTML = [
+      metricCard("V2 structure", esc(v2.structure || s.v2_policy_structure || "—")),
+      metricCard("V2 action", esc(v2.action || s.v2_policy_action || "—")),
+      metricCard("Source", esc(v2.source || s.policy_source || "—"),
+        (v2.source || s.policy_source) === "fallback_legacy" ? "warn" : ""),
+      metricCard("Legacy structure", esc(leg.structure || s.legacy_policy_structure || "—")),
+      metricCard("Version", esc(s.policy_version || s.v2_policy_version || "—")),
+      metricCard("Uncertainty", fmt(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty, 2),
+        num(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty) > 0.5 ? "warn" : ""),
+    ].join("");
+    const chips = [];
+    if (disagree) chips.push('<span class="chip disagree">disagreement</span>');
+    if (num(s.policy_fallback_used) === 1) chips.push('<span class="chip fallback">fallback</span>');
+    if (num(s.pin_active) === 1) chips.push('<span class="chip ok">pin</span>');
+    String(s.policy_hard_vetoes || "").split(",").filter(Boolean).forEach((v) =>
+      chips.push(`<span class="chip veto">${esc(v.trim())}</span>`));
+    if (!chips.length) chips.push('<span class="chip ok">no active vetoes</span>');
+    $("v2-why-chips").innerHTML = chips.join("");
+  }
+
+  function renderV2Regime(live) {
+    const conf = (live.why && live.why.regime_confidences) || {};
+    const entries = Object.entries(conf).sort((a, b) => b[1] - a[1]);
+    if (!entries.length) {
+      $("v2-regime-bars").innerHTML = '<p class="empty">No regime data</p>';
+      return;
+    }
+    const dom = (live.doing && live.doing.dominant_regime) || "";
+    $("v2-regime-bars").innerHTML = entries.map(([k, v]) => {
+      const val = num(v) || 0;
+      const isDom = k === dom;
+      const color = val >= 70 ? "green" : val >= 55 ? "amber" : "red";
+      return `<div class="trow">
+        <span class="lbl">${esc(k)}${isDom ? " ●" : ""}</span>
+        <span class="track"><span style="width:${Math.min(100, val)}%;background:var(--${color === "green" ? "green" : color === "amber" ? "amber" : "red"})"></span></span>
+        <span class="num">${val.toFixed(0)}%</span>
+      </div>`;
+    }).join("");
+  }
+
+  function renderV2OpenPositions(livePaper) {
+    const open = (livePaper && livePaper.open) || [];
+    $("v2-open-count").textContent = open.length ? (open.length > 1 ? `${open.length} open` : "1 open") : "—";
+    if (!open.length) {
+      $("v2-open-positions").innerHTML = '<p class="empty">No open positions</p>';
+      return;
+    }
+    $("v2-open-positions").innerHTML = open.map((p) => {
+      const ctx = p.entry_ctx || {};
+      const pnl = num(p.unrealized_pnl_dollars);
+      const pnlCls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
+      const pctMax = p.pct_of_max_profit != null ? pct(p.pct_of_max_profit) : "—";
+      return `<div class="op-card">
+        <div class="op-head">
+          <div>
+            <div class="op-strikes">${esc(p.strikes)}</div>
+            <div class="op-family">${esc(p.family)} · x${esc(p.contracts)} · ${trackBadge(ctx)}</div>
+          </div>
+          <div class="op-pnl ${pnlCls}">${pnl >= 0 ? "+" : ""}${money(pnl, 2)}</div>
+        </div>
+        <div class="op-metrics">
+          <div><span class="k">Entry credit</span><span class="v">${fmt(p.entry_credit, 2)}</span></div>
+          <div><span class="k">Held</span><span class="v">${fmt(p.hold_min, 0)}m</span></div>
+          <div><span class="k">% of max profit</span><span class="v ${pnlCls}">${pctMax}</span></div>
+          <div><span class="k">V2 wanted</span><span class="v sm">${esc(ctx.v2_policy_structure || "—")}</span></div>
+        </div>
+      </div>`;
+    }).join("");
+  }
+
+  function renderV2Paper(paper) {
+    if (!paper || paper.trades == null) {
+      $("v2-paper-metrics").innerHTML = '<div class="metric"><span class="k">status</span><span class="v sm">no data</span></div>';
+      return;
+    }
+    const pnlCls = num(paper.total_pnl) > 0 ? "pos" : num(paper.total_pnl) < 0 ? "neg" : "";
+    $("v2-paper-metrics").innerHTML = [
+      metricCard("Equity", money(paper.equity, 0), "info"),
+      metricCard("Total P&L", money(paper.total_pnl, 0), pnlCls),
+      metricCard("Win rate", pct(paper.win_rate)),
+      metricCard("Closed trades", paper.trades),
+    ].join("");
+  }
+
+  function renderV2Funnel(ticks) {
+    const list = ticks || [];
+    let n = 0, disagree = 0, fallback = 0, v2Trade = 0;
+    const rows = [];
+    list.slice().reverse().forEach((t) => {
+      const s = tickSignals(t) || {};
+      if (s.policy_mode == null && s.v2_policy_structure == null && s.policy_disagreement == null) return;
+      n += 1;
+      const d = num(s.policy_disagreement) === 1;
+      const fb = num(s.policy_fallback_used) === 1;
+      if (d) disagree += 1;
+      if (fb) fallback += 1;
+      const v2a = String(s.v2_policy_action || "").toUpperCase();
+      if (v2a === "TRADE") v2Trade += 1;
+      if (d || fb) {
+        const leg = s.legacy_policy_structure || s.policy_structure || t.selected_family || "—";
+        const v2 = s.v2_policy_structure || "—";
+        rows.push(`<div class="fn-row ${d ? "warn" : ""}">
+          <span class="lbl mono">${esc(etTime(t.ts))}</span>
+          <span class="lbl">${esc(leg)} → ${esc(v2)}${fb ? " (fallback)" : ""}</span>
+        </div>`);
+      }
+    });
+    $("v2-funnel-sub").textContent = n ? `${disagree} disagree / ${n} obs` : "session";
+    $("v2-funnel-metrics").innerHTML = [
+      metricCard("Observations", n || "—"),
+      metricCard("Disagreements", disagree, disagree ? "warn" : "pos"),
+      metricCard("Fallbacks", fallback, fallback ? "warn" : ""),
+      metricCard("V2 TRADE ticks", v2Trade),
+    ].join("");
+    $("v2-funnel-rows").innerHTML = rows.length
+      ? `<div class="fn-grid" style="margin-top:10px">${rows.slice(0, 12).join("")}</div>`
+      : '<p class="empty" style="margin-top:8px">No policy disagreements this session</p>';
+  }
+
+  function renderV2Timeline(data) {
+    $("v2-log-date").textContent = data.session_date || "";
+    const ticks = (data.ticks || []).slice().reverse().filter((t) => {
+      const s = tickSignals(t) || {};
+      return s.policy_mode != null || s.v2_policy_structure != null
+        || s.phys_density_mode != null || s.v2_fc_p_up_30m != null
+        || s.pin_active != null;
+    });
+    if (!ticks.length) {
+      $("v2-timeline").innerHTML = '<p class="empty">No V2-annotated ticks yet</p>';
+      return;
+    }
+    $("v2-timeline").innerHTML = ticks.map((t) => {
+      const s = tickSignals(t) || {};
+      const v2Struct = s.v2_policy_structure || "—";
+      const v2Act = s.v2_policy_action || "—";
+      const leg = s.legacy_policy_structure || s.policy_structure || t.selected_family || "—";
+      const disagree = num(s.policy_disagreement) === 1;
+      const trade = String(v2Act).toUpperCase() === "TRADE";
+      const extras = [];
+      if (disagree) extras.push(`${leg}≠${v2Struct}`);
+      if (s.phys_density_mode) extras.push(s.phys_density_mode);
+      if (num(s.pin_active) === 1) extras.push("pin");
+      if (num(s.policy_fallback_used) === 1) extras.push("fallback");
+      const extraHtml = extras.length
+        ? ` <small class="tl-v2">${esc(extras.join(" · "))}</small>` : "";
+      return `<div class="tl-item${trade ? " is-trade" : ""}${disagree ? " tl-disagree" : ""}">
+        <span class="t">${etTime(t.ts)}</span>
+        <span class="m">${esc(v2Struct)} <small>${esc(v2Act)}</small>${extraHtml}
+          <small>· ${fmt(t.spot, 2)}</small></span>
+        <span class="d ${trade ? "trade" : "no"}">${trade ? "V2" : "—"}</span>
+      </div>`;
+    }).join("");
+  }
+
+  /* ---------------- track helpers (Legacy vs V2) ---------------- */
+  function fillTrack(ctx) {
+    ctx = ctx || {};
+    if (ctx.fill_track === "v2" || ctx.fill_track === "legacy") return ctx.fill_track;
+    const mode = String(ctx.policy_mode || "").toLowerCase();
+    if (mode === "champion") return "v2";
+    return "legacy";
+  }
+  function trackDisagree(ctx) {
+    return num((ctx || {}).policy_disagreement) === 1;
+  }
+  function trackBadge(ctx) {
+    const track = fillTrack(ctx);
+    const chips = [`<span class="chip track-${track}">${track}</span>`];
+    if (trackDisagree(ctx)) {
+      const wanted = (ctx && ctx.v2_policy_structure) || "?";
+      chips.push(`<span class="chip track-disagree" title="V2 wanted ${esc(wanted)}">≠ V2 ${esc(wanted)}</span>`);
+    }
+    return `<span class="chips">${chips.join("")}</span>`;
+  }
+
   function renderPolicy(latest) {
     const s = tickSignals(latest) || {};
     const mode = s.policy_mode || "—";
@@ -1075,7 +1362,8 @@
       if (!s) continue;
       if (s.phys_v2_mean != null || s.v2_fc_p_up_30m != null
           || s.v2_top_candidate_id != null || s.v2_rank_disagreement != null
-          || s.phys_density_mode != null) {
+          || s.phys_density_mode != null || s.policy_mode != null
+          || s.v2_policy_structure != null || s.pin_active != null) {
         return ticks[i];
       }
     }
@@ -1661,8 +1949,19 @@
     return map[t.exit_reason] || esc(t.exit_reason || "—");
   }
 
+  let journalData = { open: [], closed: [] };
+  let tjTrackFilter = "";
+
+  function tradeMatchesTrack(t, filter) {
+    if (!filter) return true;
+    const ctx = t.entry_ctx || {};
+    if (filter === "disagree") return trackDisagree(ctx);
+    return fillTrack(ctx) === filter;
+  }
+
   function renderJournal(data) {
-    const open = data.open || [];
+    if (data) journalData = data;
+    const open = journalData.open || [];
     $("tj-open-count").textContent = String(open.length);
     if (!open.length) {
       $("tj-open").innerHTML = '<p class="empty">No open positions</p>';
@@ -1670,22 +1969,27 @@
       $("tj-open").innerHTML = open.map((p) => {
         const pnl = num(p.unrealized_pnl_dollars);
         const cls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
+        const ctx = p.entry_ctx || {};
         return `<div class="tj-open-row">
           <div class="tj-head">
             <b>${esc(p.family)}</b> <span class="mono">${esc(p.strikes)}</span>
             <span>×${p.contracts}</span>
+            ${trackBadge(ctx)}
             <span class="mono ${cls}">${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : "—"}</span>
             <span class="tj-dim">${fmt(p.hold_min, 0)}m held</span>
-            ${rasInline(p.entry_ctx || {})}
+            ${rasInline(ctx)}
           </div>
-          <div class="tj-sub">${entryLogicLine(p.entry_ctx)}</div>
-          ${rasBlock(p.entry_ctx || {})}
+          <div class="tj-sub">${entryLogicLine(ctx)}</div>
+          ${rasBlock(ctx)}
         </div>`;
       }).join("");
     }
 
-    const closed = data.closed || [];
-    $("tj-closed-count").textContent = String(closed.length);
+    const closedAll = journalData.closed || [];
+    const closed = closedAll.filter((t) => tradeMatchesTrack(t, tjTrackFilter));
+    $("tj-closed-count").textContent = tjTrackFilter
+      ? `${closed.length} / ${closedAll.length}`
+      : String(closedAll.length);
     $("tj-empty").classList.toggle("hidden", closed.length > 0);
     $("tj-table").classList.toggle("hidden", closed.length === 0);
     $("tj-body").innerHTML = closed.map((t) => {
@@ -1695,10 +1999,12 @@
       const reasonCls = t.exit_reason === "target" || t.exit_reason === "trail" ? "good"
                       : t.exit_reason === "stop" ? "bad"
                       : t.exit_reason === "ras_invalidate" ? "warn" : "";
+      const ctx = t.entry_ctx || {};
       return `<tr>
         <td class="mono">${esc((t.opened_at || "").slice(0, 10))} ${opened}</td>
+        <td class="tj-track-cell">${trackBadge(ctx)}</td>
         <td><b>${esc(t.family)}</b> <span class="mono tj-dim">${esc(t.strikes)}</span>
-            <div class="tj-sub">${entryLogicLine(t.entry_ctx)}</div></td>
+            <div class="tj-sub">${entryLogicLine(ctx)}</div></td>
         <td class="mono">×${t.contracts}</td>
         <td class="mono">${fmt(t.entry_credit, 2)}</td>
         <td class="mono">${fmt(t.exit_value, 2)}</td>
@@ -1706,10 +2012,21 @@
         <td class="mono ${cls}">${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : "—"}</td>
         <td><span class="tj-reason ${reasonCls}">${esc(t.exit_reason || "—")}</span>
             <div class="tj-sub">${exitLogicLine(t)}</div>
-            ${rasExitLine(t.entry_ctx)}</td>
+            ${rasExitLine(ctx)}</td>
         <td class="mono">$${fmt(t.equity_after, 2)}</td>
       </tr>`;
     }).join("");
+  }
+
+  function initJournalControls() {
+    document.querySelectorAll("#tj-filters .val-filter").forEach((el) => {
+      el.addEventListener("click", () => {
+        tjTrackFilter = el.dataset.track || "";
+        document.querySelectorAll("#tj-filters .val-filter")
+          .forEach((b) => b.classList.toggle("active", b === el));
+        renderJournal();
+      });
+    });
   }
 
   function drawEquityCurve(closed) {
@@ -1888,14 +2205,25 @@
       }
 
       if (m.feature_contributions && typeof m.feature_contributions === "object") {
+        const V2_PREF = ["sig:policy_", "sig:v2_", "sig:phys_", "sig:gex_", "sig:pin_"];
+        const isV2 = (k) => V2_PREF.some((p) => k.startsWith(p));
         const entries = Object.entries(m.feature_contributions)
           .filter(([k, v]) => k !== "n" && k !== "note" && typeof v === "number")
-          .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 12);
-        if (entries.length) {
-          parts.push('<h3 class="val-h3">Feature contributions (r vs realized P&amp;L)</h3>'
-            + '<div class="val-corr">' + entries.map(([k, v]) =>
+          .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+        const legacy = entries.filter(([k]) => !isV2(k)).slice(0, 10);
+        const v2 = entries.filter(([k]) => isV2(k)).slice(0, 10);
+        const col = (title, rows, empty) => {
+          if (!rows.length) return `<div><h3 class="val-h3">${esc(title)}</h3><p class="empty">${esc(empty)}</p></div>`;
+          return `<div><h3 class="val-h3">${esc(title)}</h3><div class="val-corr">`
+            + rows.map(([k, v]) =>
               `<div class="val-corr-row"><span class="mono">${esc(k)}</span>
-               <span class="mono ${v >= 0 ? "pos" : "neg"}">${sign(v, 3)}</span></div>`).join("") + "</div>");
+               <span class="mono ${v >= 0 ? "pos" : "neg"}">${sign(v, 3)}</span></div>`).join("")
+            + "</div></div>";
+        };
+        if (legacy.length || v2.length) {
+          parts.push('<h3 class="val-h3">Feature contributions (r vs realized P&amp;L)</h3>'
+            + `<div class="val-track-split">${col("Legacy engine", legacy, "No legacy correlations yet")}`
+            + `${col("V2 / policy / phys / GEX", v2, "No V2 correlations yet — need settled ticks with V2 signals")}</div>`);
         }
       }
     }
@@ -1986,6 +2314,39 @@
 
   /* ---------------- learning tab (adaptive learning engine) ---------------- */
   const SEV_CLS = { alert: "veto", warn: "warn", info: "" };
+
+  function renderLearningV2Status(live) {
+    const el = $("lrn-v2-metrics");
+    if (!el) return;
+    const p = (live && live.parallel) || {};
+    const v2 = p.v2 || {};
+    const s = (live && live.v2_signals) || {};
+    const mode = v2.mode || s.policy_mode || "—";
+    $("lrn-v2-sub").textContent = mode;
+    if (!live || (!live.ts && !Object.keys(s).length && !v2.mode)) {
+      el.innerHTML = '<p class="empty">No live V2 observation yet — Learning stays empty until '
+        + '<span class="mono">adaptive_learning.learner</span> runs; V2 status appears once the shadow pipeline ticks</p>';
+      $("lrn-v2-chips").innerHTML = "";
+      return;
+    }
+    const disagree = num(v2.disagreement) === 1 || num(s.policy_disagreement) === 1;
+    const fallback = num(v2.fallback_used) === 1 || num(s.policy_fallback_used) === 1;
+    el.innerHTML = [
+      metricCard("Policy mode", esc(mode)),
+      metricCard("V2 structure", esc(v2.structure || s.v2_policy_structure || "—")),
+      metricCard("V2 action", esc(v2.action || s.v2_policy_action || "—")),
+      metricCard("Confidence", fmt(v2.confidence != null ? v2.confidence : s.v2_policy_confidence, 2)),
+      metricCard("Source", esc(v2.source || s.policy_source || "—"),
+        fallback ? "warn" : ""),
+      metricCard("Phys mode", esc(s.phys_density_mode || "—")),
+    ].join("");
+    const chips = ['<span class="chip track-v2">v2 shadow</span>',
+      '<span class="chip track-legacy">learning = legacy</span>'];
+    if (disagree) chips.push('<span class="chip disagree">disagreement</span>');
+    if (fallback) chips.push('<span class="chip fallback">fallback</span>');
+    if (num(s.pin_active) === 1) chips.push('<span class="chip ok">pin</span>');
+    $("lrn-v2-chips").innerHTML = chips.join("");
+  }
 
   function renderLearningDiagnostics(runs) {
     const latest = runs.find((r) => (r.diagnostics || []).length) || runs[0];
@@ -2149,8 +2510,15 @@
       <tbody>${rows}</tbody></table>`;
   }
 
-  async function refreshLearning() {
+  async function refreshLearning(liveOpt) {
     try {
+      if (liveOpt) renderLearningV2Status(liveOpt);
+      else {
+        try {
+          const live = await api("/api/live");
+          renderLearningV2Status(live);
+        } catch (_) { /* ignore */ }
+      }
       const [learning, cands, promos, feats, drift] = await Promise.all([
         api("/api/learning?limit=50").catch(() => ({})),
         api("/api/candidates?limit=50").catch(() => ({})),
@@ -2214,6 +2582,11 @@
       renderParallel(live, latest);
       renderPolicy(latest);
       const v2Tick = lastTickWithV2(ticks) || latest;
+      renderV2Signal(live, v2Tick);
+      renderPin(v2Tick, live);
+      renderV2Why(live, v2Tick);
+      renderV2Regime(live);
+      renderV2OpenPositions(live.paper);
       renderPhysDensity(v2Tick, live);
       renderRanker(v2Tick, live);
       renderV2Playbook(candidate, live);
@@ -2231,13 +2604,17 @@
         paper = { ...paper, equity: live.paper.equity };
       }
       renderPaper(paper);
+      renderV2Paper(paper);
       renderEdge(report);
       renderFunnel(report, ticks);
+      renderV2Funnel(ticks);
       renderPredict(report);
       renderSigCorr(report);
       renderReadiness(readiness);
       renderTimeline(history);
+      renderV2Timeline(history);
       staleNote(live, market);
+      if (activeTab === "learning") renderLearningV2Status(live);
 
       // PredictionBundle: prefer store lookup, fall back to journaled v2_fc_*.
       const forecastTick = v2Tick || latest;
@@ -2422,6 +2799,7 @@
     $("tab-validation").addEventListener("click", () => switchTab("validation"));
     $("tab-learning").addEventListener("click", () => switchTab("learning"));
     initValidationControls();
+    initJournalControls();
     initChartControls();
     loadMarketStatus();
     refresh();

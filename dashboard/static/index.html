@@ -214,6 +214,23 @@
     <div class="grid hidden" id="view-v2">
 
       <div class="col col-left">
+        <section class="panel accent" id="v2-signal-panel">
+          <h2>V2 signal <span class="h2-right" id="v2-signal-time">—</span></h2>
+          <div class="verdict wait" id="v2-verdict">
+            <div class="word" id="v2-verdict-word">—</div>
+            <div class="sub" id="v2-verdict-sub">awaiting first tick</div>
+          </div>
+          <div class="dirline" id="v2-dirline"></div>
+          <div class="gauge">
+            <div class="gauge-row"><span>Confidence</span><b id="v2-conf-num">—</b></div>
+            <div class="bar blue"><span id="v2-conf-bar" style="width:0%"></span></div>
+          </div>
+          <div class="gauge">
+            <div class="gauge-row"><span>Size cap</span><b id="v2-size-num">—</b></div>
+            <div class="bar green"><span id="v2-size-bar" style="width:0%"></span></div>
+          </div>
+        </section>
+
         <section class="panel accent" id="parallel-panel">
           <h2>Parallel decisions <span class="h2-right" id="parallel-mode">—</span></h2>
           <div class="policy-compare" id="parallel-compare"></div>
@@ -228,13 +245,24 @@
           <div class="chips" id="policy-chips" style="margin-top:10px"></div>
         </section>
 
-        <section class="panel" id="forecast-panel">
-          <h2>V2 forecast <span class="h2-right" id="forecast-sub">—</span></h2>
-          <div class="metrics" id="forecast-metrics"></div>
+        <section class="panel" id="v2-open-panel">
+          <h2>Open position <span class="h2-right" id="v2-open-count">—</span></h2>
+          <div id="v2-open-positions"><p class="empty">No open positions</p></div>
+        </section>
+
+        <section class="panel" id="pin-panel">
+          <h2>Pin regime <span class="h2-right" id="pin-sub">—</span></h2>
+          <div class="metrics" id="pin-metrics"></div>
+          <div class="chips" id="pin-chips" style="margin-top:10px"></div>
         </section>
       </div>
 
       <div class="col col-mid">
+        <section class="panel" id="forecast-panel">
+          <h2>V2 forecast <span class="h2-right" id="forecast-sub">—</span></h2>
+          <div class="metrics" id="forecast-metrics"></div>
+        </section>
+
         <section class="panel" id="phys-panel">
           <h2>Physical density <span class="h2-right" id="phys-mode">—</span></h2>
           <div class="metrics" id="phys-metrics"></div>
@@ -245,9 +273,16 @@
           <div class="metrics" id="ranker-metrics"></div>
         </section>
 
-        <section class="panel" id="sigcorr-panel">
-          <h2>Signal correlations <span class="h2-right">V2 · settled</span></h2>
-          <div id="sigcorr-rows"><p class="empty">No correlation sample yet</p></div>
+        <section class="panel" id="v2-why-panel">
+          <h2>V2 rationale</h2>
+          <p class="reason" id="v2-reason">—</p>
+          <div class="metrics" id="v2-why-metrics"></div>
+          <div class="chips" id="v2-why-chips" style="margin-top:10px"></div>
+        </section>
+
+        <section class="panel" id="v2-regime-panel">
+          <h2>Regime confidence <span class="h2-right">shared</span></h2>
+          <div id="v2-regime-bars"><p class="empty">No regime data</p></div>
         </section>
       </div>
 
@@ -260,6 +295,32 @@
         <section class="panel" id="v2-playbook-panel">
           <h2>V2 economics <span class="h2-right">observation</span></h2>
           <div class="metrics" id="v2-playbook-metrics"></div>
+        </section>
+
+        <section class="panel" id="sigcorr-panel">
+          <h2>Signal correlations <span class="h2-right">V2 · settled</span></h2>
+          <div id="sigcorr-rows"><p class="empty">No correlation sample yet</p></div>
+        </section>
+
+        <section class="panel" id="v2-paper-panel">
+          <h2>Paper account <span class="h2-right">legacy fills</span></h2>
+          <div class="metrics" id="v2-paper-metrics"></div>
+          <p class="empty" id="v2-paper-note" style="margin-top:8px">
+            Fills follow the authoritative track (legacy in shadow mode).
+            V2 decisions are journaled in parallel for comparison.
+          </p>
+        </section>
+      </div>
+
+      <div class="col" style="grid-column:1/-1">
+        <section class="panel" id="v2-funnel-panel">
+          <h2>Policy disagreements <span class="h2-right" id="v2-funnel-sub">session</span></h2>
+          <div class="metrics" id="v2-funnel-metrics"></div>
+          <div id="v2-funnel-rows"></div>
+        </section>
+        <section class="panel">
+          <h2>V2 session log <span class="h2-right" id="v2-log-date">—</span></h2>
+          <div class="tl" id="v2-timeline"><p class="empty">No V2-annotated ticks yet</p></div>
         </section>
       </div>
 
@@ -277,11 +338,17 @@
       </section>
       <section class="panel">
         <h2>Closed trades <span class="h2-right" id="tj-closed-count">—</span></h2>
+        <div class="val-filters" id="tj-filters" style="margin-bottom:10px">
+          <button class="val-filter active" data-track="" type="button">All</button>
+          <button class="val-filter" data-track="legacy" type="button">Legacy</button>
+          <button class="val-filter" data-track="v2" type="button">V2</button>
+          <button class="val-filter" data-track="disagree" type="button">Disagreements</button>
+        </div>
         <div class="tj-scroll">
           <table class="tj-table" id="tj-table">
             <thead>
               <tr>
-                <th>Opened</th><th>Structure</th><th>Qty</th><th>Entry</th>
+                <th>Opened</th><th>Track</th><th>Structure</th><th>Qty</th><th>Entry</th>
                 <th>Exit</th><th>Hold</th><th>P&amp;L</th><th>Exit logic</th><th>Equity</th>
               </tr>
             </thead>
@@ -312,6 +379,17 @@
 
     <!-- ===================== LEARNING VIEW ===================== -->
     <div class="validation-view hidden" id="view-learning">
+      <section class="panel" id="lrn-v2-status-panel" style="grid-column:1/-1">
+        <h2>V2 shadow status <span class="h2-right" id="lrn-v2-sub">live</span></h2>
+        <div class="metrics" id="lrn-v2-metrics"></div>
+        <div class="chips" id="lrn-v2-chips" style="margin-top:10px"></div>
+        <p class="empty" id="lrn-v2-note" style="margin-top:8px">
+          Learning below optimizes <b>legacy engine config</b> (gate/selector/classifier).
+          V2 policy/ranker run in parallel shadow until promoted via
+          <span class="mono">--policy-mode champion</span>.
+        </p>
+      </section>
+
       <section class="panel" id="lrn-left">
         <h2>Diagnostics <span class="h2-right" id="lrn-diag-sub">—</span></h2>
         <div id="lrn-diagnostics"><p class="empty">No learning runs yet — run
@@ -325,7 +403,7 @@
       </section>
 
       <section class="panel" id="lrn-right">
-        <h2>Champion vs challengers <span class="h2-right" id="lrn-cand-sub">—</span></h2>
+        <h2>Champion vs challengers <span class="h2-right" id="lrn-cand-sub">legacy engine</span></h2>
         <div id="lrn-champion"><p class="empty">No champion config — dataclass defaults live</p></div>
         <div id="lrn-candidates"><p class="empty">No candidate configs yet</p></div>
 

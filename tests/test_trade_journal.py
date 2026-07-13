@@ -168,6 +168,9 @@ def test_entry_ctx_recorded_and_served(tmp_path):
     open_view = b.report(T[1])["open"][0]
     assert open_view["entry_ctx"]["cell"] == ["compression", "compression", "neutral"]
     assert open_view["entry_ctx"]["gate_score"] == 64.2
+    # Default (no policy signals) → legacy fill track
+    assert open_view["entry_ctx"]["fill_track"] == "legacy"
+    assert open_view["entry_ctx"]["policy_disagreement"] == 0.0
 
     b.on_tick(T[1], _result(TARGET))                        # close it
     from dashboard.queries import paper_trades_journal
@@ -177,6 +180,44 @@ def test_entry_ctx_recorded_and_served(tmp_path):
     assert t["exit_reason"] == "target"
     assert t["entry_ctx"]["conviction"] == "HIGH"
     assert t["entry_ctx"]["prob_profit"] == 0.71
+    assert t["entry_ctx"]["fill_track"] == "legacy"
+
+
+def test_entry_ctx_records_v2_policy_track(tmp_path):
+    """Shadow/champion policy fields land on entry_ctx for journal track badges."""
+    b = _broker(tmp_path)
+    res = _result(ENTRY)
+    res.signals = {
+        "policy_mode": "shadow",
+        "policy_source": "prediction_policy",
+        "policy_disagreement": 1.0,
+        "legacy_policy_structure": "LPS",
+        "v2_policy_structure": "IC",
+        "v2_policy_action": "TRADE",
+        "v2_policy_direction": "both",
+        "v2_policy_confidence": 0.72,
+    }
+    b.on_tick(T[0], res)
+    ctx = b.open_positions[0].entry_ctx
+    # shadow mode keeps legacy as authoritative fill track
+    assert ctx["fill_track"] == "legacy"
+    assert ctx["policy_mode"] == "shadow"
+    assert ctx["policy_disagreement"] == 1.0
+    assert ctx["v2_policy_structure"] == "IC"
+    assert ctx["legacy_structure"] == "LPS"
+
+    b2 = PaperBroker(db_path=str(tmp_path / "champ_paper.sqlite"),
+                     cfg=PaperConfig())
+    res2 = _result(ENTRY)
+    res2.signals = {
+        "policy_mode": "champion",
+        "policy_source": "prediction_policy",
+        "policy_disagreement": 0.0,
+        "v2_policy_structure": "IC",
+        "v2_policy_action": "TRADE",
+    }
+    b2.on_tick(T[0], res2)
+    assert b2.open_positions[0].entry_ctx["fill_track"] == "v2"
 
 
 def test_entry_ctx_migration_on_legacy_db(tmp_path):
