@@ -371,7 +371,11 @@ class TradierDataFeed:
             rsp_spy_div=breadth["rsp_spy_div"], sector_align=breadth["sector_align"],
             top10_pressure=breadth["top10_pressure"],
         )
-        return TickSnapshot(market=market, bars=raw, chain=chain)
+        return TickSnapshot(
+            market=market, bars=raw, chain=chain,
+            option_rows=rows,
+            gex_feed_source="TradierDataFeed",
+        )
 
     def settlement_price(self, session_date: str) -> Optional[float]:
         return get_settlement(self.underlying, session_date)

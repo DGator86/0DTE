@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ from regime_alignment import (
 from risk_manager import PositionMonitor
 
 ET = ZoneInfo("America/New_York")
+log = logging.getLogger("paper_broker")
 
 
 # --------------------------------------------------------------------------- #
@@ -222,8 +224,15 @@ class PaperBroker:
         events: list[str] = []
         snap = getattr(result, "snapshot", None)
         chain = getattr(snap, "chain", None) if snap is not None else None
+
+        # Even without a chain we must still honor RAS exits using the last
+        # marked P&L — otherwise feed gaps leave positions unprotected.
         if chain is None:
-            return events                                   # no marks possible this tick
+            for pos in list(self.open_positions):
+                ev = self._manage_ras_only(pos, now, result=result)
+                if ev:
+                    events.append(ev)
+            return events
 
         cmid, pmid, spr = _chain_maps(chain)
 
@@ -239,6 +248,41 @@ class PaperBroker:
             events.append(ev)
 
         return events
+
+    def _manage_ras_only(self, pos, now, result=None) -> Optional[str]:
+        """Apply RAS exit/tighten without fresh chain quotes."""
+        if result is None:
+            return None
+        ras_list = getattr(result, "ras_results", None) or []
+        ras = next((r for r in ras_list if r.position_id == pos.id), None)
+        if ras is None:
+            return None
+        action = self.position_monitor.evaluate(ras)
+        pos.entry_ctx["ras_score"] = ras.score
+        pos.entry_ctx["ras_action"] = ras.action
+        pos.entry_ctx["ras_ema_score"] = ras.ema_score
+        if action.action == "exit" and self.cfg.ras_exit_enabled:
+            # Reconstruct a mark from the last known P&L.
+            pnl_ps = float(pos.last_pnl_ps)
+            credit_now = pos.entry_credit - pnl_ps
+            net_ps = pnl_ps
+            pnl_dollars = net_ps * self.cfg.multiplier * pos.contracts
+            self.cash += pnl_dollars
+            date = now.astimezone(ET).date().isoformat()
+            self._day_realized[date] = self._day_realized.get(date, 0.0) + pnl_dollars
+            self.open_positions.remove(pos)
+            self.position_monitor.release(pos.id)
+            pos.entry_ctx["ras_at_exit"] = ras.score
+            pos.entry_ctx["ras_exit_note"] = "chain_unavailable"
+            self._last_exit_at = now
+            self._last_exit_reason = "ras_invalidate"
+            self._record(pos, now, credit_now, net_ps, pnl_dollars, "ras_invalidate")
+            self._notify("PAPER EXIT",
+                         f"{pos.family} {pos.strikes_str()} ras_invalidate "
+                         f"(no chain) pnl=${pnl_dollars:+.2f}")
+            return (f"PAPER EXIT {pos.family} ras_invalidate (no chain) "
+                    f"pnl=${pnl_dollars:+.2f}")
+        return None
 
     # -- entry --------------------------------------------------------------
     def _maybe_open(self, now, result, chain, cmid, pmid, spr) -> Optional[str]:
@@ -308,8 +352,14 @@ class PaperBroker:
                 try:
                     entry_snapshot = build_entry_snapshot(
                         regime, intent, market, structure_class, structure=structure)
-                except Exception:
+                except Exception as exc:
+                    log.warning("entry_snapshot build failed: %s", exc)
                     entry_snapshot = None
+            else:
+                log.warning("entry_snapshot skipped: market/regime/intent incomplete")
+        if entry_snapshot is None:
+            log.warning("opening paper position WITHOUT entry_snapshot — "
+                        "RAS will not monitor this trade")
         entry_ctx = {
             "regime": getattr(regime, "dominant_regime", None),
             "engine": getattr(regime, "permitted_engine", None),

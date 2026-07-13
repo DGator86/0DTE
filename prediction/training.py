@@ -44,6 +44,9 @@ from prediction.models.return_quantiles import (QUANTILE_HORIZONS,
                                                 ReturnQuantileConfig,
                                                 ReturnQuantileModel)
 from prediction.models.volatility import VolatilityModel, VolatilityModelConfig
+from prediction.models.range_survival import (
+    RANGE_HORIZONS, RangeSurvivalConfig, RangeSurvivalModel, range_feature_row,
+)
 
 ET = ZoneInfo("America/New_York")
 
@@ -323,6 +326,7 @@ class PredictionModelGroup:
     direction: dict = field(default_factory=dict)     # horizon -> DirectionModel
     quantiles: dict = field(default_factory=dict)     # horizon -> ReturnQuantileModel
     volatility: Optional[VolatilityModel] = None
+    range_survival: dict = field(default_factory=dict)  # horizon -> RangeSurvivalModel
     feature_version: str = FEATURE_VERSION
     group_version: str = MODEL_GROUP_VERSION
 
@@ -334,6 +338,9 @@ class PredictionModelGroup:
             out[f"quantiles_{h}"] = f"fwd_return_{h}"
         if self.volatility is not None:
             out["volatility"] = self.volatility.metadata.get("target", "")
+        for h, m in self.range_survival.items():
+            out[f"range_survive_{h}"] = m.metadata.get(
+                "target", f"range_survive_{h}")
         out["group"] = self.group_version
         return out
 
@@ -341,15 +348,93 @@ class PredictionModelGroup:
         vals = [m.metadata.get("uncertainty")
                 for m in self.direction.values()
                 if m.metadata.get("uncertainty") is not None]
+        for m in self.range_survival.values():
+            u = m.metadata.get("uncertainty")
+            if u is not None:
+                vals.append(u)
         return float(np.mean(vals)) if vals else None
+
+
+def train_range_survival_models(
+    frame: TrainingFrame, *,
+    config: Optional[RangeSurvivalConfig] = None,
+    horizons: Sequence[str] = ("30m", "close"),
+    n_folds: int = 3,
+    embargo_sessions: int = 1,
+) -> dict:
+    """Train wall-channel RangeSurvivalModel per horizon."""
+    models: dict = {}
+    horizons_out: dict = {}
+    for h in horizons:
+        if h not in RANGE_HORIZONS:
+            continue
+        mask, y = frame.target(f"range_survive_{h}")
+        if int(mask.sum()) < 20:
+            horizons_out[h] = {"n_labeled": int(mask.sum()), "skipped": True}
+            continue
+        idx = np.where(mask)[0]
+        rows = []
+        for i in idx:
+            r = frame.rows[i]
+            spot = float(r.get("spot") or 0.0)
+            lower = r.get("put_wall")
+            upper = r.get("call_wall")
+            if spot <= 0 or lower is None or upper is None:
+                continue
+            rows.append(range_feature_row(
+                spot=spot, lower=float(lower), upper=float(upper),
+                minutes_to_close=r.get("minutes_to_close"),
+                expected_realized_move=r.get("expected_range"),
+                net_gex=r.get("net_gex"),
+                adx=r.get("adx"),
+                cvd_slope=r.get("cvd_slope"),
+            ))
+        # Align y to rows that had walls.
+        if len(rows) < 20:
+            horizons_out[h] = {"n_labeled": len(rows), "skipped": True}
+            continue
+        # Recompute y only for rows we kept: walk idx again.
+        kept_y, kept_sessions = [], []
+        rows = []
+        for i in idx:
+            r = frame.rows[i]
+            spot = float(r.get("spot") or 0.0)
+            lower = r.get("put_wall")
+            upper = r.get("call_wall")
+            if spot <= 0 or lower is None or upper is None:
+                continue
+            rows.append(range_feature_row(
+                spot=spot, lower=float(lower), upper=float(upper),
+                minutes_to_close=r.get("minutes_to_close"),
+                expected_realized_move=r.get("expected_range"),
+                net_gex=r.get("net_gex"),
+                adx=r.get("adx"),
+                cvd_slope=r.get("cvd_slope"),
+            ))
+            kept_y.append(int(y[i]))
+            kept_sessions.append(frame.sessions[i])
+        cfg = dataclasses.replace(
+            config or RangeSurvivalConfig(),
+            kind="wall_channel", horizon=h,
+            embargo_sessions=embargo_sessions,
+        )
+        model = RangeSurvivalModel(config=cfg).fit(rows, kept_y, kept_sessions)
+        models[h] = model
+        horizons_out[h] = {
+            "n_labeled": len(kept_y),
+            "uncertainty": model.metadata.get("uncertainty"),
+            "base_rate": model.metadata.get("base_rate"),
+        }
+    return {"models": models, "horizons": horizons_out, "folds": n_folds}
 
 
 def train_model_group(frame: TrainingFrame, *,
                       direction_config: Optional[DirectionModelConfig] = None,
                       quantile_config: Optional[ReturnQuantileConfig] = None,
                       volatility_config: Optional[VolatilityModelConfig] = None,
+                      range_config: Optional[RangeSurvivalConfig] = None,
                       n_folds: int = 3, embargo_sessions: int = 1) -> dict:
-    """Train the full PR 4 suite; returns {"group", "reports"}."""
+    """Train the full PR 4 suite (+ range survival); returns {"group", "reports"}."""
     d = train_direction_models(frame, config=direction_config,
                                n_folds=n_folds,
                                embargo_sessions=embargo_sessions)
@@ -359,12 +444,17 @@ def train_model_group(frame: TrainingFrame, *,
     v = train_volatility_model(frame, config=volatility_config,
                                n_folds=n_folds,
                                embargo_sessions=embargo_sessions)
+    rs = train_range_survival_models(frame, config=range_config,
+                                     n_folds=n_folds,
+                                     embargo_sessions=embargo_sessions)
     group = PredictionModelGroup(direction=d["models"], quantiles=q["models"],
-                                 volatility=v["model"])
+                                 volatility=v["model"],
+                                 range_survival=rs["models"])
     return {"group": group,
             "reports": {"direction": d["horizons"], "quantiles": q["horizons"],
                         "volatility": {k: v[k] for k in
                                        ("n_labeled", "fold_metrics")},
+                        "range_survival": rs["horizons"],
                         "folds": d["folds"]}}
 
 
@@ -379,13 +469,17 @@ def _f(x) -> Optional[float]:
 def build_prediction_bundle(group: PredictionModelGroup, row: dict, *,
                             snapshot_id: str, ts: str, session_date: str,
                             symbol: str = "SPY",
-                            quality: Optional[dict] = None
+                            quality: Optional[dict] = None,
+                            structural: Optional[dict] = None,
                             ) -> PredictionBundle:
     """
     Assemble one PredictionBundle from the model group for one observation
     row. Only forecast inputs enter (§6.3) — the caller cannot pass any
     selected structure, family, conviction, or gate result because there is
     nowhere to put them. Fields whose model is missing stay None.
+
+    `structural` supplies spot/put_wall/call_wall for range-survival feature
+    rows when those are not already on `row`.
     """
     kw: dict = {}
     for h, model in group.direction.items():
@@ -401,6 +495,31 @@ def build_prediction_bundle(group: PredictionModelGroup, row: dict, *,
     if group.volatility is not None:
         v = group.volatility.predict([row])
         kw["expected_realized_move_close"] = _f(v["expected_move"][0])
+        if "expected_move" in v:
+            kw.setdefault("expected_realized_move_30m",
+                          _f(v["expected_move"][0]))
+
+    # Range survival — needs structural walls.
+    struct = dict(structural or {})
+    spot = float(struct.get("spot") or row.get("spot") or 0.0)
+    lower = struct.get("put_wall", row.get("put_wall"))
+    upper = struct.get("call_wall", row.get("call_wall"))
+    if spot > 0 and lower is not None and upper is not None:
+        feat = range_feature_row(
+            spot=spot, lower=float(lower), upper=float(upper),
+            minutes_to_close=struct.get("minutes_to_close",
+                                        row.get("minutes_to_close")),
+            expected_realized_move=_first_move(kw, row),
+            net_gex=struct.get("net_gex", row.get("net_gex")),
+            adx=struct.get("adx", row.get("adx")),
+            cvd_slope=struct.get("cvd_slope", row.get("cvd_slope")),
+        )
+        for h, model in group.range_survival.items():
+            try:
+                kw[f"p_range_survive_{h}"] = _f(model.predict_proba([feat])[0])
+            except Exception:
+                pass
+
     cov = (quality or {}).get("feature_coverage")
     return PredictionBundle(
         snapshot_id=snapshot_id, ts=ts, session_date=session_date,
@@ -410,6 +529,18 @@ def build_prediction_bundle(group: PredictionModelGroup, row: dict, *,
         feature_version=group.feature_version,
         model_versions=group.model_versions(),
         **kw)
+
+
+def _first_move(kw: dict, row: dict) -> Optional[float]:
+    for k in ("expected_realized_move_30m", "expected_realized_move_close"):
+        if kw.get(k) is not None:
+            return float(kw[k])
+    for k in ("expected_range", "straddle_breakeven"):
+        v = row.get(k)
+        if isinstance(v, (int, float)) and float(v) > 0:
+            spot = float(row.get("spot") or 0.0)
+            return float(v) / spot if spot > 0 else float(v)
+    return None
 
 
 # --------------------------------------------------------------------------- #

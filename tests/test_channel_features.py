@@ -278,7 +278,7 @@ def test_size_adjust_trims_on_opposing_breakout():
 
 def test_size_adjust_neutral_without_channel_rows():
     from decision_matrix import _channel_size_adjust
-    assert _channel_size_adjust([], "IC") == (1.0, "")
+    assert _channel_size_adjust([], "IC") == (1.0, "channels unavailable")
 
 
 def test_size_adjust_never_boosts_debit_structures():

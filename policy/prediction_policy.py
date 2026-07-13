@@ -258,10 +258,13 @@ class PredictionPolicy:
             return False
         if uncertainty > cfg.max_uncertainty_premium:
             return False
-        no_premium = any(v in {
-            "short_gamma", "below_flip", "trending", "term_backwardation",
-            "adx_trend",
-        } or str(v).startswith("adx") for v in hard_vetoes)
+        no_premium = any(
+            v in {
+                "short_gamma", "short_gamma_regime",
+                "below_flip", "below_gamma_flip",
+                "trending", "term_backwardation", "adx_trend",
+            } or str(v).startswith("adx")
+            for v in hard_vetoes)
         if no_premium:
             return False
         if implied is not None and realized is not None and implied > 0:
@@ -308,9 +311,13 @@ class PredictionPolicy:
         return True
 
     def _premium_structure(self, p_up, hard_vetoes) -> tuple[str, str]:
-        no_premium = any(v in {
-            "short_gamma", "below_flip", "trending", "term_backwardation",
-        } or str(v).startswith("adx") for v in hard_vetoes)
+        no_premium = any(
+            v in {
+                "short_gamma", "short_gamma_regime",
+                "below_flip", "below_gamma_flip",
+                "trending", "term_backwardation",
+            } or str(v).startswith("adx")
+            for v in hard_vetoes)
         if no_premium:
             return ("NT", "none")
         if p_up is None:

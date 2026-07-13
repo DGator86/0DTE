@@ -53,7 +53,53 @@ def _market_to_dict(m: MarketSnapshot) -> dict:
 def _market_from_dict(d: dict) -> MarketSnapshot:
     d = dict(d)
     d["now"] = dt.datetime.fromisoformat(d["now"])
+    # Replay honesty: old recordings omit gex_rank_warm. Defaulting True
+    # would treat a warm-up sentinel rank of 0.5 as a real weak-GEX print
+    # and re-trigger GEX_WEAK. Infer cold when the field is absent and the
+    # rank is exactly the warm-up neutral.
+    if "gex_rank_warm" not in d:
+        rank = d.get("gex_pct_rank")
+        if rank is not None and abs(float(rank) - 0.5) < 1e-12:
+            d["gex_rank_warm"] = False
+        else:
+            d["gex_rank_warm"] = True
     return MarketSnapshot(**d)
+
+
+def _option_rows_to_dict(rows) -> Optional[list]:
+    if not rows:
+        return None
+    out = []
+    for r in rows:
+        out.append({
+            "side": getattr(r, "side", None),
+            "strike": float(getattr(r, "strike", 0.0) or 0.0),
+            "oi": int(getattr(r, "oi", 0) or 0),
+            "gamma": float(getattr(r, "gamma", 0.0) or 0.0),
+            "bid": float(getattr(r, "bid", 0.0) or 0.0),
+            "ask": float(getattr(r, "ask", 0.0) or 0.0),
+            "delta": float(getattr(r, "delta", 0.0) or 0.0),
+            "volume": int(getattr(r, "volume", 0) or 0),
+            "dte_days": float(getattr(r, "dte_days", 0.0) or 0.0),
+        })
+    return out
+
+
+def _option_rows_from_dict(rows) -> Optional[list]:
+    if not rows:
+        return None
+    from spy0dte import OptionRow
+    out = []
+    for r in rows:
+        row = OptionRow(
+            side=r["side"], strike=float(r["strike"]), oi=int(r["oi"]),
+            gamma=float(r["gamma"]), bid=float(r["bid"]), ask=float(r["ask"]),
+            delta=float(r["delta"]), volume=int(r.get("volume", 0) or 0),
+        )
+        # Weekly GEX providers look for dte_days on the row.
+        row.dte_days = float(r.get("dte_days", 0) or 0)  # type: ignore[attr-defined]
+        out.append(row)
+    return out
 
 
 def _chain_to_dict(c: ChainSnapshot) -> dict:
@@ -115,6 +161,11 @@ class ChainRecorder:
                 "market": _market_to_dict(snap.market),
                 "chain": _chain_to_dict(snap.chain) if snap.chain is not None else None,
                 "bars": _bars_rows(snap.bars, self._last_bar_ts) if snap.bars is not None else [],
+                "option_rows": _option_rows_to_dict(
+                    getattr(snap, "option_rows", None)),
+                "weekly_option_rows": _option_rows_to_dict(
+                    getattr(snap, "weekly_option_rows", None)),
+                "gex_feed_source": getattr(snap, "gex_feed_source", "") or "",
             }
             self._seq += 1
             if snap.bars is not None and len(snap.bars.ts):
@@ -207,6 +258,10 @@ class RecordedFeed:
                 market=_market_from_dict(rec["market"]),
                 bars=bars,
                 chain=_chain_from_dict(rec["chain"]) if rec.get("chain") else None,
+                option_rows=_option_rows_from_dict(rec.get("option_rows")),
+                weekly_option_rows=_option_rows_from_dict(
+                    rec.get("weekly_option_rows")),
+                gex_feed_source=rec.get("gex_feed_source") or "",
             )
             yield rec.get("seq", i), ts, snap
 
@@ -242,6 +297,10 @@ class RecordedFeed:
             market=_market_from_dict(rec["market"]),
             bars=bars,
             chain=_chain_from_dict(rec["chain"]) if rec.get("chain") else None,
+            option_rows=_option_rows_from_dict(rec.get("option_rows")),
+            weekly_option_rows=_option_rows_from_dict(
+                rec.get("weekly_option_rows")),
+            gex_feed_source=rec.get("gex_feed_source") or "",
         )
 
     def settlement_price(self, session_date: str) -> Optional[float]:
