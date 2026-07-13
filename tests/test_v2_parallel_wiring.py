@@ -20,7 +20,7 @@ import pytest
 from gate_scorer import MarketSnapshot
 from prediction.inference import (
     HeuristicCandidateValueModel, heuristic_bundle_from_tick,
-    make_bundle_provider,
+    make_bundle_provider, make_physical_forecast_provider,
 )
 from prediction.contracts import PredictionBundle
 from policy.prediction_policy import PredictionPolicy, bundle_is_usable
@@ -260,6 +260,62 @@ class TestLiveStateParallel:
         assert payload["parallel"]["legacy"]["structure"] == "IC"
         assert payload["parallel"]["v2"]["structure"] == "IC"
         assert "v2_signals" in payload
+        assert "phys_v2_mean" in payload["v2_signals"]
+        assert payload.get("forecast") is None  # no v2_fc_* on this fixture
+
+
+class TestV2ObservationOnStandDown:
+    """V2 panels must populate even when legacy stands down / NT."""
+
+    def _chain_snap(self, market):
+        from rnd_extractor import ChainQuote, ChainSnapshot
+        chain = ChainSnapshot(
+            quotes=[ChainQuote(float(k), 2.0, 2.2, 2.0, 2.2)
+                    for k in range(590, 611)],
+            spot=600.0, t_years=0.001, r=0.05,
+        )
+        rows = []
+        for k in range(590, 611):
+            rows.append(OptionRow("put", float(k), 1000, 0.05, 2.0, 2.2, 0.5,
+                                  volume=200))
+            rows.append(OptionRow("call", float(k), 1000, 0.05, 2.0, 2.2, 0.5,
+                                  volume=200))
+        return TickSnapshot(
+            market=market, bars=_bars(200), chain=chain,
+            option_rows=rows, gex_feed_source="test",
+        )
+
+    def test_stand_down_journals_forecast_phys_ranker(self):
+        # Hostile / high-vol snapshot that forces regime stand_down + NT.
+        market = _market(
+            net_gex=-5e9, gamma_flip=610.0, gex_pct_rank=0.1,
+            vix9d=40.0, vix=35.0, vix3m=30.0, vvix=140.0,
+            straddle_breakeven=8.0, expected_range=6.0,
+            adx=40.0, rsi=20.0, bb_width=5.0, vwap=620.0,
+            vwap_reversion_count=5, tick_abs_mean=2000.0,
+            cvd_slope=-1.0, has_catalyst=True,
+        )
+        snap = self._chain_snap(market)
+        bp = make_bundle_provider(symbol="SPY")
+        orch = UnifiedOrchestrator(
+            feed=_Feed(snap),
+            policy_mode="shadow",
+            prediction_bundle_provider=bp,
+            physical_forecast_provider=make_physical_forecast_provider(bp),
+            candidate_value_model=HeuristicCandidateValueModel(),
+        )
+        result = orch.tick(_now())
+        assert result is not None
+        assert result.decision is None  # stand-down / NT early return
+        assert result.signals.get("v2_fc_p_up_30m") is not None
+        assert result.signals.get("phys_v2_mean") is not None
+        assert result.signals.get("phys_density_mode") is not None
+        assert result.signals.get("v2_top_candidate_id") is not None
+
+        from dashboard.state import serialize_tick_result
+        payload = serialize_tick_result(result)
+        assert payload["forecast"] is not None
+        assert "p_up_30m" in payload["forecast"]
         assert "phys_v2_mean" in payload["v2_signals"]
 
 

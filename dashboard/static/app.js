@@ -328,7 +328,7 @@
   }
 
   function renderPhysDensity(latest, live) {
-    const s = tickSignals(latest) || (live && live.v2_signals) || {};
+    const s = mergeV2Signals(latest, live);
     $("phys-mode").textContent = s.phys_density_mode || "—";
     if (s.phys_density_mode == null && s.phys_v2_mean == null && s.phys_live_ev == null) {
       $("phys-metrics").innerHTML = '<p class="empty">No physical-density signals yet</p>';
@@ -347,7 +347,7 @@
   }
 
   function renderRanker(latest, live) {
-    const s = tickSignals(latest) || (live && live.v2_signals) || {};
+    const s = mergeV2Signals(latest, live);
     const has = s.v2_top_candidate_id != null || s.v2_rank_disagreement != null
       || s.v2_utility_score != null;
     if (!has) {
@@ -366,8 +366,8 @@
     ].join("");
   }
 
-  function renderV2Playbook(latest) {
-    const s = tickSignals(latest) || {};
+  function renderV2Playbook(latest, live) {
+    const s = mergeV2Signals(latest, live);
     const t = latest || {};
     const cards = [];
     if (num(s.phys_v2_shadow_ev) != null) {
@@ -527,17 +527,44 @@
   }
 
   /* ---------------- V2 forecast bundle ---------------- */
-  function renderForecast(predPayload) {
-    const row = predPayload && predPayload.prediction;
-    const p = (row && row.predictions) || {};
-    if (!row || !Object.keys(p).length) {
-      $("forecast-sub").textContent = predPayload && predPayload.note
-        ? "unavailable" : "—";
-      $("forecast-metrics").innerHTML =
-        '<p class="empty">No PredictionBundle for this snapshot</p>';
-      return;
+  function forecastFromSignals(tick, live) {
+    const s = mergeV2Signals(tick, live);
+    const liveFc = (live && live.forecast) || {};
+    const p = { ...liveFc };
+    for (const [k, v] of Object.entries(s)) {
+      if (k.startsWith("v2_fc_") && k !== "v2_fc_mode" && k !== "v2_fc_model_version") {
+        p[k.slice(6)] = v;
+      }
     }
-    $("forecast-sub").textContent = row.mode || row.model_group_version || "bundle";
+    if (!Object.keys(p).length) return null;
+    return {
+      mode: s.v2_fc_mode || liveFc.mode || "signals",
+      model_group_version: s.v2_fc_model_version || liveFc.model_version || "",
+      uncertainty: p.uncertainty,
+      predictions: p,
+    };
+  }
+
+  function renderForecast(predPayload, tick, live) {
+    const row = predPayload && predPayload.prediction;
+    let p = (row && row.predictions) || {};
+    let sub = row && (row.mode || row.model_group_version);
+    let unc = row && row.uncertainty;
+    if (!row || !Object.keys(p).length) {
+      const fallback = forecastFromSignals(tick, live);
+      if (fallback) {
+        p = fallback.predictions;
+        sub = fallback.mode || fallback.model_group_version || "signals";
+        unc = fallback.uncertainty;
+      } else {
+        $("forecast-sub").textContent = predPayload && predPayload.note
+          ? "unavailable" : "—";
+        $("forecast-metrics").innerHTML =
+          '<p class="empty">No PredictionBundle for this snapshot</p>';
+        return;
+      }
+    }
+    $("forecast-sub").textContent = sub || "bundle";
     const cards = [
       metricCard("P(up) 30m", pct(p.p_up_30m)),
       metricCard("P(up) close", pct(p.p_up_close)),
@@ -548,8 +575,8 @@
       metricCard("Realized move 30m", fmt(p.expected_realized_move_30m, 4)),
       metricCard("Touch call wall", pct(p.p_touch_call_wall_30m)),
       metricCard("Touch put wall", pct(p.p_touch_put_wall_30m)),
-      metricCard("Uncertainty", fmt(p.uncertainty != null ? p.uncertainty : row.uncertainty, 2),
-        num(p.uncertainty != null ? p.uncertainty : row.uncertainty) > 0.5 ? "warn" : ""),
+      metricCard("Uncertainty", fmt(p.uncertainty != null ? p.uncertainty : unc, 2),
+        num(p.uncertainty != null ? p.uncertainty : unc) > 0.5 ? "warn" : ""),
       metricCard("Data quality", pct(p.data_quality)),
       metricCard("Coverage", pct(p.feature_coverage)),
     ];
@@ -1017,11 +1044,30 @@
      REGIME FIELD — continuous bias/gamma readings per journal tick
      ============================================================ */
   function tickSignals(t) {
-    let s = t.signals_json;
+    let s = t && t.signals_json;
     if (typeof s === "string") {           // older backends serve the raw JSON string
       try { s = JSON.parse(s); } catch (_) { s = null; }
     }
     return s && typeof s === "object" ? s : null;
+  }
+
+  function mergeV2Signals(tick, live) {
+    const fromLive = (live && live.v2_signals) || {};
+    const fromTick = tickSignals(tick) || {};
+    return { ...fromLive, ...fromTick };
+  }
+
+  function lastTickWithV2(ticks) {
+    for (let i = ticks.length - 1; i >= 0; i--) {
+      const s = tickSignals(ticks[i]);
+      if (!s) continue;
+      if (s.phys_v2_mean != null || s.v2_fc_p_up_30m != null
+          || s.v2_top_candidate_id != null || s.v2_rank_disagreement != null
+          || s.phys_density_mode != null) {
+        return ticks[i];
+      }
+    }
+    return ticks.length ? ticks[ticks.length - 1] : null;
   }
 
   // Direction bias in [-1, +1] (+1 bull). Prefers the continuous matrix bias
@@ -2155,9 +2201,10 @@
       renderPlaybook(candidate, live);
       renderParallel(live, latest);
       renderPolicy(latest);
-      renderPhysDensity(latest, live);
-      renderRanker(latest, live);
-      renderV2Playbook(candidate);
+      const v2Tick = lastTickWithV2(ticks) || latest;
+      renderPhysDensity(v2Tick, live);
+      renderRanker(v2Tick, live);
+      renderV2Playbook(candidate, live);
       renderRegime(live);
       renderReason(live, candidate);
       renderWhy(live);
@@ -2180,13 +2227,14 @@
       renderTimeline(history);
       staleNote(live, market);
 
-      // PredictionBundle for the latest tick (separate store; optional).
-      if (latest && latest.snapshot_id) {
-        api("/api/predictions?snapshot_id=" + encodeURIComponent(latest.snapshot_id))
-          .then(renderForecast)
-          .catch(() => renderForecast(null));
+      // PredictionBundle: prefer store lookup, fall back to journaled v2_fc_*.
+      const forecastTick = v2Tick || latest;
+      if (forecastTick && forecastTick.snapshot_id) {
+        api("/api/predictions?snapshot_id=" + encodeURIComponent(forecastTick.snapshot_id))
+          .then((payload) => renderForecast(payload, forecastTick, live))
+          .catch(() => renderForecast(null, forecastTick, live));
       } else {
-        renderForecast(null);
+        renderForecast(null, forecastTick, live);
       }
 
       lastChartData = { ticks, live, market, trades };
