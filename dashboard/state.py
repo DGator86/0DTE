@@ -166,6 +166,7 @@ def serialize_tick_result(
     raw_signals = getattr(result, "signals", None) or {}
     v2_keys = (
         "policy_", "v2_", "phys_", "gex_", "legacy_policy_", "pin_", "cf_",
+        "cone_",
     )
     v2_signals = {
         k: v for k, v in raw_signals.items()
@@ -209,6 +210,34 @@ def serialize_tick_result(
         },
     }
 
+    # MTF sigma cones (live panes) — prefer orchestrator cache via result attr.
+    sigma_cones = getattr(result, "sigma_cones", None)
+    if sigma_cones is None and hasattr(result, "signals"):
+        # Reconstruct a minimal 5m pane from flat signals when live cache absent.
+        if raw_signals.get("cone_primary_tf"):
+            bands = []
+            for k, tag in ((0.5, "0p5"), (1.0, "1p0"), (2.0, "2p0")):
+                lo = raw_signals.get(f"cone_{tag}_lo")
+                hi = raw_signals.get(f"cone_{tag}_hi")
+                if lo is None or hi is None:
+                    continue
+                bands.append({
+                    "sigma": k,
+                    "lo": lo,
+                    "hi": hi,
+                    "mid": raw_signals.get(f"cone_{tag}_mid"),
+                    "horizon_min": raw_signals.get(f"cone_{tag}_horizon_min"),
+                })
+            if bands:
+                sigma_cones = {
+                    "model_version": raw_signals.get("cone_model_version"),
+                    "panes": [{
+                        "timeframe": raw_signals.get("cone_primary_tf"),
+                        "spot": raw_signals.get("cone_spot"),
+                        "bands": bands,
+                    }],
+                }
+
     payload = {
         "ts": result.ts.isoformat(),
         "status": "live",
@@ -223,6 +252,7 @@ def serialize_tick_result(
         "v2_signals": v2_signals,
         "forecast": forecast or None,
         "parallel": parallel,
+        "sigma_cones": sigma_cones,
     }
     return payload
 

@@ -801,6 +801,43 @@ html, body {
 .val-track-split .val-h3 { margin-top: 0; }
 .tj-track-cell { white-space: nowrap; }
 .tj-track-cell .chips { gap: 4px; }
+
+/* ---- Prediction / sigma cones ---- */
+.cone-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.cone-pane {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+.cone-pane .cone-tf {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.cone-band {
+  display: grid;
+  grid-template-columns: 48px 1fr auto;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+.cone-band:first-of-type { border-top: none; }
+.cone-band .sig { font-family: var(--mono); color: var(--blue, #4aa8ff); font-weight: 700; }
+.cone-band .rng { font-family: var(--mono); }
+.cone-band .hz { font-family: var(--mono); color: var(--muted); font-size: 11px; }
+.pred-match-in { color: var(--green); }
+.pred-match-out { color: var(--red); }
 #sigcorr-rows .val-corr-row { padding: 3px 0; border-bottom: 1px solid var(--border); }
 #sigcorr-rows .val-corr-row:last-child { border-bottom: none; }
 @media (max-width: 700px) {

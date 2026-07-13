@@ -1902,20 +1902,141 @@
   }
 
   /* ---------------- trade journal tab ---------------- */
+  /* ---------------- prediction tab (MTF sigma cones) ---------------- */
+  let predSettledFilter = "";
+  let predTfFilter = "";
+
+  function renderLiveCones(live) {
+    const cones = (live && live.sigma_cones) || {};
+    const panes = cones.panes || [];
+    $("pred-live-sub").textContent = cones.model_version
+      ? `${cones.model_version} · live`
+      : "live · MTF";
+    if (!panes.length) {
+      $("pred-cone-panes").innerHTML = '<p class="empty">Awaiting first cone tick</p>';
+      return;
+    }
+    $("pred-cone-panes").innerHTML = `<div class="cone-grid">${panes.map((p) => {
+      const bands = (p.bands || []).map((b) => `
+        <div class="cone-band">
+          <span class="sig">${esc(String(b.sigma))}σ</span>
+          <span class="rng">${fmt(b.lo, 2)} – ${fmt(b.hi, 2)}</span>
+          <span class="hz">+${fmt(b.horizon_min, 0)}m</span>
+        </div>`).join("");
+      return `<div class="cone-pane">
+        <div class="cone-tf">${esc(p.timeframe)} · spot ${fmt(p.spot, 2)}</div>
+        ${bands}
+      </div>`;
+    }).join("")}</div>`;
+  }
+
+  function renderConeCoverage(cov) {
+    cov = cov || {};
+    const n = cov.n_settled || 0;
+    $("pred-cov-sub").textContent = n ? `${n} settled` : "—";
+    const hit = num(cov.hit_rate);
+    $("pred-coverage-metrics").innerHTML = [
+      metricCard("Settled bands", n || "—"),
+      metricCard("Inside band", cov.n_inside != null ? String(cov.n_inside) : "—",
+        hit != null && hit >= 0.5 ? "pos" : ""),
+      metricCard("Hit rate", hit != null ? pct(hit) : "—",
+        hit != null && hit >= 0.5 ? "pos" : hit != null ? "warn" : ""),
+    ].join("");
+    const by = cov.by_sigma || {};
+    const keys = Object.keys(by).sort((a, b) => num(a) - num(b));
+    if (!keys.length) {
+      $("pred-coverage-by-sigma").innerHTML =
+        '<p class="empty">No settled cones yet — bands match true spot when their horizon elapses</p>';
+      return;
+    }
+    $("pred-coverage-by-sigma").innerHTML = `<div class="metrics">${keys.map((k) => {
+      const s = by[k] || {};
+      return metricCard(`${k}σ hit`, s.hit_rate != null
+        ? `${pct(s.hit_rate)} (n=${s.n})` : "—",
+        num(s.hit_rate) >= 0.5 ? "pos" : "warn");
+    }).join("")}</div>`;
+  }
+
+  function renderConeJournal(rows) {
+    rows = rows || [];
+    $("pred-jrn-count").textContent = String(rows.length);
+    $("pred-empty").classList.toggle("hidden", rows.length > 0);
+    $("pred-table").classList.toggle("hidden", rows.length === 0);
+    $("pred-body").innerHTML = rows.map((r) => {
+      const settled = num(r.settled) === 1;
+      const inside = num(r.inside) === 1;
+      const match = !settled ? '<span class="tj-dim">open</span>'
+        : inside ? '<span class="pred-match-in">inside</span>'
+        : `<span class="pred-match-out">${esc(r.coverage_note || "out")}</span>`;
+      const err = settled && num(r.error_mid) != null
+        ? sign(r.error_mid, 2) : "—";
+      return `<tr>
+        <td class="mono">${esc((r.ts || "").slice(0, 16).replace("T", " "))}</td>
+        <td class="mono">${esc(r.timeframe || "—")}</td>
+        <td class="mono">${fmt(r.sigma, 1)}σ</td>
+        <td class="mono">${fmt(r.spot, 2)}</td>
+        <td class="mono">${fmt(r.lo, 2)} – ${fmt(r.hi, 2)}</td>
+        <td class="mono">+${fmt(r.horizon_min, 0)}m</td>
+        <td class="mono">${esc((r.settle_by || "").slice(11, 16) || "—")}</td>
+        <td class="mono">${settled ? fmt(r.realized_spot, 2) : "—"}</td>
+        <td>${match}</td>
+        <td class="mono ${num(r.error_mid) > 0 ? "pos" : num(r.error_mid) < 0 ? "neg" : ""}">${err}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  async function refreshPrediction(liveOpt) {
+    try {
+      if (liveOpt) renderLiveCones(liveOpt);
+      const q = new URLSearchParams({ limit: "200" });
+      if (predSettledFilter !== "") q.set("settled", predSettledFilter === "1" ? "true" : "false");
+      if (predTfFilter) q.set("timeframe", predTfFilter);
+      const data = await api("/api/sigma-cones?" + q.toString());
+      renderConeCoverage(data.coverage);
+      renderConeJournal(data.rows || []);
+      if (data.note && !(data.rows || []).length) {
+        $("pred-empty").textContent = data.note;
+        $("pred-empty").classList.remove("hidden");
+      }
+    } catch (e) {
+      if (e.message !== "Unauthorized") console.warn("prediction", e);
+    }
+  }
+
+  function initPredictionControls() {
+    document.querySelectorAll("#pred-filters .val-filter").forEach((el) => {
+      el.addEventListener("click", () => {
+        if (el.hasAttribute("data-tf")) {
+          predTfFilter = el.dataset.tf || "";
+          predSettledFilter = "";
+        } else {
+          predSettledFilter = el.dataset.settled || "";
+          predTfFilter = "";
+        }
+        document.querySelectorAll("#pred-filters .val-filter")
+          .forEach((b) => b.classList.toggle("active", b === el));
+        refreshPrediction();
+      });
+    });
+  }
+
   let activeTab = "legacy";
 
   function switchTab(tab) {
     activeTab = tab;
     $("tab-legacy").classList.toggle("active", tab === "legacy");
     $("tab-v2").classList.toggle("active", tab === "v2");
+    $("tab-prediction").classList.toggle("active", tab === "prediction");
     $("tab-journal").classList.toggle("active", tab === "journal");
     $("tab-validation").classList.toggle("active", tab === "validation");
     $("tab-learning").classList.toggle("active", tab === "learning");
     $("view-legacy").classList.toggle("hidden", tab !== "legacy");
     $("view-v2").classList.toggle("hidden", tab !== "v2");
+    $("view-prediction").classList.toggle("hidden", tab !== "prediction");
     $("view-journal").classList.toggle("hidden", tab !== "journal");
     $("view-validation").classList.toggle("hidden", tab !== "validation");
     $("view-learning").classList.toggle("hidden", tab !== "learning");
+    if (tab === "prediction") refreshPrediction();
     if (tab === "journal") refreshJournal();
     if (tab === "validation") refreshValidation();
     if (tab === "learning") refreshLearning();
@@ -2549,6 +2670,7 @@
     if (activeTab === "journal") refreshJournal();
     if (activeTab === "validation") refreshValidation();
     if (activeTab === "learning") refreshLearning();
+    if (activeTab === "prediction") refreshPrediction();
     try {
       let [live, market, history, report, paper, readiness, trades, valLatest, pendingPromos] = await Promise.all([
         api("/api/live"),
@@ -2615,6 +2737,7 @@
       renderV2Timeline(history);
       staleNote(live, market);
       if (activeTab === "learning") renderLearningV2Status(live);
+      if (activeTab === "prediction") renderLiveCones(live);
 
       // PredictionBundle: prefer store lookup, fall back to journaled v2_fc_*.
       const forecastTick = v2Tick || latest;
@@ -2795,11 +2918,13 @@
     showApp();
     $("tab-legacy").addEventListener("click", () => switchTab("legacy"));
     $("tab-v2").addEventListener("click", () => switchTab("v2"));
+    $("tab-prediction").addEventListener("click", () => switchTab("prediction"));
     $("tab-journal").addEventListener("click", () => switchTab("journal"));
     $("tab-validation").addEventListener("click", () => switchTab("validation"));
     $("tab-learning").addEventListener("click", () => switchTab("learning"));
     initValidationControls();
     initJournalControls();
+    initPredictionControls();
     initChartControls();
     loadMarketStatus();
     refresh();

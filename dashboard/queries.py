@@ -358,6 +358,41 @@ def fetch_prediction_for_snapshot(
     }
 
 
+def fetch_sigma_cone_journal(
+    *,
+    prediction_db: str = "",
+    session_date: Optional[str] = None,
+    timeframe: Optional[str] = None,
+    settled: Optional[bool] = None,
+    limit: int = 200,
+) -> dict:
+    """
+    Read MTF sigma-cone journal + coverage stats from PredictionStore.
+    Degrades gracefully when the DB / table is missing.
+    """
+    if not prediction_db or not _db_exists(prediction_db):
+        return {
+            "rows": [],
+            "coverage": {"n_settled": 0, "hit_rate": None, "by_sigma": {}},
+            "note": "prediction database not found",
+        }
+    try:
+        from prediction.storage import PredictionStore
+        store = PredictionStore(db_path=prediction_db)
+        rows = store.fetch_sigma_cones(
+            session_date=session_date, timeframe=timeframe,
+            settled=settled, limit=limit)
+        coverage = store.sigma_cone_coverage(session_date=session_date)
+        store.conn.close()
+        return {"rows": rows, "coverage": coverage, "note": None}
+    except Exception as exc:
+        return {
+            "rows": [],
+            "coverage": {"n_settled": 0, "hit_rate": None, "by_sigma": {}},
+            "note": f"sigma cone journal unavailable: {exc}",
+        }
+
+
 def paper_trades_journal(paper_db_path: str, live_state_path: str = "",
                           limit: int = 200) -> dict:
     """Trade journal: open positions (from live_state, marked every tick) plus

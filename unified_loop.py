@@ -94,6 +94,8 @@ class TickResult:
     ras_results: list = field(default_factory=list)
     # Observation signals (policy / phys / gex / v2) for live_state + dashboard.
     signals: dict = field(default_factory=dict)
+    # MTF sigma-cone panes for the Prediction tab (also journaled in store).
+    sigma_cones: Optional[dict] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -651,6 +653,52 @@ class UnifiedOrchestrator:
                     log.warning("champion fallback also failed: %s", exc2)
             return None
 
+    def _emit_and_settle_sigma_cones(self, now: dt.datetime, snapshot_id: str,
+                                     snap, signals: dict) -> None:
+        """
+        Build MTF sigma cones, journal them, settle due bands vs true spot.
+
+        Observation-only: never gates. Failures are logged and skipped.
+        """
+        try:
+            from prediction.sigma_cone import (
+                build_mtf_cones, cones_to_signals, cones_live_summary,
+            )
+            from prediction.dataset import session_metadata
+
+            market = snap.market
+            spot = float(getattr(market, "spot", 0.0) or 0.0)
+            if spot <= 0:
+                self._tick_sigma_cones = None
+                return
+
+            meta = session_metadata(now)
+            session_date = (meta.get("session_date")
+                            or now.astimezone(ET).date().isoformat())
+            mtc = meta.get("minutes_to_close")
+
+            cones = build_mtf_cones(
+                snapshot_id=snapshot_id,
+                ts=now,
+                session_date=session_date,
+                spot=spot,
+                market=market,
+                signals=signals,
+                minutes_to_close=mtc,
+            )
+            signals.update(cones_to_signals(cones))
+            self._tick_sigma_cones = cones_live_summary(cones)
+
+            store = self.prediction_store
+            if store is not None and hasattr(store, "log_sigma_cones"):
+                store.log_sigma_cones(cones)
+                now_et = now if now.tzinfo else now.replace(tzinfo=ET)
+                now_iso = now_et.astimezone(ET).isoformat()
+                store.settle_sigma_cones(now_iso, spot, realized_ts=now_iso)
+        except Exception as exc:
+            log.warning("sigma cone emit/settle failed: %s", exc)
+            self._tick_sigma_cones = None
+
     def _next_snapshot_id(self, now: dt.datetime) -> str:
         """Stable per-tick observation id (PR 3): SHA256 of symbol |
         normalized ET timestamp | feature version | per-session sequence."""
@@ -944,6 +992,13 @@ class UnifiedOrchestrator:
         # and disagreement are journaled. Champion: V2 drives structure /
         # stand-down with explicit fallback_legacy when the bundle is missing.
         policy_route = self._route_policy(snap, signals, intent, regime_state)
+
+        # ---- MTF sigma cones (outward-looking prediction journal) ----
+        # Emit after policy so bias/vol signals exist; settle due bands against
+        # the true spot on every tick so coverage is measurable.
+        self._emit_and_settle_sigma_cones(
+            now, snapshot_id, snap, signals)
+
         live_structure = intent.decision.structure
         live_direction = intent.decision.direction
         live_size_mult = float(intent.size_mult)
@@ -1010,6 +1065,7 @@ class UnifiedOrchestrator:
                 vetoes=regime_state.vetoes, snapshot=snap,
                 ras_results=ras_results,
                 signals=pub_signals,
+                sigma_cones=getattr(self, "_tick_sigma_cones", None),
             )
             if self.journal:
                 row = _no_trade_row(snap.market, intent, regime_state,
@@ -1176,6 +1232,7 @@ class UnifiedOrchestrator:
             vetoes=regime_state.vetoes, snapshot=snap,
             ras_results=ras_results,
             signals=pub_signals,
+            sigma_cones=getattr(self, "_tick_sigma_cones", None),
         )
 
     def run_replay(self, timestamps: Sequence[dt.datetime]) -> list[TickResult]:
@@ -1200,12 +1257,23 @@ class UnifiedOrchestrator:
 
     def settle(self, session_date: str) -> int:
         self._save_state()                       # end-of-day flush of adaptive scales
-        if self.journal is None:
-            return 0
-        price = self.feed.settlement_price(session_date)
-        if price is None:
-            return 0
-        return self.journal.settle_session(session_date, price)
+        n = 0
+        if self.journal is not None:
+            price = self.feed.settlement_price(session_date)
+            if price is not None:
+                n = self.journal.settle_session(session_date, price)
+                # Force-settle any remaining cone bands for the session against
+                # the official settlement price so the prediction journal closes.
+                store = self.prediction_store
+                if store is not None and hasattr(store, "settle_sigma_cones"):
+                    try:
+                        # Far-future ISO so every unsettled band for the day is due.
+                        far = f"{session_date}T23:59:59-04:00"
+                        store.settle_sigma_cones(far, float(price),
+                                                 realized_ts=far)
+                    except Exception as exc:
+                        log.warning("sigma cone EOD settle failed: %s", exc)
+        return n
 
 
 # --------------------------------------------------------------------------- #

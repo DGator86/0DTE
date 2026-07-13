@@ -22,6 +22,7 @@ from dashboard.queries import (
     candidate_configs,
     feature_scores,
     fetch_prediction_for_snapshot,
+    fetch_sigma_cone_journal,
     gex_variant_summary,
     journal_fetch,
     journal_max_id,
@@ -176,6 +177,23 @@ async def api_predictions(
         snapshot_id,
         prediction_db=_config.get("prediction_db", "prediction_store.sqlite"),
         journal_db=_config.get("db", "shadow.db"),
+    )
+
+
+@app.get("/api/sigma-cones")
+async def api_sigma_cones(
+    session_date: Optional[str] = Query(None),
+    timeframe: Optional[str] = Query(None),
+    settled: Optional[bool] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """MTF sigma-cone prediction journal + coverage vs realized spot."""
+    return fetch_sigma_cone_journal(
+        prediction_db=_config.get("prediction_db", "prediction_store.sqlite"),
+        session_date=session_date,
+        timeframe=timeframe,
+        settled=settled,
+        limit=limit,
     )
 
 
