@@ -1,0 +1,37 @@
+[Unit]
+# Evening learning: post-close walk-forward backtests + parameter search over
+# recorded ticks. Stages candidate configs for human review (never auto-writes
+# champion.json). Populates the dashboard Learning tab.
+Description=0DTE evening learning cycle (optimize candidate settings)
+After=network-online.target zerodte-validate-daily.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zerodte
+Group=zerodte
+WorkingDirectory=/opt/zerodte
+EnvironmentFile=/etc/zerodte/zerodte.env
+# Persist candidates/champion under /var/lib so ProtectSystem=strict + deploys
+# cannot wipe them. Reports land beside the journal.
+ExecStart=/opt/zerodte/venv/bin/python -m adaptive_learning.learner \
+    --mode evening \
+    --db /var/lib/zerodte/shadow.db \
+    --record-dir /var/lib/zerodte/ticks \
+    --configs-dir /var/lib/zerodte/configs \
+    --reports-dir /var/lib/zerodte/reports/promotion \
+    --trials 20 \
+    --folds 3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zerodte
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-learn-evening
+
+# Insufficient history / no_action are successful soft outcomes (exit 0).
+SuccessExitStatus=0

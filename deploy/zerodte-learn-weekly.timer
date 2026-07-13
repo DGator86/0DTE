@@ -1,0 +1,11 @@
+[Unit]
+# Sunday evening deep optimize — after weekly validation (18:00 ET).
+Description=Run the 0DTE weekly learning / backtest optimize cycle
+
+[Timer]
+OnCalendar=Sun 19:00 America/New_York
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

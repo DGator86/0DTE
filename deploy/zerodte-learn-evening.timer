@@ -1,0 +1,12 @@
+[Unit]
+# Weekday evening optimize: after validation (17:15) and settlement (16:15).
+# 17:45 ET leaves buffer for the daily validation oneshot to finish.
+Description=Run the 0DTE evening learning / backtest optimize cycle
+
+[Timer]
+OnCalendar=Mon..Fri 17:45 America/New_York
+RandomizedDelaySec=180
+Persistent=true
+
+[Install]
+WantedBy=timers.target

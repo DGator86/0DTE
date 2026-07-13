@@ -93,6 +93,22 @@ case "$CMD" in
         --db "$DB" --record-dir /var/lib/zerodte/ticks
     ;;
 
+  learn)
+    # Run the adaptive learner on demand (ARG: evening | weekly | daily; default evening).
+    # Evening/weekly optimize candidate settings from recorded ticks; daily is
+    # diagnostics-only. Candidates stage under /var/lib/zerodte/configs for
+    # human promotion (promoter --approve); never auto-writes champion.json.
+    mode="${ARG:-evening}"
+    case "$mode" in daily|evening|weekly) ;; *) echo "learn arg must be 'daily', 'evening', or 'weekly'"; exit 2 ;; esac
+    trials=20; folds=3
+    case "$mode" in weekly) trials=40; folds=5 ;; daily) trials=30; folds=4 ;; esac
+    as_svc "$PY" -m adaptive_learning.learner --mode "$mode" \
+        --db "$DB" --record-dir /var/lib/zerodte/ticks \
+        --configs-dir /var/lib/zerodte/configs \
+        --reports-dir /var/lib/zerodte/reports/promotion \
+        --trials "$trials" --folds "$folds"
+    ;;
+
   test-notify)
     # Send a test push through the SAME ntfy path real trade signals use, reading
     # the topic from the 0600 env file (as root). The topic is never printed —
@@ -121,7 +137,7 @@ PYEOF
 
   *)
     echo "Unknown command: $CMD" >&2
-    echo "Valid: status | logs | report | paper-report | diagnose-tradier | diagnose-tastytrade | restart | settle | validate | test-notify" >&2
+    echo "Valid: status | logs | report | paper-report | diagnose-tradier | diagnose-tastytrade | restart | settle | validate | learn | test-notify" >&2
     exit 2
     ;;
 esac

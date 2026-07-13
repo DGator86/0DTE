@@ -84,6 +84,25 @@ systemctl daemon-reload
 systemctl enable --now zerodte-validate-daily.timer >/dev/null 2>&1 || true
 systemctl enable --now zerodte-validate-weekly.timer >/dev/null 2>&1 || true
 
+log "Learning timers (evening optimize + weekly deep optimize)"
+# Durable configs/reports under the data dir (survives /opt resets; writable
+# under ProtectSystem=strict). Seed from repo configs/ on first boot only.
+mkdir -p "$DATA_DIR/configs/candidates" "$DATA_DIR/configs/promoted" \
+         "$DATA_DIR/configs/archive" "$DATA_DIR/reports/promotion" \
+         "$DATA_DIR/ticks"
+if [ ! -f "$DATA_DIR/configs/champion.json" ] \
+   && [ -f "$APP_DIR/configs/champion.json" ]; then
+    cp -a "$APP_DIR/configs/champion.json" "$DATA_DIR/configs/champion.json"
+fi
+chown -R "$SVC_USER:$SVC_USER" "$DATA_DIR/configs" "$DATA_DIR/reports" "$DATA_DIR/ticks"
+for unit in zerodte-learn-evening zerodte-learn-weekly; do
+    install -m 644 "$APP_DIR/deploy/$unit.service" "/etc/systemd/system/$unit.service"
+    install -m 644 "$APP_DIR/deploy/$unit.timer" "/etc/systemd/system/$unit.timer"
+done
+systemctl daemon-reload
+systemctl enable --now zerodte-learn-evening.timer >/dev/null 2>&1 || true
+systemctl enable --now zerodte-learn-weekly.timer >/dev/null 2>&1 || true
+
 if [ ! -f "$ENV_FILE" ]; then
     # printf renders the color; a plain heredoc can't interpret \033 escapes
     # and would print them literally — and this is the first-run message.
