@@ -116,6 +116,9 @@ class ClassifierContext:
     # volatility_channel_features.channel_features_from_bars (the caller owns
     # the bar stream). Empty dict -> channel features read None (reliability 0).
     channel: dict = field(default_factory=dict)
+    # Shared pin assessment from unified_loop (same object as matrix / gate).
+    # When set, soft-exempt uses this instead of a second assess_pin call.
+    pin: Optional[object] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -427,10 +430,15 @@ class RegimeClassifier:
         # Pin soft-exempt: keep the veto string for the journal, but do not
         # block the premium_selling engine — otherwise compression is knocked
         # to ≤15 and breakout/trend always wins on a glued-to-flip tape.
+        # Prefer the shared tick pin from unified_loop so classifier + matrix
+        # cannot disagree on pin_active.
         try:
             from pin_regime import assess_pin, pin_soft_exempt_vetoes
-            pin = assess_pin(ctx.market, channel=getattr(ctx, "channel", None) or {})
-            if pin.is_pin:
+            pin = getattr(ctx, "pin", None)
+            if pin is None:
+                pin = assess_pin(
+                    ctx.market, channel=getattr(ctx, "channel", None) or {})
+            if getattr(pin, "is_pin", False):
                 soft = pin_soft_exempt_vetoes()
                 vetoes = [
                     (reason, (set() if reason in soft else eng))

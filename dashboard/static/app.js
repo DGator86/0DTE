@@ -635,7 +635,19 @@
       html = `<b>Standing down.</b> ${esc((w.stand_down_reason || "regime veto").replace(/_/g, " "))}.`;
       if (arr(w.dealer_vetoes).length) html += ` Dealer flags: ${esc(arr(w.dealer_vetoes).join(", "))}.`;
     } else if (d.decision === "TRADE" && d.gate_pass) {
-      html = `<b>Trade armed.</b> ${esc(d.structure || "")} ${esc(d.direction || "")} via <b>${esc(d.permitted_engine || "engine")}</b> in a ${esc(d.dominant_regime || "")} regime. `;
+      const credit = ["PCS", "CCS", "IC", "IF"].includes(d.structure);
+      const via = credit
+        ? (d.permitted_engine || "premium")
+        : (d.structure === "STG" || d.structure === "BKS"
+          ? (d.permitted_engine || "vol")
+          : "directional debit");
+      html = `<b>Trade armed.</b> ${esc(d.structure || "")} ${esc(d.direction || "")} as <b>${esc(via)}</b> in a ${esc(d.dominant_regime || "")} regime. `;
+      if (credit && d.permitted_engine && d.permitted_engine !== "premium_selling") {
+        html += `<i>(classifier engine ${esc(d.permitted_engine)})</i> `;
+      }
+      if (!credit && d.permitted_engine === "premium_selling") {
+        html += `<i>(classifier said premium_selling — structure is debit)</i> `;
+      }
       html += `Gate scored <b>${fmt(d.gate_score, 1)}</b>`;
       if (w.capture) html += `, targeting <b>${esc(w.capture)}</b>`;
       if (w.strike_rule) html += ` with strike rule ${esc(w.strike_rule)}`;

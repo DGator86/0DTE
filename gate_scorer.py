@@ -275,9 +275,10 @@ def evaluate_gates(s: MarketSnapshot, cfg: GateConfig,
             f"(+{cfg.flip_buffer_frac:.2%} buffer)"
         )
 
-    # 3. Term structure not inverted (contango) — still hard under pin
+    # 3. Term structure not inverted (contango) — soft-exempt under pin so
+    # short-gamma pin days with mild backwardation can still sell theta.
     ratio = s.vix9d / s.vix if s.vix else float("inf")
-    if ratio >= cfg.contango_ratio_max or s.vix >= s.vix3m:
+    if (ratio >= cfg.contango_ratio_max or s.vix >= s.vix3m) and not pin_active:
         failed.append(
             f"TERM_INVERTED: VIX9D/VIX={ratio:.3f}, VIX={s.vix:.2f} vs VIX3M={s.vix3m:.2f} "
             "(stress/backwardation = breakout risk)"

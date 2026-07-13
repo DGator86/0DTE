@@ -296,8 +296,9 @@ def decide_from_matrix(rows: list, regimes: dict,
     Collapse the MTF matrix into a TradeIntent.
 
     `pin` is an optional PinAssessment (pin_regime.assess_pin). When active:
-      * breakout exec/context axes remapped toward compression (sell theta
-        into the pin instead of buying breakout premium)
+      * BOTH exec and context axes forced to compression (sell theta into the
+        pin — trend×compression→LPS and breakout debit cells are the failure
+        mode this overrides)
       * short_gamma / below_flip / trending soft-exempted from the credit→debit
         flip so IC/IF/PCS/CCS can survive
       * very tight pins upgrade IC → IF
@@ -326,15 +327,14 @@ def decide_from_matrix(rows: list, regimes: dict,
     raw_exec, raw_ctx = exec_r, ctx_r
     note_parts: list[str] = []
 
-    # Pin: breakout label with spot glued to the flip is usually a mis-route.
-    if pin_active:
-        if exec_r == "breakout":
-            exec_r = "compression"
-        if ctx_r == "breakout":
-            ctx_r = "compression"
-        if (raw_exec, raw_ctx) != (exec_r, ctx_r):
-            note_parts.append(
-                f"pin override: {raw_exec}/{raw_ctx}→{exec_r}/{ctx_r}")
+    # Pin harvest: force the compression×compression credit cells. Leaving
+    # exec=trend intact kept trend×compression→LPS (long put spread) firing
+    # while spot was glued to the flip with permitted_engine=premium_selling.
+    if pin_active and (exec_r != "compression" or ctx_r != "compression"):
+        note_parts.append(
+            f"pin force: {raw_exec}/{raw_ctx}→compression/compression")
+        exec_r = "compression"
+        ctx_r = "compression"
 
     decision = DECISION_TABLE[(exec_r, ctx_r, dir_label)]
     raw_structure = decision.structure
@@ -350,6 +350,27 @@ def decide_from_matrix(rows: list, regimes: dict,
             decision.anchor_tf,
         )
         note_parts.append("pin upgrade: IC→IF")
+
+    # Safety net: any remaining debit under pin → direction-leaned credit.
+    if pin_active and decision.structure not in PREMIUM_STRUCTURES:
+        if dir_label == "bull":
+            decision = Decision(
+                "PCS", "put", "MED",
+                "pin harvest: put credit into flip",
+                "short put under spot / put wall; wing below", "15m")
+        elif dir_label == "bear":
+            decision = Decision(
+                "CCS", "call", "MED",
+                "pin harvest: call credit into flip",
+                "short call over spot / call wall; wing above", "15m")
+        else:
+            decision = Decision(
+                "IF" if getattr(pin, "prefer_fly", False) else "IC",
+                "both", "MED",
+                "pin harvest: neutral credit at flip",
+                "shorts near flip / inside walls", "15m")
+        size = SIZE[decision.conviction]
+        note_parts.append(f"pin debit→credit: {raw_structure}→{decision.structure}")
 
     # dealer-state vetoes override premium-selling cells — unless pin soft-exempts
     hard_stop = any(v.startswith("catalyst") for v in vetoes)

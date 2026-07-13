@@ -833,9 +833,15 @@ class UnifiedOrchestrator:
             if isinstance(v, (int, float)) and math.isfinite(v):
                 signals[f"chan_{k}"] = float(v)
 
+        # One pin assessment per tick — shared by classifier, matrix, gate,
+        # selector, and V2 policy so labels cannot disagree with structure.
+        from pin_regime import assess_pin, pin_to_signals
+        pin = assess_pin(snap.market, signals=signals, channel=channel)
+        signals.update(pin_to_signals(pin))
+
         # ---- Track B: regime classifier ----
         clf_ctx = ClassifierContext(market=snap.market, rnd=rnd, edge=edge,
-                                    channel=channel)
+                                    channel=channel, pin=pin)
         regime_state = self._classifier.classify(clf_ctx, self._prev_std)
         self._prev_std = regime_state.standardized
 
@@ -859,13 +865,6 @@ class UnifiedOrchestrator:
         mtf_in = build_mtf_input(snap.bars, snap_dict)
         mat_rows = build_matrix(mtf_in, self._matrix_scale_book)
         regimes = regime_rows(mat_rows)
-
-        # Pin assessment (flip / wall channel) — drives premium soft-exempt +
-        # breakout→compression remap so we sell theta into pins instead of
-        # buying breakout debit while spot is glued to the flip.
-        from pin_regime import assess_pin, pin_to_signals
-        pin = assess_pin(snap.market, signals=signals, channel=channel)
-        signals.update(pin_to_signals(pin))
 
         # Raw table lookup (no pin) for counterfactual journaling.
         raw_intent = decide_from_matrix(

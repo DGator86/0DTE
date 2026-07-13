@@ -88,10 +88,26 @@ class TestMatrixPinOverride:
         pin = assess_pin(_pin_market())
         raw = decide_from_matrix(rows, regimes, vetoes=[], pin=None)
         pinned = decide_from_matrix(rows, regimes, vetoes=[], pin=pin)
-        # When raw would have been breakout on either axis, pin remaps it.
-        if raw.exec_regime == "breakout" or raw.context_regime == "breakout":
-            assert pinned.exec_regime != "breakout"
-            assert "pin override" in pinned.note
+        assert pinned.exec_regime == "compression"
+        assert pinned.context_regime == "compression"
+        assert pinned.decision.structure in PREMIUM_STRUCTURES
+        if (raw.exec_regime, raw.context_regime) != ("compression", "compression"):
+            assert "pin force" in pinned.note
+
+    def test_trend_compression_bear_becomes_credit_under_pin(self):
+        """Dashboard failure mode: trend×compression×bear → LPS while pinned."""
+        rows, regimes = self._rows_regimes()
+        pin = assess_pin(_pin_market())
+        assert pin.is_pin
+        pinned = decide_from_matrix(
+            rows, regimes,
+            vetoes=["short_gamma_regime"],
+            pin=pin,
+        )
+        assert pinned.exec_regime == "compression"
+        assert pinned.context_regime == "compression"
+        assert pinned.decision.structure in PREMIUM_STRUCTURES
+        assert pinned.decision.structure != "LPS"
 
 
 class TestGatePinExempt:
@@ -108,6 +124,16 @@ class TestGatePinExempt:
         assert not any("GEX_SHORT" in g for g in allowed.failed_gates)
         assert not any("BELOW_FLIP" in g for g in allowed.failed_gates)
         assert not any("TRENDING" in g for g in allowed.failed_gates)
+
+    def test_term_inverted_soft_exempt_under_pin(self):
+        m = _pin_market(vix9d=18.0, vix=16.0, vix3m=15.0)  # backwardation
+        blocked = evaluate(m, GateConfig(), structure_class="premium",
+                           pin_active=False)
+        assert any("TERM_INVERTED" in g for g in blocked.failed_gates)
+        allowed = evaluate(m, GateConfig(), structure_class="premium",
+                           pin_active=True)
+        assert not any("TERM_INVERTED" in g for g in allowed.failed_gates)
+        assert allowed.decision is Decision.GO
 
 
 class TestSelectorPinExempt:
