@@ -431,7 +431,7 @@ class UnifiedOrchestrator:
 
     def _run_v2_shadow_ranking(
             self, snap, signals: dict, snapshot_id: str, decide_pdf, cfg,
-            decision=None) -> None:
+            decision=None, pin_active: bool = False):
         """Observation-only candidate ranking (works without a live TRADE).
 
         Returns the (possibly annotated) decision, or the input decision when
@@ -456,7 +456,8 @@ class UnifiedOrchestrator:
                     edge_s = compute_edge(
                         rnd_s, snap.chain, cfg.rnd,
                         physical_pdf=decide_pdf)
-                    ctx_s = GammaContext.from_market_snapshot(snap.market)
+                    ctx_s = GammaContext.from_market_snapshot(
+                        snap.market, pin_active=pin_active)
                     sel_s = select_spreads(
                         snap.chain, rnd_s, edge_s, ctx_s, cfg.selector,
                         physical_pdf=decide_pdf, target_families=None)
@@ -599,6 +600,7 @@ class UnifiedOrchestrator:
                 "stand_down": bool(regime_state.stand_down) or in_warmup,
                 "implied_remaining_move": implied,
                 "session_warmup": in_warmup,
+                "pin_active": bool(signals.get("pin_active")),
             }
             pin = PolicyInput(
                 predictions=bundle,
@@ -857,7 +859,26 @@ class UnifiedOrchestrator:
         mtf_in = build_mtf_input(snap.bars, snap_dict)
         mat_rows = build_matrix(mtf_in, self._matrix_scale_book)
         regimes = regime_rows(mat_rows)
-        intent = decide_from_matrix(mat_rows, regimes, vetoes=regime_state.vetoes)
+
+        # Pin assessment (flip / wall channel) — drives premium soft-exempt +
+        # breakout→compression remap so we sell theta into pins instead of
+        # buying breakout debit while spot is glued to the flip.
+        from pin_regime import assess_pin, pin_to_signals
+        pin = assess_pin(snap.market, signals=signals, channel=channel)
+        signals.update(pin_to_signals(pin))
+
+        # Raw table lookup (no pin) for counterfactual journaling.
+        raw_intent = decide_from_matrix(
+            mat_rows, regimes, vetoes=regime_state.vetoes, pin=None)
+        intent = decide_from_matrix(
+            mat_rows, regimes, vetoes=regime_state.vetoes, pin=pin)
+        signals["pin_raw_structure"] = raw_intent.decision.structure
+        signals["pin_raw_exec"] = raw_intent.exec_regime
+        signals["pin_raw_context"] = raw_intent.context_regime
+        if pin.is_pin and raw_intent.decision.structure != intent.decision.structure:
+            signals["pin_structure_override"] = 1.0
+        else:
+            signals["pin_structure_override"] = 0.0
 
         # Observation-only regime time series for the dashboard (chart shading
         # + quadrant view): the continuous direction-bias value (0-100, 50 =
@@ -980,7 +1001,7 @@ class UnifiedOrchestrator:
                     signals["phys_density_mode"] = "vrp"
                 self._run_v2_shadow_ranking(
                     snap, signals, snapshot_id, decide_pdf, cfg,
-                    decision=None)
+                    decision=None, pin_active=bool(pin.is_pin))
             signals, signals_json = self._signals_with_ras(signals, ras_results)
             pub_signals = {k: v for k, v in signals.items()
                            if not str(k).startswith("_")}
@@ -1040,6 +1061,7 @@ class UnifiedOrchestrator:
             # Shadow EV comparison: when V2 is available but legacy still
             # prices the live decision (or vice versa), re-price the same
             # candidate set under the other density and journal both EVs.
+            pin_active = bool(pin.is_pin)
             if (v2_result is not None and self.physical_pdf is None
                     and density_mode != "v2"):
                 try:
@@ -1049,7 +1071,8 @@ class UnifiedOrchestrator:
                         target_structure=live_structure,
                         direction=live_direction,
                         physical_density_mode="v2",
-                        physical_moments=v2_result.moments)
+                        physical_moments=v2_result.moments,
+                        pin_active=pin_active)
                     if shadow.candidate is not None:
                         signals["phys_v2_shadow_ev"] = shadow.candidate.ev
                         signals["phys_v2_shadow_family"] = shadow.candidate.family
@@ -1061,16 +1084,49 @@ class UnifiedOrchestrator:
                               target_structure=live_structure,
                               direction=live_direction,
                               physical_density_mode=density_mode,
-                              physical_moments=density_moments)
+                              physical_moments=density_moments,
+                              pin_active=pin_active)
             signals["phys_density_mode"] = density_mode
             if (decision.candidate is not None
                     and isinstance(decision.candidate.ev, (int, float))):
                 signals["phys_live_ev"] = decision.candidate.ev
 
+            # Counterfactual: under pin, journal the path we did NOT take.
+            try:
+                from decision_matrix import PREMIUM_STRUCTURES
+                raw_struct = raw_intent.decision.structure
+                if pin_active and live_structure in PREMIUM_STRUCTURES:
+                    if raw_struct not in PREMIUM_STRUCTURES and raw_struct != "NT":
+                        cf = decide(
+                            snap.market, snap.chain, cfg,
+                            physical_pdf=decide_pdf,
+                            target_structure=raw_struct,
+                            direction=raw_intent.decision.direction,
+                            physical_density_mode=density_mode,
+                            pin_active=False)
+                        if cf.candidate is not None:
+                            signals["cf_debit_ev"] = cf.candidate.ev
+                            signals["cf_debit_family"] = cf.candidate.family
+                            signals["cf_debit_structure"] = raw_struct
+                elif pin_active and live_structure not in PREMIUM_STRUCTURES:
+                    cf = decide(
+                        snap.market, snap.chain, cfg,
+                        physical_pdf=decide_pdf,
+                        target_structure="IF",
+                        direction="both",
+                        physical_density_mode=density_mode,
+                        pin_active=True)
+                    if cf.candidate is not None:
+                        signals["cf_premium_ev"] = cf.candidate.ev
+                        signals["cf_premium_family"] = cf.candidate.family
+                        signals["cf_premium_structure"] = "IF"
+            except Exception as exc:
+                log.warning("pin counterfactual failed: %s", exc)
+
             # ---- V2 candidate-value shadow ranking (PR 8 / §14) ----
             annotated = self._run_v2_shadow_ranking(
                 snap, signals, snapshot_id, decide_pdf, cfg,
-                decision=decision)
+                decision=decision, pin_active=pin_active)
             if annotated is not None:
                 decision = annotated
 

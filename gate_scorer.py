@@ -243,31 +243,39 @@ def _scale(value: float, lo: float, hi: float) -> float:
 # --------------------------------------------------------------------------- #
 # Hard gates                                                                   #
 # --------------------------------------------------------------------------- #
-def evaluate_gates(s: MarketSnapshot, cfg: GateConfig) -> list[str]:
-    """Return list of failed-gate reasons. Empty list => all gates pass."""
+def evaluate_gates(s: MarketSnapshot, cfg: GateConfig,
+                   pin_active: bool = False) -> list[str]:
+    """Return list of failed-gate reasons. Empty list => all gates pass.
+
+    When ``pin_active`` is True (spot glued to flip / inside walls), soft-exempt
+    GEX_SHORT / BELOW_FLIP / TRENDING so premium-selling can harvest the pin
+    even under negative GEX. Catalyst / warmup / late lockouts still hard-fail.
+    """
     failed: list[str] = []
 
     # 1. Long-gamma regime: net GEX positive AND meaningfully large.
     # The magnitude check only applies once the rank window is warm: an
     # unwarmed window reports a neutral 0.5 ("no opinion"), and no-opinion
     # must not veto — the sign check above still protects the short-gamma case.
-    if s.net_gex <= 0:
+    # Pin soft-exempt: negative GEX with price pinned is sellable.
+    if s.net_gex <= 0 and not pin_active:
         failed.append("GEX_SHORT: net gamma <= 0 (dealers short gamma; moves amplify)")
-    elif s.gex_rank_warm and s.gex_pct_rank < cfg.min_gex_pct_rank:
+    elif s.net_gex > 0 and s.gex_rank_warm and s.gex_pct_rank < cfg.min_gex_pct_rank:
         failed.append(
             f"GEX_WEAK: |GEX| rank {s.gex_pct_rank:.2f} < {cfg.min_gex_pct_rank:.2f} "
             "(positive but too thin to pin)"
         )
 
-    # 2. Above the gamma flip, with buffer
+    # 2. Above the gamma flip, with buffer — soft-exempt under pin (spot ON
+    # the flip fails the buffer by construction).
     flip_min = s.gamma_flip * (1 + cfg.flip_buffer_frac)
-    if s.spot < flip_min:
+    if s.spot < flip_min and not pin_active:
         failed.append(
             f"BELOW_FLIP: spot {s.spot:.2f} not clear of flip {s.gamma_flip:.2f} "
             f"(+{cfg.flip_buffer_frac:.2%} buffer)"
         )
 
-    # 3. Term structure not inverted (contango)
+    # 3. Term structure not inverted (contango) — still hard under pin
     ratio = s.vix9d / s.vix if s.vix else float("inf")
     if ratio >= cfg.contango_ratio_max or s.vix >= s.vix3m:
         failed.append(
@@ -275,8 +283,9 @@ def evaluate_gates(s: MarketSnapshot, cfg: GateConfig) -> list[str]:
             "(stress/backwardation = breakout risk)"
         )
 
-    # 4. No trend present
-    if s.adx >= cfg.max_adx:
+    # 4. No trend present — soft-exempt under pin (ADX can be elevated while
+    # spot is still glued to the flip).
+    if s.adx >= cfg.max_adx and not pin_active:
         failed.append(f"TRENDING: ADX {s.adx:.1f} >= {cfg.max_adx:.0f}")
 
     # 5. No catalyst in the danger window
@@ -459,16 +468,18 @@ def score_to_kelly(score: float, cfg: GateConfig) -> float:
 # Top-level entry point                                                        #
 # --------------------------------------------------------------------------- #
 def evaluate(s: MarketSnapshot, cfg: Optional[GateConfig] = None,
-             structure_class: str = "premium", direction: str = "") -> GateResult:
+             structure_class: str = "premium", direction: str = "",
+             pin_active: bool = False) -> GateResult:
     """
     structure_class: "premium" (default — the original credit-selling gate) or
     "directional" (debit structures: universal stops only + trend-quality score).
+    pin_active: soft-exempt GEX_SHORT / BELOW_FLIP / TRENDING on the premium gate.
     """
     cfg = cfg or GateConfig()
     if structure_class == "directional":
         failed = evaluate_directional_gates(s, cfg)
     else:
-        failed = evaluate_gates(s, cfg)
+        failed = evaluate_gates(s, cfg, pin_active=pin_active)
 
     side, nearer_wall, wall_dist = pick_side(s, cfg)
 

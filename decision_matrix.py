@@ -16,8 +16,9 @@ Three decision axes, collapsed from the matrix:
 
 The full 3x3x3 = 27-cell DECISION_TABLE below enumerates every combination and
 the structure it implies. Dealer-state vetoes (catalyst, short gamma, below
-flip) override the premium-selling cells, because those are regime FACTS that
-no timeframe blend should be allowed to outvote.
+flip) override the premium-selling cells by default. When ``pin_regime``
+detects a flip/wall pin, short-gamma / below-flip / trending are soft-exempted
+and breakout axes remap toward compression so credit can survive the pin.
 
 Structure families
   IC  iron condor (neutral credit)        LCS long call spread (bull debit)
@@ -289,7 +290,18 @@ class TradeIntent:
 
 
 def decide_from_matrix(rows: list, regimes: dict,
-                       vetoes: Optional[list] = None) -> TradeIntent:
+                       vetoes: Optional[list] = None,
+                       pin=None) -> TradeIntent:
+    """
+    Collapse the MTF matrix into a TradeIntent.
+
+    `pin` is an optional PinAssessment (pin_regime.assess_pin). When active:
+      * breakout exec/context axes remapped toward compression (sell theta
+        into the pin instead of buying breakout premium)
+      * short_gamma / below_flip / trending soft-exempted from the credit→debit
+        flip so IC/IF/PCS/CCS can survive
+      * very tight pins upgrade IC → IF
+    """
     vetoes = vetoes or []
     fast_blend = _regime_blend(regimes, FAST)
     slow_blend = _regime_blend(regimes, SLOW)
@@ -310,19 +322,49 @@ def decide_from_matrix(rows: list, regimes: dict,
             bias_fast=dir_fast, bias_slow=dir_slow,
         )
 
-    decision = DECISION_TABLE[(exec_r, ctx_r, dir_label)]
-    size = SIZE[decision.conviction]
-    note = ""
+    pin_active = bool(pin is not None and getattr(pin, "is_pin", False))
+    raw_exec, raw_ctx = exec_r, ctx_r
+    note_parts: list[str] = []
 
-    # dealer-state vetoes override premium-selling cells
+    # Pin: breakout label with spot glued to the flip is usually a mis-route.
+    if pin_active:
+        if exec_r == "breakout":
+            exec_r = "compression"
+        if ctx_r == "breakout":
+            ctx_r = "compression"
+        if (raw_exec, raw_ctx) != (exec_r, ctx_r):
+            note_parts.append(
+                f"pin override: {raw_exec}/{raw_ctx}→{exec_r}/{ctx_r}")
+
+    decision = DECISION_TABLE[(exec_r, ctx_r, dir_label)]
+    raw_structure = decision.structure
+    size = SIZE[decision.conviction]
+
+    # Tight pin: prefer iron fly over wide condor when the table said IC.
+    if (pin_active and getattr(pin, "prefer_fly", False)
+            and decision.structure == "IC"):
+        decision = Decision(
+            "IF", "both", decision.conviction,
+            "pin harvest: iron fly at flip",
+            "short ATM / near flip; wings inside walls",
+            decision.anchor_tf,
+        )
+        note_parts.append("pin upgrade: IC→IF")
+
+    # dealer-state vetoes override premium-selling cells — unless pin soft-exempts
     hard_stop = any(v.startswith("catalyst") for v in vetoes)
-    no_premium = any(v in NO_PREMIUM_VETOES for v in vetoes)
+    from pin_regime import pin_soft_exempt_vetoes
+    soft = pin_soft_exempt_vetoes() if pin_active else frozenset()
+    effective_vetoes = [v for v in vetoes if v not in soft]
+    no_premium = any(v in NO_PREMIUM_VETOES for v in effective_vetoes)
+    if pin_active and soft.intersection(vetoes):
+        note_parts.append(
+            "pin soft-exempt: " + ",".join(sorted(soft.intersection(vetoes))))
 
     if hard_stop:
-        decision = DECISION_TABLE[("trend", "trend", "neutral")]  # the NT cell
         decision = Decision("NT", "none", "NONE", "catalyst hard stop", "stand down", "—")
         size = 0.0
-        note = "catalyst veto: all engines blocked"
+        note_parts = ["catalyst veto: all engines blocked"]
     elif no_premium and decision.structure in PREMIUM_STRUCTURES:
         # flip a credit structure to its directional debit cousin or stand down
         matched = ",".join(sorted(v for v in vetoes if v in NO_PREMIUM_VETOES))
@@ -338,7 +380,7 @@ def decide_from_matrix(rows: list, regimes: dict,
                                 "premium forbidden by dealer/tape state; express bias as debit",
                                 "small directional spread in bias direction", decision.anchor_tf)
             size = SIZE["LOW"]
-        note = f"premium veto ({matched}): forces directional or stand-down"
+        note_parts.append(f"premium veto ({matched}): forces directional or stand-down")
 
     # channel-based conviction adjustment (post-table, post-veto): fast-TF
     # squeeze/breakout cells nudge size, never resurrect a vetoed trade
@@ -346,12 +388,17 @@ def decide_from_matrix(rows: list, regimes: dict,
         ch_mult, ch_note = _channel_size_adjust(rows, decision.structure)
         if ch_mult != 1.0:
             size *= ch_mult
-            note = f"{note}; {ch_note}" if note else ch_note
+            if ch_note:
+                note_parts.append(ch_note)
+
+    if pin_active and raw_structure != decision.structure:
+        note_parts.append(f"pin structure: {raw_structure}→{decision.structure}")
 
     return TradeIntent(
         exec_regime=exec_r, context_regime=ctx_r,
         direction_bias=dir_label, bias_value=dir_val,
-        decision=decision, size_mult=round(size, 2), vetoes=vetoes, note=note,
+        decision=decision, size_mult=round(size, 2), vetoes=vetoes,
+        note="; ".join(note_parts),
         bias_fast=dir_fast, bias_slow=dir_slow,
     )
 

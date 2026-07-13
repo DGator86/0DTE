@@ -149,6 +149,7 @@ def decide(
     direction: str = "",
     physical_density_mode: str = "",
     physical_moments: Optional[dict] = None,
+    pin_active: bool = False,
 ) -> TradeDecision:
     """
     Compose gate + selector into a TradeDecision.
@@ -158,6 +159,8 @@ def decide(
     `target_structure` / `direction` when V2 is active — those arguments
     select the gate class and the candidate family filter only; they must
     never be used to construct the density that prices the trade (§12.2).
+    `pin_active` soft-exempts short-gamma / below-flip / trending on the
+    premium gate and selector so credit can fill into a flip pin.
     """
     cfg = cfg or EngineConfig()
     session_date = market.now.astimezone().date().isoformat()
@@ -183,7 +186,7 @@ def decide(
     structure_class = ("directional" if fams is not None and fams <= DEBIT_FAMILIES
                        else "premium")
     gate = gate_evaluate(market, cfg.gate, structure_class=structure_class,
-                         direction=direction)
+                         direction=direction, pin_active=pin_active)
     gate_pass = gate.decision is Decision.GO
 
     # --- selector: needs a usable chain ---
@@ -195,7 +198,7 @@ def decide(
         rnd = extract_rnd(chain, cfg.rnd)
         edge = compute_edge(rnd, chain, cfg.rnd, physical_pdf=physical_pdf)
         edge_rich = edge.richness_signal
-        ctx = GammaContext.from_market_snapshot(market)
+        ctx = GammaContext.from_market_snapshot(market, pin_active=pin_active)
         sel = select_spreads(chain, rnd, edge, ctx, cfg.selector, physical_pdf=physical_pdf,
                              target_families=fams)
         all_candidates = list(sel.all_candidates or sel.ranked or [])
