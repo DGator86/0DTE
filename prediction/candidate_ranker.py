@@ -81,6 +81,10 @@ class SnapshotRankingResult:
             "candidate_model_version": self.model_version,
             "legacy_top_score": leg,
         }
+        if self.diagnostics.get("v2_top_family"):
+            out["v2_top_family"] = self.diagnostics["v2_top_family"]
+        if self.diagnostics.get("legacy_top_family"):
+            out["legacy_top_family"] = self.diagnostics["legacy_top_family"]
         if v2 is not None:
             out.update({
                 "v2_utility_score": v2.utility_score,

@@ -325,12 +325,39 @@ class UnifiedOrchestrator:
         ) if public else None
         return merged, signals_json
 
+    @staticmethod
+    def _attach_forecast_signals(signals: dict, bundle) -> None:
+        """Journal PredictionBundle fields for the dashboard V2 forecast panel.
+
+        Flat ``v2_fc_*`` keys survive even when the separate prediction_store
+        path is not mounted on the dashboard process.
+        """
+        if bundle is None or not isinstance(signals, dict):
+            return
+        keys = (
+            "p_up_30m", "p_up_close", "expected_return_30m",
+            "return_q10_30m", "return_q50_30m", "return_q90_30m",
+            "p_range_survive_30m", "expected_realized_move_30m",
+            "p_touch_call_wall_30m", "p_touch_put_wall_30m",
+            "uncertainty", "data_quality", "feature_coverage",
+        )
+        for k in keys:
+            v = getattr(bundle, k, None)
+            if isinstance(v, (int, float)) and math.isfinite(float(v)):
+                signals[f"v2_fc_{k}"] = float(v)
+        mv = getattr(bundle, "model_versions", None) or {}
+        ver = mv.get("bundle") or mv.get("group") or ""
+        if ver:
+            signals["v2_fc_model_version"] = str(ver)
+        signals["v2_fc_mode"] = "shadow"
+
     def _resolve_physical_forecast(self, snap, signals: dict, intent) -> Optional[object]:
         """
         Resolve an independent PhysicalForecast for this tick.
 
-        Sources, in order: physical_forecast_provider (callable), then the
-        static physical_forecast field. Accepts a PhysicalForecast or a
+        Sources, in order: this tick's cached PredictionBundle (from policy
+        dual-run), physical_forecast_provider (callable), then the static
+        physical_forecast field. Accepts a PhysicalForecast or a
         PredictionBundle (lifted via forecast_from_bundle). Returns None when
         nothing usable is available — the tick then falls back to the legacy
         / realized-vol path. The provider must NOT close the policy loop: it
@@ -340,6 +367,12 @@ class UnifiedOrchestrator:
         from prediction.contracts import PredictionBundle
         from prediction.physical_distribution import (
             PhysicalForecast, forecast_from_bundle)
+
+        # Prefer the bundle already resolved for policy this tick — avoids a
+        # second provider call / duplicate prediction_outputs row.
+        cached = getattr(self, "_tick_prediction_bundle", None)
+        if isinstance(cached, PredictionBundle):
+            return forecast_from_bundle(cached)
 
         raw = None
         if self.physical_forecast_provider is not None:
@@ -369,6 +402,115 @@ class UnifiedOrchestrator:
                 return None
         log.warning("unsupported physical_forecast type: %s", type(raw).__name__)
         return None
+
+    def _build_v2_physical_result(self, snap, signals: dict, intent, rnd, cfg):
+        """Build V2 physical density and journal ``phys_v2_*`` moments.
+
+        Observation-only: safe to run on stand-down / NT ticks so the V2 tab
+        stays populated while legacy is not trading.
+        """
+        forecast = self._resolve_physical_forecast(snap, signals, intent)
+        if forecast is None or rnd is None:
+            return None
+        try:
+            from prediction.physical_distribution import build_physical_density
+            v2_result = build_physical_density(
+                rnd, forecast,
+                scale_min=cfg.rnd.rv_scale_min,
+                scale_max=cfg.rnd.rv_scale_max)
+            signals["phys_v2_mean"] = v2_result.moments.get("mean")
+            signals["phys_v2_std"] = v2_result.moments.get("std")
+            signals["phys_v2_var_ratio"] = v2_result.moments.get("var_ratio")
+            signals["phys_v2_uncertainty"] = forecast.uncertainty
+            signals["phys_v2_expected_return"] = forecast.expected_return
+            signals["phys_v2_model_version"] = forecast.model_version
+            return v2_result
+        except Exception as exc:
+            log.warning("V2 physical density failed: %s", exc)
+            return None
+
+    def _run_v2_shadow_ranking(
+            self, snap, signals: dict, snapshot_id: str, decide_pdf, cfg,
+            decision=None) -> None:
+        """Observation-only candidate ranking (works without a live TRADE).
+
+        Returns the (possibly annotated) decision, or the input decision when
+        ranking is skipped / fails.
+        """
+        if self.candidate_value_model is None or snap.chain is None:
+            return decision
+        try:
+            from prediction.candidate_ranker import (
+                RankerConfig, run_shadow_ranking,
+            )
+            from spread_selector import select_spreads, GammaContext
+
+            rcfg = self.candidate_ranker_cfg or RankerConfig()
+            shadow_cands = []
+            if decision is not None:
+                shadow_cands = list(decision.all_candidates or [])
+            # §14.4: generate outside the routed family for research / NT ticks
+            if getattr(rcfg, "shadow_all_families", True) or not shadow_cands:
+                try:
+                    rnd_s = extract_rnd(snap.chain, cfg.rnd)
+                    edge_s = compute_edge(
+                        rnd_s, snap.chain, cfg.rnd,
+                        physical_pdf=decide_pdf)
+                    ctx_s = GammaContext.from_market_snapshot(snap.market)
+                    sel_s = select_spreads(
+                        snap.chain, rnd_s, edge_s, ctx_s, cfg.selector,
+                        physical_pdf=decide_pdf, target_families=None)
+                    shadow_cands = list(
+                        sel_s.all_candidates or sel_s.ranked or [])
+                except Exception as exc:
+                    log.warning("shadow candidate gen failed: %s", exc)
+            if not shadow_cands:
+                return decision
+            mkt = snap.market
+            minutes_left = None
+            try:
+                minutes_left = getattr(mkt, "minutes_to_close", None)
+            except Exception:
+                minutes_left = None
+            ranking = run_shadow_ranking(
+                shadow_cands,
+                self.candidate_value_model,
+                snapshot_id=snapshot_id,
+                spot=float(mkt.spot),
+                call_wall=float(mkt.call_wall),
+                put_wall=float(mkt.put_wall),
+                gamma_flip=float(mkt.gamma_flip),
+                minutes_to_close=minutes_left,
+                net_gex=float(mkt.net_gex),
+                cfg=rcfg,
+                store=self.prediction_store,
+            )
+            signals.update(ranking.signals())
+            # Annotate the live (legacy) candidate with V2 utility when present.
+            if decision is not None and decision.candidate is not None:
+                live_id = None
+                for c in shadow_cands:
+                    if (c.family == decision.candidate.family
+                            and c.short_strikes
+                            == decision.candidate.short_strikes
+                            and c.long_strikes
+                            == decision.candidate.long_strikes):
+                        live_id = getattr(c, "_v2_candidate_id", None)
+                        break
+                if live_id and live_id in ranking.forecasts:
+                    fc = ranking.forecasts[live_id]
+                    decision = dataclasses.replace(
+                        decision,
+                        candidate=dataclasses.replace(
+                            decision.candidate,
+                            v2_utility_score=fc.utility_score,
+                            v2_candidate_id=live_id,
+                        ),
+                    )
+            return decision
+        except Exception as exc:
+            log.warning("V2 candidate shadow ranking failed: %s", exc)
+            return decision
 
     def _resolve_prediction_bundle(self, snap, signals: dict, intent,
                                    regime_state) -> Optional[object]:
@@ -425,6 +567,8 @@ class UnifiedOrchestrator:
 
             bundle = self._resolve_prediction_bundle(
                 snap, signals, intent, regime_state)
+            self._tick_prediction_bundle = bundle
+            self._attach_forecast_signals(signals, bundle)
             implied = signals.get("implied_move")
             if implied is None:
                 # Prefer dollar/spot move fractions — never chan_bb_width
@@ -580,6 +724,7 @@ class UnifiedOrchestrator:
         if snap is None:
             return None
 
+        self._tick_prediction_bundle = None
         snapshot_id = self._next_snapshot_id(now)
         cfg = self.engine_cfg or EngineConfig()
 
@@ -811,8 +956,32 @@ class UnifiedOrchestrator:
         self._log_feature_snapshot(now, snapshot_id, snap, snap_dict,
                                    signals, mat_rows)
 
+        # ---- V2 physical density (observation on every chain tick) ----
+        # Run before the stand-down early return so the V2 dashboard tab
+        # still shows forecast moments / density while legacy is NT.
+        v2_result = None
+        if snap.chain is not None and rnd is not None:
+            v2_result = self._build_v2_physical_result(
+                snap, signals, intent, rnd, cfg)
+
         # ---- Stand-down: regime unstable or NT cell (or champion NO_TRADE) ----
         if stand_down_now:
+            if snap.chain is not None:
+                decide_pdf = phys_pdf
+                if (v2_result is not None
+                        and not self.use_legacy_directional_tilt
+                        and self.physical_pdf is None):
+                    decide_pdf = v2_result.as_callable()
+                    signals["phys_density_mode"] = "v2"
+                elif decide_pdf is not None:
+                    signals["phys_density_mode"] = (
+                        "realized_vol" if phys_pdf is not None else "vrp")
+                else:
+                    signals["phys_density_mode"] = "vrp"
+                self._run_v2_shadow_ranking(
+                    snap, signals, snapshot_id, decide_pdf, cfg,
+                    decision=None)
+            signals, signals_json = self._signals_with_ras(signals, ras_results)
             pub_signals = {k: v for k, v in signals.items()
                            if not str(k).startswith("_")}
             result = TickResult(
@@ -845,32 +1014,8 @@ class UnifiedOrchestrator:
         density_mode = "injected" if self.physical_pdf is not None else (
             "realized_vol" if phys_pdf is not None else "vrp")
         density_moments: Optional[dict] = None
-        v2_result = None
         if snap.chain is not None:
             decide_pdf = phys_pdf
-            forecast = self._resolve_physical_forecast(snap, signals, intent)
-            if forecast is not None and rnd is not None:
-                try:
-                    from prediction.physical_distribution import (
-                        build_physical_density)
-                    v2_result = build_physical_density(
-                        rnd, forecast,
-                        scale_min=cfg.rnd.rv_scale_min,
-                        scale_max=cfg.rnd.rv_scale_max)
-                    # Always journal V2 moments when a forecast is available
-                    # (shadow comparison), even if legacy tilt still prices
-                    # the live decision.
-                    signals["phys_v2_mean"] = v2_result.moments.get("mean")
-                    signals["phys_v2_std"] = v2_result.moments.get("std")
-                    signals["phys_v2_var_ratio"] = v2_result.moments.get(
-                        "var_ratio")
-                    signals["phys_v2_uncertainty"] = forecast.uncertainty
-                    signals["phys_v2_expected_return"] = forecast.expected_return
-                    signals["phys_v2_model_version"] = forecast.model_version
-                except Exception as exc:
-                    log.warning("V2 physical density failed: %s", exc)
-                    v2_result = None
-
             use_v2 = (v2_result is not None
                       and not self.use_legacy_directional_tilt
                       and self.physical_pdf is None)
@@ -923,80 +1068,11 @@ class UnifiedOrchestrator:
                 signals["phys_live_ev"] = decision.candidate.ev
 
             # ---- V2 candidate-value shadow ranking (PR 8 / §14) ----
-            # Observation-only: never replaces decision.candidate / TRADE.
-            if self.candidate_value_model is not None:
-                try:
-                    from prediction.candidate_ranker import (
-                        RankerConfig, run_shadow_ranking,
-                    )
-                    from spread_selector import select_spreads, GammaContext
-
-                    rcfg = self.candidate_ranker_cfg or RankerConfig()
-                    shadow_cands = list(decision.all_candidates or [])
-                    # §14.4: also generate outside the routed family for research
-                    if getattr(rcfg, "shadow_all_families", True):
-                        try:
-                            rnd_s = extract_rnd(snap.chain, cfg.rnd)
-                            edge_s = compute_edge(
-                                rnd_s, snap.chain, cfg.rnd,
-                                physical_pdf=decide_pdf)
-                            ctx_s = GammaContext.from_market_snapshot(
-                                snap.market)
-                            sel_s = select_spreads(
-                                snap.chain, rnd_s, edge_s, ctx_s, cfg.selector,
-                                physical_pdf=decide_pdf, target_families=None)
-                            shadow_cands = list(
-                                sel_s.all_candidates or sel_s.ranked or [])
-                        except Exception as exc:
-                            log.warning("shadow candidate gen failed: %s", exc)
-                    if shadow_cands:
-                        mkt = snap.market
-                        minutes_left = None
-                        try:
-                            # Prefer market helper if present
-                            minutes_left = getattr(
-                                mkt, "minutes_to_close", None)
-                        except Exception:
-                            minutes_left = None
-                        ranking = run_shadow_ranking(
-                            shadow_cands,
-                            self.candidate_value_model,
-                            snapshot_id=snapshot_id,
-                            spot=float(mkt.spot),
-                            call_wall=float(mkt.call_wall),
-                            put_wall=float(mkt.put_wall),
-                            gamma_flip=float(mkt.gamma_flip),
-                            minutes_to_close=minutes_left,
-                            net_gex=float(mkt.net_gex),
-                            cfg=rcfg,
-                            store=self.prediction_store,
-                        )
-                        signals.update(ranking.signals())
-                        # Annotate the live (legacy) candidate with V2 utility
-                        # when it appears in the shadow set — observation only.
-                        if decision.candidate is not None:
-                            live_id = None
-                            for c in shadow_cands:
-                                if (c.family == decision.candidate.family
-                                        and c.short_strikes
-                                        == decision.candidate.short_strikes
-                                        and c.long_strikes
-                                        == decision.candidate.long_strikes):
-                                    live_id = getattr(
-                                        c, "_v2_candidate_id", None)
-                                    break
-                            if live_id and live_id in ranking.forecasts:
-                                fc = ranking.forecasts[live_id]
-                                decision = dataclasses.replace(
-                                    decision,
-                                    candidate=dataclasses.replace(
-                                        decision.candidate,
-                                        v2_utility_score=fc.utility_score,
-                                        v2_candidate_id=live_id,
-                                    ),
-                                )
-                except Exception as exc:
-                    log.warning("V2 candidate shadow ranking failed: %s", exc)
+            annotated = self._run_v2_shadow_ranking(
+                snap, signals, snapshot_id, decide_pdf, cfg,
+                decision=decision)
+            if annotated is not None:
+                decision = annotated
 
             # Re-finalize signals_json after density provenance is attached.
             signals, signals_json = self._signals_with_ras(signals, ras_results)

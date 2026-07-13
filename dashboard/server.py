@@ -315,14 +315,18 @@ def main() -> None:
     parser.add_argument("--live-state", default="live_state.json", help="Live state JSON path")
     parser.add_argument("--configs-dir", default="configs",
                         help="Directory holding champion.json (Learning tab)")
-    parser.add_argument("--prediction-db", default="prediction_store.sqlite",
-                        help="PredictionStore SQLite (PredictionBundle rows)")
+    parser.add_argument("--prediction-db", default=None,
+                        help="PredictionStore SQLite (default: <db dir>/prediction_store.sqlite)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
+    from pathlib import Path
+    pred_db = args.prediction_db or str(
+        Path(args.db).with_name("prediction_store.sqlite"))
+
     _configure(args.db, args.paper_db, args.live_state, args.configs_dir,
-               prediction_db=args.prediction_db)
+               prediction_db=pred_db)
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

@@ -174,6 +174,12 @@ def serialize_tick_result(
         )
     }
 
+    # Flat forecast summary for the V2 tab when prediction_store is offline.
+    forecast = {
+        k[len("v2_fc_"):]: v for k, v in raw_signals.items()
+        if k.startswith("v2_fc_")
+    }
+
     # Parallel decision summary for Legacy vs V2 tabs.
     parallel = {
         "legacy": {
@@ -215,6 +221,7 @@ def serialize_tick_result(
         "why": why,
         "paper": paper_summary or {},
         "v2_signals": v2_signals,
+        "forecast": forecast or None,
         "parallel": parallel,
     }
     return payload
