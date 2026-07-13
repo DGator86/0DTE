@@ -64,11 +64,14 @@ class GammaContext:
     gamma_flip: float
     net_gex: float
     gex_pct_rank: float = 0.5            # |GEX| percentile; gates naked structures
+    # When True, soft-exempt short_gamma_regime / short_put<=gamma_flip vetoes
+    # so credit candidates can fill into a flip/wall pin (even if GEX < 0).
+    pin_active: bool = False
 
     @classmethod
-    def from_market_snapshot(cls, ms) -> "GammaContext":
+    def from_market_snapshot(cls, ms, pin_active: bool = False) -> "GammaContext":
         return cls(ms.spot, ms.call_wall, ms.put_wall, ms.gamma_flip, ms.net_gex,
-                   getattr(ms, "gex_pct_rank", 0.5))
+                   getattr(ms, "gex_pct_rank", 0.5), pin_active=pin_active)
 
 
 @dataclass
@@ -488,9 +491,11 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
     if not is_debit:
         if prob_touch_short > cfg.max_touch_short:
             reasons.append(f"touch {prob_touch_short:.2f}>max({touch_source})")
-        if regime_short:
+        # Pin soft-exempt: allow credit into short-gamma / at-flip pins.
+        if regime_short and not getattr(ctx, "pin_active", False):
             reasons.append("short_gamma_regime")
-        if cfg.veto_short_below_flip and short_below_flip:
+        if (cfg.veto_short_below_flip and short_below_flip
+                and not getattr(ctx, "pin_active", False)):
             reasons.append("short_put<=gamma_flip")
 
     # ---- extra hard gating for undefined-risk families ----
@@ -746,8 +751,16 @@ def _gen_backspread_put(chain: ChainSnapshot, F: float, cfg: SelectorConfig) -> 
 
 
 def _is_pinned(F: float, ctx: GammaContext, cfg: SelectorConfig) -> bool:
+    """True when forward is near a wall OR the gamma flip.
+
+    Does not require net_gex > 0 — negative-GEX pins still want the iron-fly
+    family-weight bonus (pin_regime / policy decide whether to allow credit).
+    """
     nearest_wall = min(abs(F - ctx.call_wall), abs(F - ctx.put_wall))
-    return (nearest_wall / F <= cfg.pin_band) and ctx.net_gex > 0
+    wall_pin = nearest_wall / F <= cfg.pin_band if F else False
+    flip = float(ctx.gamma_flip or 0.0)
+    flip_pin = (abs(F - flip) / F <= cfg.pin_band) if (F and flip) else False
+    return bool(wall_pin or flip_pin)
 
 
 # --------------------------------------------------------------------------- #

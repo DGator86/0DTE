@@ -424,6 +424,20 @@ class RegimeClassifier:
         if self.cfg.update_scales:
             self._update_scales(ctx)
         vetoes = _vetoes(ctx, self.cfg)
+        # Pin soft-exempt: keep the veto string for the journal, but do not
+        # block the premium_selling engine — otherwise compression is knocked
+        # to ≤15 and breakout/trend always wins on a glued-to-flip tape.
+        try:
+            from pin_regime import assess_pin, pin_soft_exempt_vetoes
+            pin = assess_pin(ctx.market, channel=getattr(ctx, "channel", None) or {})
+            if pin.is_pin:
+                soft = pin_soft_exempt_vetoes()
+                vetoes = [
+                    (reason, (set() if reason in soft else eng))
+                    for reason, eng in vetoes
+                ]
+        except Exception:
+            pass
         blocked_engines = set()
         for _, eng in vetoes:
             blocked_engines |= eng

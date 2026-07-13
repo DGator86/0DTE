@@ -98,6 +98,7 @@ class PredictionPolicy:
         cfg = self.cfg
         op = inp.operational_risk_state or {}
         hard_vetoes = tuple(op.get("hard_vetoes") or ())
+        pin_active = bool(op.get("pin_active") or op.get("pin"))
         # Operational hard stops always win.
         if (op.get("stand_down") or op.get("session_warmup")
                 or any(str(v).startswith("catalyst")
@@ -145,9 +146,13 @@ class PredictionPolicy:
         q50 = _first_not_none(bundle.return_q50_30m, bundle.return_q50_close)
 
         premium_ok = self._premium_eligible(
-            range_p, realized, implied_move, uncertainty, hard_vetoes)
+            range_p, realized, implied_move, uncertainty, hard_vetoes,
+            pin_active=pin_active)
         directional = self._directional_eligible(
             p_up, exp_ret, q50, uncertainty, hard_vetoes)
+        # Under an active pin, prefer premium over directional breakout debit.
+        if pin_active and premium_ok:
+            directional = None
         vol_ok = self._vol_eligible(
             range_p, realized, implied_move, uncertainty, hard_vetoes)
 
@@ -168,7 +173,8 @@ class PredictionPolicy:
 
         if premium_ok and directional is None:
             # Lean with mild directional bias when available.
-            structure, direction = self._premium_structure(p_up, hard_vetoes)
+            structure, direction = self._premium_structure(
+                p_up, hard_vetoes, pin_active=pin_active)
             if structure == "NT":
                 return self._no_trade(
                     bundle, hard_vetoes,
@@ -178,13 +184,15 @@ class PredictionPolicy:
                 action="TRADE",
                 direction=direction,
                 eligible_families=_families_for(structure),
-                confidence=float(range_p or 0.6),
+                confidence=float(range_p or (0.7 if pin_active else 0.6)),
                 uncertainty=uncertainty,
-                size_cap=self._size_cap(uncertainty, float(range_p or 0.6)),
+                size_cap=self._size_cap(
+                    uncertainty, float(range_p or (0.7 if pin_active else 0.6))),
                 hard_vetoes=hard_vetoes,
                 rationale=(
                     f"premium: range_survive={range_p}",
                     f"realized_move={realized}",
+                    *(("pin_active",) if pin_active else ()),
                 ),
                 policy_version=self.version,
                 source=SOURCE_V2,
@@ -255,18 +263,33 @@ class PredictionPolicy:
         )
 
     def _premium_eligible(self, range_p, realized, implied, uncertainty,
-                          hard_vetoes) -> bool:
+                          hard_vetoes, *, pin_active: bool = False) -> bool:
         cfg = self.cfg
-        if range_p is None or range_p < cfg.min_range_survive:
-            return False
+        if not pin_active:
+            if range_p is None or range_p < cfg.min_range_survive:
+                return False
+        else:
+            # Pin is range-survival evidence; allow missing or slightly soft floor.
+            if (range_p is not None
+                    and range_p < cfg.min_range_survive * 0.85):
+                return False
         if uncertainty > cfg.max_uncertainty_premium:
             return False
-        no_premium = any(
-            v in {
+        soft = set()
+        if pin_active:
+            soft = {
                 "short_gamma", "short_gamma_regime",
                 "below_flip", "below_gamma_flip",
-                "trending", "term_backwardation", "adx_trend",
-            } or str(v).startswith("adx")
+                "trending", "adx_trend",
+            }
+        no_premium = any(
+            (v not in soft) and (
+                v in {
+                    "short_gamma", "short_gamma_regime",
+                    "below_flip", "below_gamma_flip",
+                    "trending", "term_backwardation", "adx_trend",
+                } or str(v).startswith("adx")
+            )
             for v in hard_vetoes)
         if no_premium:
             return False
@@ -274,6 +297,33 @@ class PredictionPolicy:
             if float(realized) / float(implied) > cfg.max_realized_vs_implied:
                 return False
         return True
+
+    def _premium_structure(self, p_up, hard_vetoes, *, pin_active: bool = False) -> tuple[str, str]:
+        soft = set()
+        if pin_active:
+            soft = {
+                "short_gamma", "short_gamma_regime",
+                "below_flip", "below_gamma_flip",
+                "trending", "adx_trend",
+            }
+        no_premium = any(
+            (v not in soft) and (
+                v in {
+                    "short_gamma", "short_gamma_regime",
+                    "below_flip", "below_gamma_flip",
+                    "trending", "term_backwardation", "adx_trend",
+                } or str(v).startswith("adx")
+            )
+            for v in hard_vetoes)
+        if no_premium:
+            return ("NT", "none")
+        if pin_active:
+            return ("IF", "both")
+        if p_up is not None and p_up >= 0.55:
+            return ("PCS", "put")
+        if p_up is not None and p_up <= 0.45:
+            return ("CCS", "call")
+        return ("IC", "both")
 
     def _directional_eligible(self, p_up, exp_ret, q50, uncertainty,
                               hard_vetoes):
@@ -312,24 +362,6 @@ class PredictionPolicy:
         if range_p is not None and range_p > cfg.max_range_survive_for_vol:
             return False
         return True
-
-    def _premium_structure(self, p_up, hard_vetoes) -> tuple[str, str]:
-        no_premium = any(
-            v in {
-                "short_gamma", "short_gamma_regime",
-                "below_flip", "below_gamma_flip",
-                "trending", "term_backwardation",
-            } or str(v).startswith("adx")
-            for v in hard_vetoes)
-        if no_premium:
-            return ("NT", "none")
-        if p_up is None:
-            return ("IC", "both")
-        if p_up >= 0.55:
-            return ("PCS", "put")
-        if p_up <= 0.45:
-            return ("CCS", "call")
-        return ("IC", "both")
 
     @staticmethod
     def _size_cap(uncertainty: float, confidence: float) -> float:
