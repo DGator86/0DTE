@@ -125,6 +125,16 @@ class TestGatePinExempt:
         assert not any("BELOW_FLIP" in g for g in allowed.failed_gates)
         assert not any("TRENDING" in g for g in allowed.failed_gates)
 
+    def test_term_inverted_soft_exempt_under_pin(self):
+        m = _pin_market(vix9d=18.0, vix=16.0, vix3m=15.0)  # backwardation
+        blocked = evaluate(m, GateConfig(), structure_class="premium",
+                           pin_active=False)
+        assert any("TERM_INVERTED" in g for g in blocked.failed_gates)
+        allowed = evaluate(m, GateConfig(), structure_class="premium",
+                           pin_active=True)
+        assert not any("TERM_INVERTED" in g for g in allowed.failed_gates)
+        assert allowed.decision is Decision.GO
+
 
 class TestSelectorPinExempt:
     def test_credit_survives_short_gamma_when_pin_active(self):
