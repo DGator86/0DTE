@@ -17,17 +17,21 @@ Hard guarantees, enforced here:
 Entry points
 ------------
   run_daily(...)     cheap: diagnostics + drift + calibration only
-  run_weekly(...)    the full cycle including optimization
+  run_evening(...)   weekday post-close: full optimize cycle (lighter trials)
+  run_weekly(...)    weekend deep cycle: full optimize + more trials/folds
   run_manual(...)    the full cycle, triggered by hand
   run_learning_cycle(...)  the underlying engine both of the above call
 
 Data sources: pass an explicit feed_factory/timestamps (tests, demos), or a
 record_dir of shadow recordings (chain_store.RecordedFeed) for real data.
-Scheduling stays external (cron the daily/weekly CLIs); no daemon here.
+Scheduling stays external (cron / systemd the daily/evening/weekly CLIs);
+no daemon here.
 
 CLI
 ---
     python3 -m adaptive_learning.learner --mode daily  --db shadow.db
+    python3 -m adaptive_learning.learner --mode evening --db shadow.db \
+        --record-dir /var/lib/zerodte/ticks
     python3 -m adaptive_learning.learner --mode weekly --db shadow.db \
         --record-dir /var/lib/zerodte/ticks
 
@@ -188,6 +192,10 @@ def run_learning_cycle(cfg: Optional[LearnerConfig] = None,
     (learning_runs row, candidate file, promotion report, pending_review) is
     persisted along the way. Raises if holdout_frac <= 0 — no exceptions to
     the anti-selection-bias rule.
+
+    Insufficient recorded history returns outcome='insufficient_data' instead
+    of raising, so scheduled evening/weekly timers can no-op cleanly until
+    shadow has enough sessions.
     """
     cfg = cfg or LearnerConfig()
     if cfg.holdout_frac <= 0.0:
@@ -223,7 +231,20 @@ def run_learning_cycle(cfg: Optional[LearnerConfig] = None,
         summary["reason"] = reason
 
         # -- 3. data + champion baseline -------------------------------------
-        feed_factory, ticks = _resolve_feed(cfg, feed_factory, timestamps)
+        try:
+            feed_factory, ticks = _resolve_feed(cfg, feed_factory, timestamps)
+        except ValueError as exc:
+            note = str(exc)
+            jrn.log_learning_run(
+                run_id, mode, started,
+                dt.datetime.now(dt.timezone.utc).isoformat(),
+                diagnostics=summary["diagnoses"],
+                param_space=param_space,
+                outcome="insufficient_data",
+                notes=note)
+            summary["outcome"] = "insufficient_data"
+            summary["notes"] = note
+            return summary
         # Session-based carve: the holdout is complete sessions, never a
         # partial trading day (see validation/session_folds.py).
         from validation.session_folds import split_holdout_by_sessions
@@ -349,6 +370,20 @@ def run_learning_cycle(cfg: Optional[LearnerConfig] = None,
         jrn.close()
 
 
+def run_evening(cfg: Optional[LearnerConfig] = None,
+                feed_factory: Optional[Callable] = None,
+                timestamps: Optional[list] = None,
+                report_date: Optional[str] = None) -> dict:
+    """
+    Weekday post-close optimize cycle: find candidate settings from recorded
+    ticks + journal failure modes. Scheduled timers pass lighter --trials /
+    --folds; still uses mandatory holdout. Never auto-writes champion.json.
+    """
+    return run_learning_cycle(cfg or LearnerConfig(), mode="evening",
+                              feed_factory=feed_factory,
+                              timestamps=timestamps, report_date=report_date)
+
+
 def run_weekly(cfg: Optional[LearnerConfig] = None,
                feed_factory: Optional[Callable] = None,
                timestamps: Optional[list] = None,
@@ -378,11 +413,12 @@ def main() -> None:
         description="Adaptive Learning Engine — diagnose, hypothesize, "
                     "optimize with mandatory holdout, recommend promotions. "
                     "Never touches champion.json.")
-    ap.add_argument("--mode", choices=["daily", "weekly", "manual"],
+    ap.add_argument("--mode", choices=["daily", "evening", "weekly", "manual"],
                     default="manual")
     ap.add_argument("--db", default="shadow.db")
     ap.add_argument("--record-dir", default="")
     ap.add_argument("--configs-dir", default="configs")
+    ap.add_argument("--reports-dir", default="")
     ap.add_argument("--search", choices=["tpe", "random", "grid"], default="tpe")
     ap.add_argument("--trials", type=int, default=30)
     ap.add_argument("--holdout", type=float, default=0.25)
@@ -390,12 +426,16 @@ def main() -> None:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    reports_dir = args.reports_dir or os.path.join("reports", "promotion")
     cfg = LearnerConfig(db_path=args.db, record_dir=args.record_dir,
-                        configs_dir=args.configs_dir, search=args.search,
+                        configs_dir=args.configs_dir, reports_dir=reports_dir,
+                        search=args.search,
                         n_trials=args.trials, holdout_frac=args.holdout,
                         wf_folds=args.folds)
     if args.mode == "daily":
         out = run_daily(cfg)
+    elif args.mode == "evening":
+        out = run_evening(cfg)
     elif args.mode == "weekly":
         out = run_weekly(cfg)
     else:

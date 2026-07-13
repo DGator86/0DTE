@@ -16,8 +16,43 @@ SSH as a sudo-capable user. Paths used:
 | `/opt/zerodte` | the code (git checkout) + virtualenv — read-only at runtime |
 | `/etc/zerodte/zerodte.env` | secrets, `chmod 600` — never in the repo |
 | `/var/lib/zerodte/shadow.db` | the journal — persists across restarts/updates |
+| `/var/lib/zerodte/ticks/` | recorded market/chain ticks for evening backtests |
+| `/var/lib/zerodte/configs/` | champion + learner candidates (survives deploys) |
 
 ---
+
+## Evening learning (optimal settings)
+
+Validation alone does **not** search parameters. After close, systemd runs the
+Adaptive Learning Engine against recorded ticks:
+
+| Timer | When (ET) | What |
+|---|---|---|
+| `zerodte-validate-daily` | Mon–Fri 17:15 | Health / walk-forward **report** only |
+| `zerodte-learn-evening` | Mon–Fri 17:45 | Diagnose → **backtest optimize** → candidate config |
+| `zerodte-validate-weekly` | Sun 18:00 | Deep validation report |
+| `zerodte-learn-weekly` | Sun 19:00 | Deeper optimize (more trials/folds) |
+
+Candidates land in `/var/lib/zerodte/configs/` and the Learning dashboard tab.
+The learner **never** writes `champion.json` — promote by hand, then restart:
+
+```bash
+sudo -u zerodte /opt/zerodte/venv/bin/python -m adaptive_learning.promoter --list \
+    --db /var/lib/zerodte/shadow.db --configs-dir /var/lib/zerodte/configs
+sudo -u zerodte /opt/zerodte/venv/bin/python -m adaptive_learning.promoter \
+    --approve <config_id> --db /var/lib/zerodte/shadow.db \
+    --configs-dir /var/lib/zerodte/configs
+sudo systemctl restart zerodte-shadow   # champion loaded at startup only
+```
+
+On-demand: GitHub Actions → VPS Ops → `learn` with arg `evening` or `weekly`.
+
+Check timers:
+
+```bash
+systemctl list-timers 'zerodte-learn-*' 'zerodte-validate-*'
+journalctl -u zerodte-learn-evening -n 50
+```
 
 ## 1. System packages
 

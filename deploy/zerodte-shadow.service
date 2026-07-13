@@ -22,6 +22,7 @@ ExecStart=/opt/zerodte/venv/bin/python /opt/zerodte/shadow_runner.py \
     --db /var/lib/zerodte/shadow.db \
     --paper-db /var/lib/zerodte/paper.sqlite \
     --live-state /var/lib/zerodte/live_state.json \
+    --champion /var/lib/zerodte/configs/champion.json \
     --interval 60 \
     --no-legacy-directional-tilt
 

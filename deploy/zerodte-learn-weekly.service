@@ -1,0 +1,33 @@
+[Unit]
+# Weekly learning: deeper walk-forward + more TPE trials. Stages candidates
+# for human review; never auto-promotes champion.json.
+Description=0DTE weekly learning cycle (deep optimize)
+After=network-online.target zerodte-validate-weekly.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zerodte
+Group=zerodte
+WorkingDirectory=/opt/zerodte
+EnvironmentFile=/etc/zerodte/zerodte.env
+ExecStart=/opt/zerodte/venv/bin/python -m adaptive_learning.learner \
+    --mode weekly \
+    --db /var/lib/zerodte/shadow.db \
+    --record-dir /var/lib/zerodte/ticks \
+    --configs-dir /var/lib/zerodte/configs \
+    --reports-dir /var/lib/zerodte/reports/promotion \
+    --trials 40 \
+    --folds 5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zerodte
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-learn-weekly
+
+SuccessExitStatus=0

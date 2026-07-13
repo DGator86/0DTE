@@ -658,6 +658,35 @@ def test_learner_refuses_zero_holdout(tmp_path):
         run_learning_cycle(cfg)
 
 
+def test_learner_insufficient_data_is_soft_outcome(tmp_path):
+    """Scheduled evening runs must not crash when ticks are thin."""
+    from adaptive_learning.learner import LearnerConfig, run_learning_cycle
+
+    db = str(tmp_path / "j.db")
+    _seed_inverted_journal(db)
+    empty_ticks = str(tmp_path / "ticks")
+    os.makedirs(empty_ticks)
+    cfg = LearnerConfig(
+        db_path=db, record_dir=empty_ticks,
+        configs_dir=str(tmp_path / "configs"),
+        reports_dir=str(tmp_path / "reports"),
+        min_ticks=100, min_sessions=3, n_trials=2, wf_folds=2,
+    )
+    out = run_learning_cycle(cfg, mode="evening")
+    assert out["outcome"] == "insufficient_data"
+    assert out["mode"] == "evening"
+    runs = Journal(db).fetch_learning_runs()
+    assert runs and runs[0]["outcome"] == "insufficient_data"
+
+
+def test_evening_mode_cli_accepted():
+    from adaptive_learning import learner as L
+    assert callable(L.run_evening)
+    src = open(L.__file__, encoding="utf-8").read()
+    assert '"evening"' in src
+    assert "--mode" in src
+
+
 # --------------------------------------------------------------------------- #
 # Feature lab                                                                 #
 # --------------------------------------------------------------------------- #
