@@ -376,6 +376,19 @@ class PaperBroker:
         if entry_snapshot is None:
             log.warning("opening paper position WITHOUT entry_snapshot — "
                         "RAS will not monitor this trade")
+        # Parallel-policy provenance for journal Legacy / V2 delineation.
+        # Authoritative fill track follows policy_mode only (champion → v2).
+        # In shadow/legacy modes the paper broker still follows the matrix.
+        sig = getattr(result, "signals", None) or {}
+        policy_mode = sig.get("policy_mode")
+        policy_source = sig.get("policy_source")
+        mode_l = str(policy_mode or "").lower()
+        fill_track = "v2" if mode_l == "champion" else "legacy"
+        try:
+            disagree = float(sig.get("policy_disagreement") or 0.0) >= 1.0
+        except (TypeError, ValueError):
+            disagree = False
+
         entry_ctx = {
             "regime": getattr(regime, "dominant_regime", None),
             "engine": getattr(regime, "permitted_engine", None),
@@ -402,6 +415,18 @@ class PaperBroker:
             # Filled from the first RAS evaluation after entry (RAS needs a
             # registered position context, so it cannot exist at open time).
             "ras_at_entry": None,
+            # Track delineation (Legacy vs V2 parallel shadow)
+            "fill_track": fill_track,
+            "policy_mode": policy_mode,
+            "policy_source": policy_source,
+            "policy_disagreement": 1.0 if disagree else 0.0,
+            "legacy_structure": (sig.get("legacy_policy_structure")
+                                 or sig.get("policy_structure")
+                                 or structure),
+            "v2_policy_structure": sig.get("v2_policy_structure"),
+            "v2_policy_action": sig.get("v2_policy_action"),
+            "v2_policy_direction": sig.get("v2_policy_direction"),
+            "v2_policy_confidence": sig.get("v2_policy_confidence"),
         }
 
         pos = PaperPosition(

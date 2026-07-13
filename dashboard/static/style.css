@@ -770,6 +770,37 @@ html, body {
 .chip.disagree { color: var(--amber); border-color: var(--amber); background: rgba(255,182,72,0.08); }
 .chip.info { color: var(--blue, #4aa8ff); border-color: rgba(74,168,255,0.35); }
 .chip.fallback { color: var(--red); border-color: var(--red-dim); }
+.chip.track-legacy {
+  color: var(--muted);
+  border-color: var(--border-2);
+  background: rgba(230,237,247,0.04);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+.chip.track-v2 {
+  color: var(--blue, #4aa8ff);
+  border-color: rgba(74,168,255,0.4);
+  background: rgba(74,168,255,0.08);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+.chip.track-disagree {
+  color: var(--amber);
+  border-color: var(--amber);
+  background: rgba(255,182,72,0.08);
+  font-size: 10px;
+}
+.tl-item .tl-v2 { color: var(--blue, #4aa8ff); }
+.tl-item.tl-disagree { box-shadow: inset 3px 0 0 rgba(255,182,72,0.7); }
+.val-track-split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
+@media (max-width: 900px) {
+  .val-track-split { grid-template-columns: 1fr; }
+}
+.val-track-split .val-h3 { margin-top: 0; }
+.tj-track-cell { white-space: nowrap; }
+.tj-track-cell .chips { gap: 4px; }
 #sigcorr-rows .val-corr-row { padding: 3px 0; border-bottom: 1px solid var(--border); }
 #sigcorr-rows .val-corr-row:last-child { border-bottom: none; }
 @media (max-width: 700px) {
