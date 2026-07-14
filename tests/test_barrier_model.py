@@ -84,7 +84,8 @@ class TestBarrierTouchModel:
         assert np.all((p1 >= 0.0) & (p1 <= 1.0))
         assert np.array_equal(p1, p2)
         meta = m1.metadata
-        assert set(meta["fit_sessions"]).isdisjoint(meta["calibration_sessions"])
+        assert set(meta["calibration_sessions"]) <= set(meta["train_sessions"])
+        assert meta["calibration_metrics"].get("crossfit") is True
         assert "calibration_metrics" in meta
 
     def test_learns_signal_oos(self):

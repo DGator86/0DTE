@@ -84,7 +84,8 @@ class TestRangeSurvivalModel:
         meta = m1.metadata
         assert meta["kind"] == "wall_channel"
         assert meta["horizon"] == "close"
-        assert set(meta["fit_sessions"]).isdisjoint(meta["calibration_sessions"])
+        assert set(meta["calibration_sessions"]) <= set(meta["train_sessions"])
+        assert meta["calibration_metrics"].get("crossfit") is True
         assert "brier_calibrated" in meta["calibration_metrics"] or (
             "note" in meta["calibration_metrics"])
 

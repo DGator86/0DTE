@@ -25,7 +25,9 @@ from prediction.models.base import (
     brier_skill,
     log_loss_score,
 )
-from prediction.training import grouped_session_folds
+
+# NOTE: grouped_session_folds is imported lazily inside fold builders to avoid
+# circular imports (training -> direction -> crossfit -> training).
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,7 @@ def build_nested_session_folds(
     window for independent calibrator fitting (never overlap validation).
     """
     uniq = sorted(set(sessions))
+    from prediction.training import grouped_session_folds
     outer = grouped_session_folds(
         uniq,
         n_folds=cfg.outer_folds,
@@ -134,7 +137,7 @@ def build_nested_session_folds(
     return folds
 
 
-def _inner_folds_for_train(
+def inner_folds_for_train(
     train_sessions: Sequence[str],
     cfg: NestedCrossFitConfig,
 ) -> list[dict]:
@@ -161,6 +164,7 @@ def _inner_folds_for_train(
                  "embargoed_sessions": embargoed}]
     min_train = max(2, min(cfg.min_train_sessions // 2, len(uniq) // 3))
     try:
+        from prediction.training import grouped_session_folds
         return grouped_session_folds(
             uniq,
             n_folds=n_inner,
@@ -484,7 +488,7 @@ def _select_classifier_params(
     rows, y_arr, sessions_l, hp_sessions, param_grid,
     estimator_factory, predict_raw, cfg,
 ) -> tuple[dict, dict]:
-    inner = _inner_folds_for_train(hp_sessions, cfg)
+    inner = inner_folds_for_train(hp_sessions, cfg)
     if not inner:
         # Fall back: first grid point (deterministic), flag in diagnostics.
         return dict(param_grid[0]), {"note": "insufficient_sessions_for_inner_cv",
@@ -654,7 +658,7 @@ def _select_regressor_params(
     rows, y_arr, sessions_l, hp_sessions, param_grid,
     estimator_factory, cfg, group_ids,
 ) -> tuple[dict, dict]:
-    inner = _inner_folds_for_train(hp_sessions, cfg)
+    inner = inner_folds_for_train(hp_sessions, cfg)
     if not inner:
         return dict(param_grid[0]), {"note": "insufficient_sessions_for_inner_cv",
                                      "selected": dict(param_grid[0])}
@@ -734,7 +738,7 @@ def generate_train_oof_predictions(
     else:
         eligible = list(eligible_sessions)
 
-    inner = _inner_folds_for_train(eligible, cfg)
+    inner = inner_folds_for_train(eligible, cfg)
     pred = np.full(n, np.nan, dtype=float)
     assign = np.full(n, -1, dtype=int)
     feature_names: Optional[list[str]] = None

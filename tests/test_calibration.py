@@ -97,13 +97,17 @@ class TestSelection:
 
     def test_isotonic_possible_when_gates_pass(self):
         p_raw, y = _overconfident_sample(5000)
+        # Many synthetic "sessions" so nested session holdout works
+        sessions = [f"s{i % 60:02d}" for i in range(len(y))]
         cal, diag = select_calibrator(p_raw, y, n_sessions=60,
+                                      sessions=sessions,
                                       min_samples=1000, min_sessions=40)
         assert diag["brier_isotonic"] is not None    # gate opened
         assert diag["chosen"] in ("sigmoid", "isotonic")
-        # whichever won must have the lower Brier on the calibration slice
-        best = min(diag["brier_sigmoid"], diag["brier_isotonic"])
-        assert brier_score(y, cal.transform(p_raw)) == pytest.approx(best)
+        assert diag["comparison"] == "nested_holdout"
+        # Winner was selected on nested eval, then refit on all rows
+        assert np.all((cal.transform(p_raw) >= 0.0)
+                      & (cal.transform(p_raw) <= 1.0))
 
     def test_fit_calibrator_by_name(self):
         p_raw, y = _overconfident_sample(300)
