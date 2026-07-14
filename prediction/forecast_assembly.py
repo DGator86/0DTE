@@ -66,9 +66,11 @@ def build_v3_forecast(
     ood_score = 0.0
     dq_raw = (getattr(snapshot, "quality", {}) or {}).get("data_quality")
     data_quality = float(dq_raw) if dq_raw is not None else 0.85
-    feature_coverage = float(
-        (getattr(snapshot, "quality", {}) or {}).get("feature_coverage")
-        or (len(row) / 40.0 if row else 0.0))
+    fc_raw = (getattr(snapshot, "quality", {}) or {}).get("feature_coverage")
+    if fc_raw is not None:
+        feature_coverage = float(fc_raw)
+    else:
+        feature_coverage = (len(row) / 40.0 if row else 0.0)
     feature_coverage = max(0.0, min(1.0, feature_coverage))
 
     # Stage 1: structural state present?
@@ -196,14 +198,24 @@ def build_v3_forecast(
         **dict(getattr(bundle, "diagnostics", {}) or {}),
         "forecast_assembly": diagnostics,
     }
+    # Explicit None checks — observed 0.0 must never become 1.0 / derived.
+    bundle_dq = getattr(bundle, "data_quality", None)
+    merged_dq = (
+        data_quality if bundle_dq is None
+        else min(float(bundle_dq), data_quality)
+    )
+    bundle_fc = getattr(bundle, "feature_coverage", None)
+    merged_fc = (
+        feature_coverage if bundle_fc is None
+        else min(float(bundle_fc), feature_coverage)
+    )
     bundle = replace(
         bundle,
         uncertainty=max(float(getattr(bundle, "uncertainty", 0) or 0),
                         uncertainty),
         ood_score=max(float(getattr(bundle, "ood_score", 0) or 0), ood_score),
-        data_quality=min(float(getattr(bundle, "data_quality", 1) or 1),
-                         data_quality),
-        feature_coverage=feature_coverage,
+        data_quality=merged_dq,
+        feature_coverage=merged_fc,
         model_versions=merged_versions,
         diagnostics=merged_diag,
     )

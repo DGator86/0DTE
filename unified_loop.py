@@ -756,6 +756,8 @@ class UnifiedOrchestrator:
         if snap is None or snap.chain is None:
             return intents
 
+        from decision_stack.authority import coerce_size_mult
+
         # ---- LEGACY (matrix) ----
         raw_struct = getattr(getattr(intent, "decision", None), "structure", None)
         raw_dir = getattr(getattr(intent, "decision", None), "direction", None) or "both"
@@ -783,16 +785,21 @@ class UnifiedOrchestrator:
                 gate_kelly = getattr(leg_dec, "gate_kelly", None) if leg_dec else None
                 gate_score = getattr(leg_dec, "gate_score", None) if leg_dec else None
             if leg_cand is not None:
-                intents.append({
-                    "track": "legacy",
-                    "candidate": leg_cand,
-                    "size_mult": float(getattr(intent, "size_mult", 1.0) or 1.0),
-                    "gate_kelly": gate_kelly,
-                    "gate_score": gate_score,
-                    "structure": raw_struct,
-                    "direction": raw_dir,
-                    "reason": "matrix_intent",
-                })
+                size = coerce_size_mult(
+                    getattr(intent, "size_mult", None), default=1.0)
+                if size <= 0.0:
+                    pass  # zero size = no position
+                else:
+                    intents.append({
+                        "track": "legacy",
+                        "candidate": leg_cand,
+                        "size_mult": size,
+                        "gate_kelly": gate_kelly,
+                        "gate_score": gate_score,
+                        "structure": raw_struct,
+                        "direction": raw_dir,
+                        "reason": "matrix_intent",
+                    })
 
         # ---- V2 (PredictionPolicy) ----
         v2_action = str(signals.get("v2_policy_action") or "").upper()
@@ -816,19 +823,23 @@ class UnifiedOrchestrator:
                     structure_code=str(v2_struct),
                     candidate_id=signals.get("v2_top_candidate_id"))
             if v2_cand is not None:
-                size = float(signals.get("policy_size_cap")
-                             or signals.get("v2_policy_size_cap")
-                             or 1.0)
-                intents.append({
-                    "track": "v2",
-                    "candidate": v2_cand,
-                    "size_mult": size,
-                    "gate_kelly": getattr(v2_dec, "gate_kelly", None) if v2_dec else None,
-                    "gate_score": getattr(v2_dec, "gate_score", None) if v2_dec else None,
-                    "structure": v2_struct,
-                    "direction": v2_dir,
-                    "reason": "prediction_policy",
-                })
+                size = coerce_size_mult(
+                    signals.get("policy_size_cap")
+                    if signals.get("policy_size_cap") is not None
+                    else signals.get("v2_policy_size_cap"),
+                    default=1.0,
+                )
+                if size > 0.0:
+                    intents.append({
+                        "track": "v2",
+                        "candidate": v2_cand,
+                        "size_mult": size,
+                        "gate_kelly": getattr(v2_dec, "gate_kelly", None) if v2_dec else None,
+                        "gate_score": getattr(v2_dec, "gate_score", None) if v2_dec else None,
+                        "structure": v2_struct,
+                        "direction": v2_dir,
+                        "reason": "prediction_policy",
+                    })
 
         # ---- V3 (unified stack / Part 3 TradeDecisionV3) ----
         # Prefer the post-stack unified V3 decision so paper intents are built
@@ -873,27 +884,76 @@ class UnifiedOrchestrator:
                             cid, resolved_id)
                     else:
                         auth = getattr(self, "_tick_authoritative", None) or {}
-                        size = float(
-                            auth.get("size_mult")
-                            if auth.get("size_mult") is not None
-                            else (final_size_mult or 1.0)
-                        ) or 1.0
-                        intents.append({
-                            "track": "v3",
-                            "candidate": v3_cand,
-                            "size_mult": size,
-                            "gate_kelly": None,
-                            "gate_score": None,
-                            "structure": (
-                                v3.get("structure") or ds.get("family")),
-                            "direction": (
-                                v3.get("direction")
-                                or ds.get("direction")
-                                or signals.get("v2_policy_direction")),
-                            "candidate_id": cid,
-                            "v3_action": v3_action,
-                            "reason": "unified_v3",
-                        })
+                        if auth.get("size_mult") is not None:
+                            size = coerce_size_mult(auth.get("size_mult"),
+                                                    default=0.0)
+                        else:
+                            size = coerce_size_mult(final_size_mult,
+                                                    default=1.0)
+                        if size <= 0.0:
+                            log.info(
+                                "V3 TRADE suppressed: size_mult=%.4f <= 0",
+                                size)
+                        else:
+                            sel_eval = (
+                                (getattr(self, "_tick_part3", None) or {})
+                                .get("unified", {})
+                                .get("selected_candidate_evaluation")
+                            ) or {}
+                            exec_est = {
+                                "fill_probability": sel_eval.get(
+                                    "fill_probability"),
+                                "expected_fill_price": sel_eval.get(
+                                    "expected_fill_price"),
+                                "conservative_fill_price": sel_eval.get(
+                                    "conservative_fill_price"),
+                                "expected_order_value": sel_eval.get(
+                                    "expected_order_value"),
+                                "expected_concession": sel_eval.get(
+                                    "expected_concession"),
+                                "fees": sel_eval.get("fees"),
+                            }
+                            intents.append({
+                                "track": "v3",
+                                "candidate": v3_cand,
+                                "size_mult": size,
+                                "gate_kelly": None,
+                                "gate_score": None,
+                                "structure": (
+                                    v3.get("structure") or ds.get("family")),
+                                "direction": (
+                                    v3.get("direction")
+                                    or ds.get("direction")
+                                    or signals.get("v2_policy_direction")),
+                                "candidate_id": cid,
+                                "v3_action": v3_action,
+                                "reason": "unified_v3",
+                                "execution_estimate": exec_est,
+                            })
+
+        # Stamp risk_record on the authoritative intent only — record_trade
+        # fires when that paper position actually opens.
+        auth = getattr(self, "_tick_authoritative", None) or {}
+        part3 = getattr(self, "_tick_part3", None) or {}
+        auth_src = str(
+            part3.get("authority_source")
+            or (part3.get("unified") or {}).get("authority_source")
+            or ""
+        ).lower()
+        auth_trade = str(auth.get("final_action") or "").upper() == "TRADE"
+        auth_cid = auth.get("selected_candidate_id")
+        if auth_trade:
+            for intent in intents:
+                track = str(intent.get("track") or "").lower()
+                cid = (
+                    intent.get("candidate_id")
+                    or getattr(intent.get("candidate"), "candidate_id", None)
+                )
+                if auth_src in ("v3", "champion") and track == "v3":
+                    intent["risk_record"] = True
+                elif auth_src in ("", "legacy") and track == "legacy":
+                    if auth_cid is None or str(cid) == str(auth_cid):
+                        intent["risk_record"] = True
 
         return intents
 
@@ -1420,6 +1480,21 @@ class UnifiedOrchestrator:
             # Capture universe for the stack without replacing a caller-provided fn.
             stack.candidate_universe_fn = (
                 lambda snapshot, forecast=None, _u=universe: _u)
+
+            # Portfolio risk enters hard vetoes before final authority.
+            # record_trade is deferred until paper actually opens.
+            def _portfolio_risk(candidate_id: str, session_date: str):
+                if self.risk_manager is None:
+                    return ()
+                cand = self._pick_shadow_candidate(candidate_id=candidate_id)
+                if cand is None:
+                    return ("risk:candidate_unresolved",)
+                rcheck = self.risk_manager.check(cand, session_date)
+                if rcheck.approved:
+                    return ()
+                return tuple(f"risk:{v}" for v in (rcheck.vetoes or []))
+
+            stack.portfolio_risk_fn = _portfolio_risk
 
             legacy = self._legacy_decision_dict(
                 decision, intent, snapshot_id, final_size_mult)
@@ -2007,7 +2082,11 @@ class UnifiedOrchestrator:
 
             # Re-finalize signals_json after density provenance is attached.
             signals, signals_json = self._signals_with_ras(signals, ras_results)
-            # ---- Risk gate (optional, applied before journaling) ----
+            # ---- Risk gate (legacy journal only) ----
+            # Portfolio RiskManager.check/record_trade for the *authoritative*
+            # candidate runs via UnifiedDecisionStack.portfolio_risk_fn /
+            # paper open. Here we only annotate the legacy decision for the
+            # journal — never record_trade (that would desync state from V3).
             if (self.risk_manager is not None
                     and decision.decision == "TRADE"
                     and decision.candidate is not None):
@@ -2019,8 +2098,6 @@ class UnifiedOrchestrator:
                         decision="NO_TRADE",
                         no_trade_reason="risk:" + ",".join(rcheck.vetoes),
                     )
-                else:
-                    self.risk_manager.record_trade(decision.candidate, session_date)
             if self.journal:
                 row = decision.as_row()
                 row["signals_json"] = signals_json

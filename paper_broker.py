@@ -158,11 +158,13 @@ class PaperBroker:
 
     def __init__(self, db_path: str = "paper.sqlite", cfg: Optional[PaperConfig] = None,
                  notifier=None, symbol: str = "SPY",
-                 position_monitor: Optional[PositionMonitor] = None) -> None:
+                 position_monitor: Optional[PositionMonitor] = None,
+                 risk_manager=None) -> None:
         self.cfg = cfg or PaperConfig()
         self.symbol = symbol
         self._notifier = notifier
         self.position_monitor = position_monitor or PositionMonitor()
+        self.risk_manager = risk_manager
         self.open_positions: list[PaperPosition] = []
         self._db = sqlite3.connect(db_path)
         self._init_db()
@@ -362,10 +364,14 @@ class PaperBroker:
         mode_l = str(sig.get("policy_mode") or "").lower()
         # Pre-triple-paper: champion tagged the single fill as v2.
         track = "v2" if mode_l == "champion" else "legacy"
+        raw_size = getattr(result, "final_size_mult", None)
+        size_mult = 1.0 if raw_size is None else float(raw_size)
+        if size_mult <= 0.0:
+            return None
         return self._open_candidate(
             now, result, cand, chain, cmid, pmid, spr,
             track=track,
-            size_mult=float(getattr(result, "final_size_mult", 1.0) or 1.0),
+            size_mult=size_mult,
             gate_kelly=getattr(dec, "gate_kelly", None),
             gate_score=getattr(dec, "gate_score", None),
         )
@@ -380,10 +386,16 @@ class PaperBroker:
         cand = intent.get("candidate")
         if cand is None:
             return None
+        raw_size = intent.get("size_mult")
+        size_mult = 1.0 if raw_size is None else float(raw_size)
+        if size_mult <= 0.0:
+            log.info("paper entry suppressed [%s]: size_mult=%.4f <= 0",
+                     track, size_mult)
+            return None
         return self._open_candidate(
             now, result, cand, chain, cmid, pmid, spr,
             track=track,
-            size_mult=float(intent.get("size_mult") or 1.0),
+            size_mult=size_mult,
             gate_kelly=intent.get("gate_kelly"),
             gate_score=intent.get("gate_score"),
             intent_meta=intent,
@@ -433,7 +445,16 @@ class PaperBroker:
 
         legs = tuple(cand.legs)
         slip_entry = self._slippage_ps(legs, spr)
-        entry_credit = float(cand.credit) - slip_entry
+        meta_early = intent_meta or {}
+        exec_est = meta_early.get("execution_estimate") or {}
+        # Prefer V3 authorization fill price when present so paper P&L
+        # matches the execution distribution used for the decision.
+        exp_fill = exec_est.get("expected_fill_price")
+        if exp_fill is not None:
+            entry_credit = float(exp_fill)
+            slip_entry = 0.0  # already embedded in expected fill
+        else:
+            entry_credit = float(cand.credit) - slip_entry
 
         mp, ml = self._payoff_extents(legs, chain.spot, entry_credit)
         if ml <= 0:
@@ -529,6 +550,7 @@ class PaperBroker:
                 .get("decision_summary", {}) or {}).get("action"),
             "v3_selected_candidate_id": meta.get("candidate_id"),
             "intent_reason": meta.get("reason"),
+            "execution_estimate": exec_est or None,
         }
 
         pos = PaperPosition(
@@ -540,6 +562,13 @@ class PaperBroker:
         self.open_positions.append(pos)
         self.position_monitor.register(pos.id, entry_ctx)
         self._day_entries[key] = self._day_entries.get(key, 0) + 1
+        # Record portfolio risk state only after the authoritative open.
+        if (meta.get("risk_record")
+                and self.risk_manager is not None):
+            try:
+                self.risk_manager.record_trade(cand, date)
+            except Exception as exc:
+                log.warning("risk_manager.record_trade failed: %s", exc)
         self._notify("PAPER ENTRY",
                      f"[{track}] {pos.family} {pos.strikes_str()} x{contracts} "
                      f"entry={entry_credit:+.2f} maxP={mp:.2f} maxL={ml:.2f}")

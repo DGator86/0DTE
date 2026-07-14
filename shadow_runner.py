@@ -392,6 +392,7 @@ class ShadowRunner:
             db_path=primary_paper_db,
             cfg=paper_cfg, notifier=self._notifier, symbol=symbol,
             position_monitor=PositionMonitor(PositionRiskConfig(ras=self._ras_cfg)),
+            risk_manager=self._risk,
         )
         self._candidate_paper = None
         if candidate_paper_db:
@@ -400,6 +401,7 @@ class ShadowRunner:
                 cfg=paper_cfg, notifier=None, symbol=symbol,
                 position_monitor=PositionMonitor(
                     PositionRiskConfig(ras=self._ras_cfg)),
+                risk_manager=self._risk,
             )
             log.info("Candidate paper account: %s", candidate_paper_db)
 

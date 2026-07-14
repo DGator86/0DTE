@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from decision_stack.authority import resolve_authority
+from decision_stack.authority import coerce_size_mult, resolve_authority
 from decision_stack.contracts import UnifiedDecisionRecord
 
 
@@ -34,6 +34,9 @@ class UnifiedDecisionStack:
     legacy_score_fn: Optional[Callable] = None
     hard_veto_fn: Optional[Callable] = None
     persist_fn: Optional[Callable] = None
+    # (candidate_id, session_date) -> tuple[str, ...] risk veto reasons.
+    # Called after V3 selection; rejections enter hard_vetoes before final auth.
+    portfolio_risk_fn: Optional[Callable] = None
 
     def evaluate(
         self,
@@ -127,8 +130,8 @@ class UnifiedDecisionStack:
                     legacy_cand = legacy_decision.get("candidate_id")
                     legacy_struct = legacy_decision.get("structure")
                     legacy_dir = legacy_decision.get("direction")
-                    legacy_size = float(
-                        legacy_decision.get("size_mult") or 1.0)
+                    legacy_size = coerce_size_mult(
+                        legacy_decision.get("size_mult"), default=1.0)
             hard = tuple(hard_vetoes or ())
             auth = resolve_authority(
                 mode=mode,
@@ -243,8 +246,8 @@ class UnifiedDecisionStack:
                 legacy_cand = legacy_decision.get("candidate_id")
                 legacy_struct = legacy_decision.get("structure")
                 legacy_dir = legacy_decision.get("direction")
-                legacy_size = float(
-                    legacy_decision.get("size_mult") or 1.0)
+                legacy_size = coerce_size_mult(
+                    legacy_decision.get("size_mult"), default=1.0)
             else:
                 take = getattr(legacy_decision, "take", None)
                 if take is True:
@@ -264,8 +267,8 @@ class UnifiedDecisionStack:
                     getattr(cand, "family", None) if cand is not None
                     else getattr(legacy_decision, "structure", None))
                 legacy_dir = getattr(legacy_decision, "direction", None)
-                legacy_size = float(
-                    getattr(legacy_decision, "size_mult", 1.0) or 1.0)
+                legacy_size = coerce_size_mult(
+                    getattr(legacy_decision, "size_mult", None), default=1.0)
 
         if isinstance(v3_result, dict):
             v3_stat = str(v3_result.get("statistical_action")
@@ -277,7 +280,8 @@ class UnifiedDecisionStack:
             v3_dir = v3_result.get("direction")
             v3_reasons = tuple(v3_result.get("reasons") or ())
             selected_eval = v3_result.get("selected_candidate_evaluation")
-            v3_size = float(v3_result.get("size_mult") or 1.0)
+            v3_size = coerce_size_mult(
+                v3_result.get("size_mult"), default=1.0)
         else:
             v3_stat = str(getattr(v3_result, "statistical_action",
                                   "UNAVAILABLE"))
@@ -288,10 +292,33 @@ class UnifiedDecisionStack:
             v3_reasons = tuple(getattr(v3_result, "reasons", ()) or ())
             selected_eval = getattr(
                 v3_result, "selected_candidate_evaluation", None)
-            v3_size = float(getattr(v3_result, "size_mult", 1.0) or 1.0)
+            v3_size = coerce_size_mult(
+                getattr(v3_result, "size_mult", None), default=1.0)
+
+        # Portfolio risk against the V3-selected candidate enters hard vetoes
+        # before final authority (champion must not bypass RiskManager).
+        if (self.portfolio_risk_fn is not None
+                and str(v3_final).upper() == "TRADE"
+                and v3_cand):
+            try:
+                risk_extra = self.portfolio_risk_fn(
+                    str(v3_cand), str(session_date)) or ()
+                if risk_extra:
+                    hard = hard + tuple(str(x) for x in risk_extra)
+                    diagnostics["portfolio_risk_vetoes"] = list(risk_extra)
+                    # Reflect risk into V3 final action so paper intents and
+                    # dual-account candidate mode also see the veto.
+                    from prediction.part3_decision import _apply_vetoes
+                    v3_final, risk_reasons = _apply_vetoes(v3_final, hard)
+                    v3_reasons = v3_reasons + tuple(risk_reasons)
+            except Exception as exc:
+                diagnostics["portfolio_risk_error"] = str(exc)
+                hard = hard + ("risk:check_failed",)
+                v3_final = "HARD_VETO"
+                v3_reasons = v3_reasons + ("risk:check_failed",)
 
         # 11–12. Hard vetoes already applied inside build_v3_decision;
-        # authority router re-checks.
+        # authority router re-checks (including portfolio risk).
         auth = resolve_authority(
             mode=mode,
             legacy_decision={
@@ -315,6 +342,43 @@ class UnifiedDecisionStack:
             v3_size_mult=v3_size,
         )
         diagnostics["stages"].append("authority")
+
+        # If authority still wants TRADE on a non-V3 candidate (legacy
+        # shadow/reference), also portfolio-check that candidate.
+        if (self.portfolio_risk_fn is not None
+                and auth.final_action == "TRADE"
+                and auth.selected_candidate_id
+                and str(auth.selected_candidate_id) != str(v3_cand or "")):
+            try:
+                risk_extra = self.portfolio_risk_fn(
+                    str(auth.selected_candidate_id), str(session_date)) or ()
+                if risk_extra:
+                    hard = hard + tuple(str(x) for x in risk_extra)
+                    diagnostics["portfolio_risk_vetoes_auth"] = list(risk_extra)
+                    auth = resolve_authority(
+                        mode=mode,
+                        legacy_decision={
+                            "action": legacy_action,
+                            "candidate_id": legacy_cand,
+                            "structure": legacy_struct,
+                            "direction": legacy_dir,
+                            "size_mult": legacy_size,
+                        },
+                        v3_decision={
+                            "statistical_action": v3_stat,
+                            "final_action": v3_final,
+                            "candidate_id": v3_cand,
+                            "structure": v3_struct,
+                            "direction": v3_dir,
+                            "size_mult": v3_size,
+                        },
+                        hard_vetoes=hard,
+                        fallback_policy=fallback_policy,
+                        legacy_size_mult=legacy_size,
+                        v3_size_mult=v3_size,
+                    )
+            except Exception as exc:
+                diagnostics["portfolio_risk_error_auth"] = str(exc)
 
         disagreement = {
             "action": legacy_action != v3_final,

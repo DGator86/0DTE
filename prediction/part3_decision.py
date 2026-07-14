@@ -403,9 +403,16 @@ def build_v3_candidate_evaluations(
                     fill_unc = None
                     versions: dict = {}
 
-                    # Use loaded fill-probability model when fitted.
-                    if fill_p_model is not None and getattr(
-                            fill_p_model, "fitted", False):
+                    # One canonical fill-feature row for BOTH models.
+                    fill_feats = None
+                    need_fill_models = (
+                        (fill_p_model is not None
+                         and getattr(fill_p_model, "fitted", False))
+                        or (fill_c_model is not None
+                            and getattr(fill_c_model, "fitted", False))
+                        or mode in ("candidate", "champion")
+                    )
+                    if need_fill_models:
                         from prediction.adapters import (
                             fill_attempt_features_from_candidate,
                         )
@@ -417,7 +424,7 @@ def build_v3_candidate_evaluations(
                             raise Part3DecisionError(
                                 "quote_age_seconds unknown; refuse optimistic "
                                 "fill inference in candidate/champion mode")
-                        feats = fill_attempt_features_from_candidate(
+                        fill_feats = fill_attempt_features_from_candidate(
                             candidate=c,
                             mid_credit=mid,
                             natural_credit=natural,
@@ -427,11 +434,21 @@ def build_v3_candidate_evaluations(
                             minutes_to_close=(
                                 getattr(snapshot, "raw_features", {})
                                 or {}).get("minutes_to_close"),
-                            data_quality=float(
-                                getattr(forecast, "data_quality", None) or 0.0)
-                            if forecast is not None else None,
+                            data_quality=(
+                                float(getattr(forecast, "data_quality"))
+                                if (forecast is not None
+                                    and getattr(forecast, "data_quality", None)
+                                    is not None)
+                                else None
+                            ),
                         )
-                        fp = fill_p_model.predict(feats, family=fam)
+                        exec_diag["fill_feature_keys"] = sorted(
+                            fill_feats.keys())
+
+                    # Use loaded fill-probability model when fitted.
+                    if fill_p_model is not None and getattr(
+                            fill_p_model, "fitted", False):
+                        fp = fill_p_model.predict(fill_feats, family=fam)
                         p_fill_arg = float(fp.p_fill_60s)
                         fill_unc = float(fp.uncertainty)
                         versions["fill_probability"] = getattr(
@@ -441,21 +458,12 @@ def build_v3_candidate_evaluations(
                         raise Part3DecisionError(
                             "fill_probability model missing or unfitted")
 
-                    # Use loaded fill-concession model when fitted.
+                    # Use loaded fill-concession model when fitted —
+                    # same feature dict as fill probability (train/serve).
                     if fill_c_model is not None and getattr(
                             fill_c_model, "fitted", False):
-                        from prediction.adapters import (
-                            fill_attempt_features_from_candidate,
-                        )
-                        feats = fill_attempt_features_from_candidate(
-                            candidate=c,
-                            mid_credit=mid,
-                            natural_credit=natural,
-                            family=fam,
-                            n_legs=n_legs,
-                        )
                         fc = fill_c_model.predict(
-                            feats, family=fam, n_legs=n_legs)
+                            fill_feats, family=fam, n_legs=n_legs)
                         exp_frac = float(fc.expected_fill_fraction)
                         cons_frac = float(fc.conservative_fill_fraction)
                         versions["fill_concession"] = getattr(
@@ -528,6 +536,18 @@ def build_v3_candidate_evaluations(
                     fill_price = None
                     eov = None
 
+        # Strict modes: candidates without complete execution economics are
+        # not actionable (rank>5 skipped eval, or fill fields still None).
+        vetoes = tuple(ev.vetoes)
+        if mode in ("candidate", "champion"):
+            if (fill_p is None or fill_price is None or eov is None):
+                if "execution_failed" not in vetoes and (
+                        "credit_unavailable" not in vetoes):
+                    vetoes = vetoes + ("execution_not_evaluated",)
+                    exec_diag["execution_status"] = (
+                        exec_diag.get("execution_status")
+                        or "not_evaluated")
+
         out.append(CandidateEvaluation(
             candidate_id=ev.candidate_id,
             legacy_score=ev.legacy_score,
@@ -551,7 +571,7 @@ def build_v3_candidate_evaluations(
             expected_exit_cost=None,
             expected_order_value=eov,
             model_versions=model_versions,
-            vetoes=tuple(ev.vetoes),
+            vetoes=vetoes,
             diagnostics=exec_diag,
         ))
     return tuple(out)
@@ -615,12 +635,21 @@ def build_v3_decision(
             evaluations=evaluations,
         )
 
-    # Prefer ranked, non-vetoed candidates
-    actionable = [
-        e for e in evaluations
-        if e.final_rank is not None
-        and not e.vetoes
-    ]
+    # Prefer ranked, non-vetoed candidates with complete execution economics
+    # in strict modes (fill_p / fill_price / EOV must be present — never rely
+    # on thresholds to paper over missing execution evaluation).
+    def _actionable(e) -> bool:
+        if e.final_rank is None or e.vetoes:
+            return False
+        if mode in ("candidate", "champion"):
+            return (
+                e.fill_probability is not None
+                and e.expected_fill_price is not None
+                and e.expected_order_value is not None
+            )
+        return True
+
+    actionable = [e for e in evaluations if _actionable(e)]
     ranked = sorted(actionable, key=lambda e: e.final_rank or 999)
     if not ranked:
         # All vetoed / unranked
@@ -685,8 +714,21 @@ def build_v3_decision(
         ood = float(ood_raw) if ood_raw is not None else 0.1
         dq = float(dq_raw) if dq_raw is not None else 0.8
         p_pos = float(p_pos_raw) if p_pos_raw is not None else 0.5
-    eov = float(top.expected_order_value
-                if top.expected_order_value is not None else 0.0)
+    eov = (
+        float(top.expected_order_value)
+        if top.expected_order_value is not None else None
+    )
+    if mode in ("candidate", "champion") and eov is None:
+        return V3DecisionResult(
+            statistical_action="UNAVAILABLE",
+            final_action="UNAVAILABLE",
+            candidate_id=top.candidate_id,
+            reasons=("expected_order_value_unavailable",),
+            evaluations=evaluations,
+            selected_candidate_evaluation=top.to_dict(),
+        )
+    if eov is None:
+        eov = 0.0
     util = float(top.absolute_utility
                  if top.absolute_utility is not None else 0.0)
 

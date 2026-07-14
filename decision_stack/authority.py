@@ -61,6 +61,13 @@ def _field(decision: Any, *names: str, default=None):
     return default
 
 
+def coerce_size_mult(value: Any, *, default: float = 1.0) -> float:
+    """Preserve explicit 0.0 sizing — only substitute when value is None."""
+    if value is None:
+        return float(default)
+    return float(value)
+
+
 def resolve_authority(
     *,
     mode: str,
