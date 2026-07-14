@@ -35,9 +35,12 @@ SOURCE_FALLBACK_LEGACY = "fallback_legacy"
 @dataclass(frozen=True)
 class StructuralState:
     """
-    Dealer / wall geometry available to policy without closing the
-    forecast loop. Built from MarketSnapshot (or GEX panel) at the
-    call site — not inferred inside PredictionBundle.
+    Legacy simplified dealer / wall geometry for policy I/O.
+
+    V3 Part 2 expands structure in `prediction.structural_state.StructuralState`.
+    Conversion from V3 → this legacy view must be explicit via
+    `prediction.structural_state.StructuralState.to_legacy_policy_state()`.
+    Live gates continue to read MarketSnapshot OI fields unchanged.
     """
     spot: float = 0.0
     net_gex: float = 0.0
@@ -58,6 +61,16 @@ class StructuralState:
             put_wall=float(getattr(market, "put_wall", 0.0) or 0.0),
             gex_pct_rank=float(getattr(market, "gex_pct_rank", 0.5) or 0.5),
         )
+
+    @classmethod
+    def from_v3_structural(cls, v3_state: object) -> "StructuralState":
+        """Explicit V3 → legacy conversion (docs Part 2 §8)."""
+        to_legacy = getattr(v3_state, "to_legacy_policy_state", None)
+        if callable(to_legacy):
+            return to_legacy()
+        raise TypeError(
+            "from_v3_structural requires prediction.structural_state."
+            "StructuralState (got %r)" % (type(v3_state).__name__,))
 
     def to_dict(self) -> dict:
         return {
