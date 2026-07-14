@@ -7,6 +7,7 @@ execution_cost.py; new empirical provenance lives here.
 
 NOT financial advice.
 """
+from execution.estimate_v3 import ExecutionEstimateV3, build_execution_estimate_v3
 from execution.fill_records import (
     FILL_RECORD_VERSION,
     FillRecord,
@@ -19,4 +20,6 @@ __all__ = [
     "FillRecord",
     "fill_fraction",
     "validate_fill_record",
+    "ExecutionEstimateV3",
+    "build_execution_estimate_v3",
 ]
