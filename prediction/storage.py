@@ -227,6 +227,18 @@ CREATE INDEX IF NOT EXISTS ix_fill_session
 ON fill_records(session_date);
 CREATE INDEX IF NOT EXISTS ix_fill_candidate
 ON fill_records(candidate_id);
+
+CREATE TABLE IF NOT EXISTS meta_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    candidate_id TEXT,
+    model_version TEXT NOT NULL,
+    decision_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_meta_snapshot
+ON meta_decisions(snapshot_id);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -809,6 +821,45 @@ class PredictionStore:
                 row["record"] = json.loads(row.pop("record_json") or "{}")
             except (json.JSONDecodeError, TypeError):
                 row["record"] = {}
+            out.append(row)
+        return out
+
+    # ---- meta decisions (Part 3) ----------------------------------------------
+    def log_meta_decision(
+        self,
+        snapshot_id: str,
+        model_version: str,
+        decision: dict,
+        generated_at: str,
+        mode: str,
+        candidate_id=None,
+    ) -> int:
+        self.require_schema()
+        cur = self.conn.execute(
+            "INSERT INTO meta_decisions "
+            "(snapshot_id, candidate_id, model_version, decision_json, "
+            "generated_at, mode) VALUES (?,?,?,?,?,?)",
+            (snapshot_id, candidate_id, model_version,
+             _canonical_json(decision), generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_meta_decisions(self, snapshot_id=None) -> list:
+        self.require_schema()
+        sql = "SELECT * FROM meta_decisions"
+        args = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["decision"] = json.loads(row.pop("decision_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["decision"] = {}
             out.append(row)
         return out
 
