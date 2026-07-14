@@ -106,6 +106,21 @@ def rearrange_quantiles(q10, q50, q90) -> tuple:
     return stacked[0], stacked[1], stacked[2]
 
 
+def rearrange_quantile_grid(
+    quantile_preds: dict[float, np.ndarray],
+) -> dict[float, np.ndarray]:
+    """
+    Sort predicted quantile values per row so the quantile axis is monotone
+    (V3 Part 2 §16.3 — quantile rearrangement).
+    """
+    qs = sorted(quantile_preds.keys())
+    if not qs:
+        return {}
+    stacked = np.vstack([np.asarray(quantile_preds[q], dtype=float) for q in qs])
+    stacked = np.sort(stacked, axis=0)
+    return {q: stacked[i] for i, q in enumerate(qs)}
+
+
 def pinball_loss(y_true, y_pred, quantile: float) -> float:
     """Mean pinball (quantile) loss — the quantile model's fit metric."""
     y_true = np.asarray(y_true, dtype=float)
