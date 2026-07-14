@@ -239,6 +239,31 @@ CREATE TABLE IF NOT EXISTS meta_decisions (
 );
 CREATE INDEX IF NOT EXISTS ix_meta_snapshot
 ON meta_decisions(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS ensemble_weight_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of_session TEXT NOT NULL,
+    target TEXT NOT NULL,
+    horizon TEXT,
+    weights_json TEXT NOT NULL,
+    losses_json TEXT NOT NULL,
+    penalties_json TEXT,
+    configuration_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_weight_session
+ON ensemble_weight_history(as_of_session);
+
+CREATE TABLE IF NOT EXISTS drift_events (
+    event_id TEXT PRIMARY KEY,
+    model_id TEXT NOT NULL,
+    as_of_session TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    status_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_drift_model_session
+ON drift_events(model_id, as_of_session);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -860,6 +885,56 @@ class PredictionStore:
                 row["decision"] = json.loads(row.pop("decision_json") or "{}")
             except (json.JSONDecodeError, TypeError):
                 row["decision"] = {}
+            out.append(row)
+            out.append(row)
+        return out
+
+    # ---- ensemble weights / drift (Part 3) ------------------------------------
+    def log_ensemble_weights(
+        self, *, as_of_session, target, weights, losses, configuration_hash,
+        created_at, horizon=None, penalties=None,
+    ) -> int:
+        self.require_schema()
+        cur = self.conn.execute(
+            "INSERT INTO ensemble_weight_history "
+            "(as_of_session, target, horizon, weights_json, losses_json, "
+            "penalties_json, configuration_hash, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (as_of_session, target, horizon, _canonical_json(weights),
+             _canonical_json(losses),
+             _canonical_json(penalties) if penalties is not None else None,
+             configuration_hash, created_at),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def log_drift_event(self, event_id, model_id, as_of_session, severity,
+                        status, created_at) -> None:
+        self.require_schema()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO drift_events "
+            "(event_id, model_id, as_of_session, severity, status_json, "
+            "created_at) VALUES (?,?,?,?,?,?)",
+            (event_id, model_id, as_of_session, severity,
+             _canonical_json(status), created_at),
+        )
+        self.conn.commit()
+
+    def fetch_drift_events(self, model_id=None) -> list:
+        self.require_schema()
+        sql = "SELECT * FROM drift_events"
+        args = []
+        if model_id:
+            sql += " WHERE model_id=?"
+            args.append(model_id)
+        sql += " ORDER BY created_at, event_id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["status"] = json.loads(row.pop("status_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["status"] = {}
             out.append(row)
         return out
 
