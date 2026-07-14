@@ -88,10 +88,11 @@ def stage2_fills(records: Sequence[FillRecord]) -> list:
 
 
 def prior_fill_fraction_for_record(rec: FillRecord) -> float:
-    return float(fill_fraction_for(
+    frac, _ = fill_fraction_for(
         rec.family,
         n_legs=rec.n_legs,
         quote_age_seconds=rec.quote_age_seconds,
         minutes_to_close=rec.minutes_to_close,
         relative_spread=rec.relative_spread,
-    ))
+    )
+    return float(frac)
