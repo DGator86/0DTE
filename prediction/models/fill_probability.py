@@ -100,6 +100,8 @@ def fill_features_from_attempt(rec) -> dict:
     mid = float(d.get("mid_credit_at_submit") or 0.0)
     nat = float(d.get("natural_credit_at_submit") or 0.0)
     lim = float(d.get("limit_credit") if d.get("limit_credit") is not None else mid)
+    qa = d.get("quote_age_seconds")
+    mtc = d.get("minutes_to_close")
     return {
         "n_legs": float(d.get("n_legs") or 0),
         "is_credit": 1.0 if (d.get("side") or "credit").lower()
@@ -109,8 +111,10 @@ def fill_features_from_attempt(rec) -> dict:
         "relative_spread": float(d.get("relative_spread") or 0.0),
         "absolute_spread": float(d.get("absolute_spread") or 0.0),
         "option_price_scale": float(d.get("option_price_scale") or 0.0),
-        "quote_age_seconds": float(d.get("quote_age_seconds") or 0.0),
-        "minutes_to_close": float(d.get("minutes_to_close") or 0.0),
+        # Unknown age stays None so FeatureVectorizer marks missingness —
+        # never treat unknown as a fresh (0s) quote.
+        "quote_age_seconds": None if qa is None else float(qa),
+        "minutes_to_close": None if mtc is None else float(mtc),
         "realized_volatility": d.get("realized_volatility"),
         "implied_remaining_move": d.get("implied_remaining_move"),
         "data_quality": d.get("data_quality"),

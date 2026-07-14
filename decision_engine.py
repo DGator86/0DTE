@@ -39,7 +39,7 @@ from gate_scorer import MarketSnapshot, GateConfig, Decision, evaluate as gate_e
 from rnd_extractor import ChainSnapshot, RNDConfig, extract_rnd, compute_edge
 from spread_selector import (
     GammaContext, SelectorConfig, select_spreads, SpreadCandidate,
-    STRUCTURE_TO_FAMILIES, DEBIT_FAMILIES,
+    STRUCTURE_TO_FAMILIES, DEBIT_FAMILIES, reprice_candidates,
 )
 
 
@@ -164,8 +164,9 @@ def decide(
     premium gate and selector so credit can fill into a flip pin.
 
     When ``precomputed_candidates`` is provided (shared tick universe), the
-    selector is NOT re-run — candidates are filtered to the target family
-    and the best tradable pick is chosen from that immutable set.
+    selector is NOT re-run for geometry — but EV / score / vetoes are
+    **repriced** under the supplied ``physical_pdf`` so alternate-density
+    shadow and tilt paths remain meaningful.
     """
     cfg = cfg or EngineConfig()
     session_date = market.now.astimezone().date().isoformat()
@@ -201,7 +202,17 @@ def decide(
     all_candidates: list = []
     try:
         if precomputed_candidates is not None:
-            all_candidates = list(precomputed_candidates)
+            # Freeze geometry from the shared universe; reprice under this
+            # call's physical density (tilt / V2 shadow / pin CF).
+            rnd = extract_rnd(chain, cfg.rnd)
+            edge = compute_edge(rnd, chain, cfg.rnd, physical_pdf=physical_pdf)
+            edge_rich = edge.richness_signal
+            ctx = GammaContext.from_market_snapshot(market, pin_active=pin_active)
+            all_candidates = reprice_candidates(
+                list(precomputed_candidates),
+                chain, rnd, ctx, cfg.selector,
+                physical_pdf=physical_pdf,
+            )
             pool = all_candidates
             if fams is not None:
                 pool = [c for c in all_candidates
@@ -215,12 +226,6 @@ def decide(
                     key=lambda c: float(getattr(c, "score", 0.0) or 0.0))
             if candidate is None:
                 selector_reason = "no candidate in shared universe"
-            # Edge richness from first available candidate diagnostics if present
-            for c in all_candidates:
-                er = getattr(c, "edge_richness", None)
-                if er is not None:
-                    edge_rich = float(er)
-                    break
         else:
             rnd = extract_rnd(chain, cfg.rnd)
             edge = compute_edge(rnd, chain, cfg.rnd, physical_pdf=physical_pdf)

@@ -416,11 +416,15 @@ def _canonical_json(obj) -> str:
 
 
 def make_candidate_id(snapshot_id: str, family: str, legs: list) -> str:
-    """Stable candidate identity: observation + family + exact leg geometry."""
-    geom = _canonical_json([[lg["strike"], lg["kind"], lg["qty"]]
-                            for lg in legs])
-    payload = f"{snapshot_id}|{family}|{geom}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    """Canonical candidate identity — same function as the live universe.
+
+    Historical callers used a full SHA-256 of ``strike|kind|qty``. All writers
+    now share ``prediction.candidate_universe.make_candidate_id`` so V1/V2/V3
+    resolve the same ``cand_<24 hex>`` identity.
+    """
+    from prediction.candidate_universe import make_candidate_id as _canonical
+
+    return _canonical(snapshot_id, family=family, legs=legs)
 
 
 @dataclass

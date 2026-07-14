@@ -30,6 +30,7 @@ def adapt_candidate_forecast_v3(forecast: Any) -> dict:
     Map CandidateForecastV3 (or compatible) onto CandidateEvaluation fields.
 
     Required: p_profit, utility_score, expected_net_pnl, quantile ladder, ES.
+    Missing required fields raise AdapterError — never invent zero risk.
     """
     if isinstance(forecast, CandidateForecastV3):
         fc = forecast
@@ -41,27 +42,31 @@ def adapt_candidate_forecast_v3(forecast: Any) -> dict:
             f"expected CandidateForecastV3-like object with p_profit/"
             f"utility_score, got {type(forecast).__name__}")
 
-    p_profit = getattr(fc, "p_profit", None)
-    util = getattr(fc, "utility_score", None)
-    if p_profit is None or util is None:
+    required = (
+        "p_profit", "utility_score", "expected_net_pnl", "expected_shortfall",
+        "pnl_q05", "pnl_q10", "pnl_q25", "pnl_q50",
+        "pnl_q75", "pnl_q90", "pnl_q95",
+    )
+    missing = [n for n in required if getattr(fc, n, None) is None]
+    if missing:
         raise AdapterError(
-            "CandidateForecast missing required p_profit / utility_score")
+            "CandidateForecast missing required fields: "
+            + ",".join(missing))
 
     return {
         "candidate_id": str(getattr(fc, "candidate_id", "") or ""),
-        "expected_net_pnl": float(getattr(fc, "expected_net_pnl", 0.0) or 0.0),
-        "p_positive_pnl": float(p_profit),
-        "absolute_utility": float(util),
-        "expected_shortfall": float(
-            getattr(fc, "expected_shortfall", 0.0) or 0.0),
+        "expected_net_pnl": float(fc.expected_net_pnl),
+        "p_positive_pnl": float(fc.p_profit),
+        "absolute_utility": float(fc.utility_score),
+        "expected_shortfall": float(fc.expected_shortfall),
         "pnl_quantiles": {
-            "q05": float(getattr(fc, "pnl_q05", 0.0) or 0.0),
-            "q10": float(getattr(fc, "pnl_q10", 0.0) or 0.0),
-            "q25": float(getattr(fc, "pnl_q25", 0.0) or 0.0),
-            "q50": float(getattr(fc, "pnl_q50", 0.0) or 0.0),
-            "q75": float(getattr(fc, "pnl_q75", 0.0) or 0.0),
-            "q90": float(getattr(fc, "pnl_q90", 0.0) or 0.0),
-            "q95": float(getattr(fc, "pnl_q95", 0.0) or 0.0),
+            "q05": float(fc.pnl_q05),
+            "q10": float(fc.pnl_q10),
+            "q25": float(fc.pnl_q25),
+            "q50": float(fc.pnl_q50),
+            "q75": float(fc.pnl_q75),
+            "q90": float(fc.pnl_q90),
+            "q95": float(fc.pnl_q95),
         },
         "model_versions": {
             "candidate_value": str(
@@ -86,17 +91,23 @@ def verify_candidate_feature_schema(
     trained_feature_names: Optional[Sequence[str]] = None,
 ) -> list[str]:
     """
-    Return list of trained feature names missing from serving rows.
+    Return trained feature names missing from **any** serving row.
 
-    Prefer ``trained_feature_names`` from the fitted vectorizer. Schema hash
-    is a secondary check used when the name list is unavailable.
+    Checks each row individually — a batch-union check would pass when only
+    some candidates carry a required key (silent median imputation).
     """
     if not rows:
         return list(trained_feature_names or []) or ["<empty_rows>"]
-    present = set().union(*(r.keys() for r in rows))
     if trained_feature_names:
-        return [n for n in trained_feature_names if n not in present]
+        missing: set[str] = set()
+        for r in rows:
+            present = set(r.keys())
+            for n in trained_feature_names:
+                if n not in present:
+                    missing.add(n)
+        return sorted(missing)
     if expected_hash:
+        # Hash path still uses the union (single schema fingerprint).
         got = candidate_feature_schema_hash(rows)
         if got != expected_hash:
             return [f"schema_hash:{got}!={expected_hash}"]
@@ -229,8 +240,11 @@ def fill_attempt_features_from_candidate(
         "relative_spread": float(rel),
         "absolute_spread": float(abs_spread),
         "option_price_scale": abs(float(mid_credit)),
-        "quote_age_seconds": float(quote_age_seconds or 0.0),
-        "minutes_to_close": float(minutes_to_close or 0.0),
+        # Preserve unknown quote age as None — never coerce to fresh (0.0).
+        "quote_age_seconds": (
+            None if quote_age_seconds is None else float(quote_age_seconds)),
+        "minutes_to_close": (
+            None if minutes_to_close is None else float(minutes_to_close)),
         "realized_volatility": realized_volatility,
         "implied_remaining_move": implied_remaining_move,
         "data_quality": data_quality,

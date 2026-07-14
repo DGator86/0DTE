@@ -565,7 +565,11 @@ class UnifiedOrchestrator:
                             == decision.candidate.short_strikes
                             and c.long_strikes
                             == decision.candidate.long_strikes):
-                        live_id = getattr(c, "_v2_candidate_id", None)
+                        live_id = (
+                            getattr(c, "candidate_id", None)
+                            or getattr(c, "v2_candidate_id", None)
+                            or getattr(c, "_v2_candidate_id", None)
+                        )
                         break
                 if live_id and live_id in ranking.forecasts:
                     fc = ranking.forecasts[live_id]
@@ -585,16 +589,28 @@ class UnifiedOrchestrator:
     def _pick_shadow_candidate(self, candidate_id: Optional[str] = None,
                                family: Optional[str] = None,
                                structure_code: Optional[str] = None):
-        """Pick a concrete SpreadCandidate from this tick's shadow set."""
+        """Pick a concrete SpreadCandidate from this tick's shadow set.
+
+        When ``candidate_id`` is supplied, resolve **exactly** that identity
+        (``candidate_id`` / ``v2_candidate_id`` / ``_v2_candidate_id`` aliases).
+        Never fall back by family — an unresolved explicit ID returns ``None``
+        so the caller can mark the decision UNAVAILABLE rather than paper-
+        trading a substitute.
+        """
         cands = list(getattr(self, "_tick_shadow_cands", None) or [])
         if not cands:
             return None
-        if candidate_id:
+        if candidate_id is not None and str(candidate_id).strip():
+            want = str(candidate_id).strip()
             for c in cands:
-                cid = getattr(c, "_v2_candidate_id", None) or getattr(
-                    c, "v2_candidate_id", None)
-                if cid == candidate_id:
+                aliases = (
+                    getattr(c, "candidate_id", None),
+                    getattr(c, "v2_candidate_id", None),
+                    getattr(c, "_v2_candidate_id", None),
+                )
+                if any(a is not None and str(a) == want for a in aliases):
                     return c
+            return None
         if structure_code:
             try:
                 from spread_selector import STRUCTURE_TO_FAMILIES
@@ -613,7 +629,10 @@ class UnifiedOrchestrator:
         forecasts = getattr(self, "_tick_shadow_forecasts", None) or {}
         best, best_u = None, None
         for c in cands:
-            cid = getattr(c, "_v2_candidate_id", None)
+            cid = (
+                getattr(c, "candidate_id", None)
+                or getattr(c, "_v2_candidate_id", None)
+            )
             fc = forecasts.get(cid) if cid else None
             u = float(getattr(fc, "utility_score", None)
                       or getattr(c, "v2_utility_score", None)
@@ -652,25 +671,12 @@ class UnifiedOrchestrator:
         except Exception as exc:
             log.warning("shared candidate universe generation failed: %s", exc)
             cands = []
-        # Stamp stable candidate ids when missing
+        # Stamp stable candidate ids (canonical + v2 aliases)
         if snapshot_id and cands:
             try:
-                from prediction.candidate_universe import (
-                    make_candidate_id, _legs_from,
-                )
+                from prediction.candidate_universe import stamp_candidate_id
                 for c in cands:
-                    if getattr(c, "candidate_id", None) or getattr(
-                            c, "v2_candidate_id", None):
-                        continue
-                    cid = make_candidate_id(
-                        snapshot_id,
-                        family=str(getattr(c, "family", None) or "unknown"),
-                        legs=_legs_from(c),
-                    )
-                    try:
-                        setattr(c, "candidate_id", cid)
-                    except Exception:
-                        pass
+                    stamp_candidate_id(c, snapshot_id)
             except Exception:
                 pass
         self._tick_shared_cands = cands
@@ -843,37 +849,51 @@ class UnifiedOrchestrator:
                 or part3.get("selected_candidate_id")
                 or ds.get("selected_candidate_id")
             )
-            v3_cand = self._pick_shadow_candidate(
-                candidate_id=cid,
-                family=(
-                    v3.get("structure")
-                    or ds.get("family")
-                    or (part3.get("ranking") or {}).get("top_family")
-                ),
-            )
-            if v3_cand is not None:
-                auth = getattr(self, "_tick_authoritative", None) or {}
-                size = float(
-                    auth.get("size_mult")
-                    if auth.get("size_mult") is not None
-                    else (final_size_mult or 1.0)
-                ) or 1.0
-                intents.append({
-                    "track": "v3",
-                    "candidate": v3_cand,
-                    "size_mult": size,
-                    "gate_kelly": None,
-                    "gate_score": None,
-                    "structure": (
-                        v3.get("structure") or ds.get("family")),
-                    "direction": (
-                        v3.get("direction")
-                        or ds.get("direction")
-                        or signals.get("v2_policy_direction")),
-                    "candidate_id": cid,
-                    "v3_action": v3_action,
-                    "reason": "unified_v3",
-                })
+            # Explicit ID required for V3 paper — never family-fallback.
+            if not cid:
+                log.warning(
+                    "V3 TRADE without selected_candidate_id; skip paper intent")
+            else:
+                v3_cand = self._pick_shadow_candidate(candidate_id=str(cid))
+                if v3_cand is None:
+                    log.warning(
+                        "V3 selected candidate_id=%s unresolved in shared "
+                        "universe; skip paper intent (no family substitute)",
+                        cid)
+                else:
+                    resolved_id = (
+                        getattr(v3_cand, "candidate_id", None)
+                        or getattr(v3_cand, "v2_candidate_id", None)
+                        or getattr(v3_cand, "_v2_candidate_id", None)
+                    )
+                    if str(resolved_id) != str(cid):
+                        log.error(
+                            "V3 candidate identity mismatch: selected=%s "
+                            "resolved=%s; refusing paper intent",
+                            cid, resolved_id)
+                    else:
+                        auth = getattr(self, "_tick_authoritative", None) or {}
+                        size = float(
+                            auth.get("size_mult")
+                            if auth.get("size_mult") is not None
+                            else (final_size_mult or 1.0)
+                        ) or 1.0
+                        intents.append({
+                            "track": "v3",
+                            "candidate": v3_cand,
+                            "size_mult": size,
+                            "gate_kelly": None,
+                            "gate_score": None,
+                            "structure": (
+                                v3.get("structure") or ds.get("family")),
+                            "direction": (
+                                v3.get("direction")
+                                or ds.get("direction")
+                                or signals.get("v2_policy_direction")),
+                            "candidate_id": cid,
+                            "v3_action": v3_action,
+                            "reason": "unified_v3",
+                        })
 
         return intents
 
@@ -1369,7 +1389,11 @@ class UnifiedOrchestrator:
                 raw_features=row,
                 snapshot_id=snapshot_id,
                 quality={
-                    "data_quality": float(signals.get("data_quality") or 0.85),
+                    "data_quality": (
+                        float(signals["data_quality"])
+                        if signals.get("data_quality") is not None
+                        else 0.85
+                    ),
                     "feature_coverage": min(1.0, len(row) / 40.0),
                 },
                 source_timestamps=src_ts,

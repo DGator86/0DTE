@@ -60,26 +60,72 @@ class CandidateUniverse:
         }
 
 
+def _normalize_leg_dict(leg: dict) -> dict:
+    """Canonical leg dict for ID hashing: right, side, qty, strike, expiration."""
+    kind = str(
+        leg.get("right") or leg.get("option_type") or leg.get("kind") or ""
+    ).upper()
+    if kind in ("CALL",):
+        kind = "C"
+    elif kind in ("PUT",):
+        kind = "P"
+    qty_raw = leg.get("qty")
+    if qty_raw is None:
+        qty_raw = leg.get("quantity")
+    qty = int(qty_raw if qty_raw is not None else 1)
+    side = leg.get("side") or leg.get("action")
+    if side is None:
+        side = "sell" if qty < 0 else "buy"
+    side = str(side).lower()
+    # Canonical qty is signed: sell negative, buy positive.
+    if side in ("sell", "short") and qty > 0:
+        qty = -qty
+    elif side in ("buy", "long") and qty < 0:
+        qty = abs(qty)
+    return {
+        "right": kind[:1] if kind else "",
+        "side": side,
+        "qty": qty,
+        "strike": float(leg.get("strike") or 0.0),
+        "expiration": str(leg.get("expiration") or leg.get("expiry") or ""),
+    }
+
+
 def _legs_from(candidate: Any) -> Sequence[dict]:
     if isinstance(candidate, dict):
-        return list(candidate.get("legs") or [])
+        return [_normalize_leg_dict(lg) if isinstance(lg, dict) else lg
+                for lg in (candidate.get("legs") or [])]
     legs = getattr(candidate, "legs", None) or ()
     out = []
     for leg in legs:
         if isinstance(leg, dict):
-            out.append(leg)
+            out.append(_normalize_leg_dict(leg))
         else:
-            out.append({
-                "right": getattr(leg, "right", None)
-                or getattr(leg, "option_type", None),
-                "side": getattr(leg, "side", None)
-                or getattr(leg, "action", None),
-                "qty": getattr(leg, "qty", None)
-                or getattr(leg, "quantity", 1),
+            kind = str(
+                getattr(leg, "kind", None)
+                or getattr(leg, "right", None)
+                or getattr(leg, "option_type", None)
+                or ""
+            ).upper()
+            if kind in ("CALL",):
+                kind = "C"
+            elif kind in ("PUT",):
+                kind = "P"
+            qty = int(getattr(leg, "qty", None)
+                      or getattr(leg, "quantity", 1) or 1)
+            side = getattr(leg, "side", None) or getattr(leg, "action", None)
+            if side is None:
+                side = "sell" if qty < 0 else "buy"
+            out.append(_normalize_leg_dict({
+                "right": kind[:1] if kind else "",
+                "side": side,
+                "qty": qty,
                 "strike": getattr(leg, "strike", None),
-                "expiration": getattr(leg, "expiration", None)
-                or getattr(leg, "expiry", None),
-            })
+                "expiration": (
+                    getattr(leg, "expiration", None)
+                    or getattr(leg, "expiry", None)
+                ),
+            }))
     return out
 
 
@@ -91,17 +137,13 @@ def make_candidate_id(
 ) -> str:
     """
     Deterministic candidate ID incorporating snapshot, family, and legs.
+
+    This is the single canonical identity function for V1/V2/V3.
     """
-    normalized_legs = []
-    for leg in legs:
-        normalized_legs.append({
-            "right": str(leg.get("right") or leg.get("option_type") or ""),
-            "side": str(leg.get("side") or leg.get("action") or ""),
-            "qty": int(leg.get("qty") or leg.get("quantity") or 1),
-            "strike": float(leg.get("strike") or 0.0),
-            "expiration": str(
-                leg.get("expiration") or leg.get("expiry") or ""),
-        })
+    normalized_legs = [_normalize_leg_dict(dict(leg)) for leg in legs]
+    # Sort for order-independence
+    normalized_legs.sort(
+        key=lambda lg: (lg["right"], lg["side"], lg["strike"], lg["qty"]))
     payload = {
         "snapshot_id": snapshot_id,
         "family": str(family),
@@ -111,6 +153,33 @@ def make_candidate_id(
         json.dumps(payload, sort_keys=True, separators=(",", ":"),
                    default=str).encode("utf-8")).hexdigest()
     return f"cand_{digest[:24]}"
+
+
+def stamp_candidate_id(candidate: Any, snapshot_id: str) -> str:
+    """Assign canonical candidate_id (and v2 alias) onto a candidate object."""
+    family = (
+        candidate.get("family") if isinstance(candidate, dict)
+        else getattr(candidate, "family", "unknown"))
+    legs = _legs_from(candidate)
+    existing = (
+        (candidate.get("candidate_id") if isinstance(candidate, dict)
+         else getattr(candidate, "candidate_id", None))
+    )
+    cid = existing or make_candidate_id(
+        snapshot_id, family=str(family or "unknown"), legs=legs)
+    if isinstance(candidate, dict):
+        candidate["candidate_id"] = cid
+        candidate["v2_candidate_id"] = cid
+    else:
+        for attr in ("candidate_id", "v2_candidate_id", "_v2_candidate_id"):
+            try:
+                setattr(candidate, attr, cid)
+            except Exception:
+                try:
+                    object.__setattr__(candidate, attr, cid)
+                except Exception:
+                    pass
+    return cid
 
 
 def generator_configuration_hash(config: Optional[dict] = None) -> str:
@@ -140,6 +209,8 @@ def build_candidate_universe(
     frozen = []
     seen_ids: set[str] = set()
     for c in candidates:
+        if isinstance(c, dict):
+            c = dict(c)
         family = (
             c.get("family") if isinstance(c, dict)
             else getattr(c, "family", "unknown"))
@@ -154,17 +225,7 @@ def build_candidate_universe(
             continue
         seen_ids.add(cid)
         if assign_ids:
-            if isinstance(c, dict):
-                c = dict(c)
-                c["candidate_id"] = cid
-            else:
-                try:
-                    object.__setattr__(c, "candidate_id", cid)
-                except (AttributeError, TypeError):
-                    try:
-                        setattr(c, "candidate_id", cid)
-                    except Exception:
-                        pass
+            stamp_candidate_id(c, snapshot_id)
         frozen.append(c)
     return CandidateUniverse(
         snapshot_id=str(snapshot_id),

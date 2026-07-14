@@ -64,8 +64,8 @@ def build_v3_forecast(
     model_versions: dict = {}
     uncertainty = 0.25
     ood_score = 0.0
-    data_quality = float(
-        (getattr(snapshot, "quality", {}) or {}).get("data_quality") or 0.85)
+    dq_raw = (getattr(snapshot, "quality", {}) or {}).get("data_quality")
+    data_quality = float(dq_raw) if dq_raw is not None else 0.85
     feature_coverage = float(
         (getattr(snapshot, "quality", {}) or {}).get("feature_coverage")
         or (len(row) / 40.0 if row else 0.0))

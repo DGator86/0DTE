@@ -409,15 +409,21 @@ def build_v3_candidate_evaluations(
                         from prediction.adapters import (
                             fill_attempt_features_from_candidate,
                         )
+                        quote_age = (
+                            getattr(snapshot, "source_ages_seconds", {})
+                            or {}).get("chain")
+                        if (mode in ("candidate", "champion")
+                                and quote_age is None):
+                            raise Part3DecisionError(
+                                "quote_age_seconds unknown; refuse optimistic "
+                                "fill inference in candidate/champion mode")
                         feats = fill_attempt_features_from_candidate(
                             candidate=c,
                             mid_credit=mid,
                             natural_credit=natural,
                             family=fam,
                             n_legs=n_legs,
-                            quote_age_seconds=(
-                                getattr(snapshot, "source_ages_seconds", {})
-                                or {}).get("chain"),
+                            quote_age_seconds=quote_age,
                             minutes_to_close=(
                                 getattr(snapshot, "raw_features", {})
                                 or {}).get("minutes_to_close"),

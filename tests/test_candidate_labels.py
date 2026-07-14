@@ -170,7 +170,7 @@ class TestCandidateStorage:
     def test_candidate_id_stable_and_geometry_sensitive(self):
         a = make_candidate_id("snap1", "put_credit", PCS_LEGS)
         b = make_candidate_id("snap1", "put_credit", PCS_LEGS)
-        assert a == b and len(a) == 64
+        assert a == b and a.startswith("cand_") and len(a) == 29
         other = [{"strike": 598.0, "kind": "P", "qty": -1},
                  {"strike": 597.0, "kind": "P", "qty": 1}]
         assert make_candidate_id("snap1", "put_credit", other) != a
