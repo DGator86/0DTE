@@ -39,6 +39,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol, Sequence
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -130,6 +131,9 @@ class UnifiedOrchestrator:
     classifier_cfg: Optional[ClassifierConfig] = None
     physical_pdf: Optional[Callable] = None     # callable(grid)->density for Track A
     risk_manager: Optional[RiskManager] = None
+    # Separate ledger for the V3 candidate dual-paper account (candidate mode).
+    # When None, portfolio_risk_fn falls back to risk_manager for both accounts.
+    candidate_risk_manager: Optional[RiskManager] = None
     state_path: Optional[str] = None            # persist adaptive scales across restarts
     ras_cfg: Optional[RASConfig] = None
     # Static per-dominant-regime engine deltas from the champion config
@@ -900,6 +904,7 @@ class UnifiedOrchestrator:
                                 .get("unified", {})
                                 .get("selected_candidate_evaluation")
                             ) or {}
+                            diag = sel_eval.get("diagnostics") or {}
                             exec_est = {
                                 "fill_probability": sel_eval.get(
                                     "fill_probability"),
@@ -912,6 +917,10 @@ class UnifiedOrchestrator:
                                 "expected_concession": sel_eval.get(
                                     "expected_concession"),
                                 "fees": sel_eval.get("fees"),
+                                "entry_fees": diag.get("entry_fees"),
+                                "expected_exit_fees": diag.get(
+                                    "expected_exit_fees"),
+                                "mid_credit": diag.get("mid_credit"),
                             }
                             intents.append({
                                 "track": "v3",
@@ -931,29 +940,9 @@ class UnifiedOrchestrator:
                                 "execution_estimate": exec_est,
                             })
 
-        # Stamp risk_record on the authoritative intent only — record_trade
-        # fires when that paper position actually opens.
-        auth = getattr(self, "_tick_authoritative", None) or {}
-        part3 = getattr(self, "_tick_part3", None) or {}
-        auth_src = str(
-            part3.get("authority_source")
-            or (part3.get("unified") or {}).get("authority_source")
-            or ""
-        ).lower()
-        auth_trade = str(auth.get("final_action") or "").upper() == "TRADE"
-        auth_cid = auth.get("selected_candidate_id")
-        if auth_trade:
-            for intent in intents:
-                track = str(intent.get("track") or "").lower()
-                cid = (
-                    intent.get("candidate_id")
-                    or getattr(intent.get("candidate"), "candidate_id", None)
-                )
-                if auth_src in ("v3", "champion") and track == "v3":
-                    intent["risk_record"] = True
-                elif auth_src in ("", "legacy") and track == "legacy":
-                    if auth_cid is None or str(cid) == str(auth_cid):
-                        intent["risk_record"] = True
+        # Each paper account records into its own RiskManager on open.
+        for intent in intents:
+            intent["risk_record"] = True
 
         return intents
 
@@ -1481,15 +1470,44 @@ class UnifiedOrchestrator:
             stack.candidate_universe_fn = (
                 lambda snapshot, forecast=None, _u=universe: _u)
 
-            # Portfolio risk enters hard vetoes before final authority.
-            # record_trade is deferred until paper actually opens.
-            def _portfolio_risk(candidate_id: str, session_date: str):
-                if self.risk_manager is None:
+            # Portfolio risk is account-scoped. record_trade deferred to paper open.
+            def _portfolio_risk(candidate_id: str, session_date: str,
+                                account: str = "v3"):
+                rm = self.risk_manager
+                if str(account).lower() in ("v3", "candidate"):
+                    rm = getattr(self, "candidate_risk_manager", None) or rm
+                if rm is None:
                     return ()
                 cand = self._pick_shadow_candidate(candidate_id=candidate_id)
                 if cand is None:
                     return ("risk:candidate_unresolved",)
-                rcheck = self.risk_manager.check(cand, session_date)
+                # Prefer execution-adjusted max loss when V3 economics exist.
+                risk_cand = cand
+                try:
+                    sel = (
+                        (getattr(self, "_tick_part3", None) or {})
+                        .get("unified", {})
+                        .get("selected_candidate_evaluation")
+                    ) or {}
+                    if (str(sel.get("candidate_id") or "") == str(candidate_id)
+                            and sel.get("expected_fill_price") is not None):
+                        mid = (sel.get("diagnostics") or {}).get("mid_credit")
+                        if mid is None:
+                            mid = getattr(cand, "credit", None)
+                        exp = float(sel["expected_fill_price"])
+                        base_ml = float(getattr(cand, "max_loss", 0.0) or 0.0)
+                        if mid is not None:
+                            # Worse fill → higher max loss for credit structures.
+                            adj = base_ml + max(0.0, float(mid) - exp)
+                            risk_cand = SimpleNamespace(
+                                family=getattr(cand, "family", None),
+                                max_loss=adj,
+                                gamma=getattr(cand, "gamma", 0.0),
+                                capital=getattr(cand, "capital", adj),
+                            )
+                except Exception:
+                    risk_cand = cand
+                rcheck = rm.check(risk_cand, session_date)
                 if rcheck.approved:
                     return ()
                 return tuple(f"risk:{v}" for v in (rcheck.vetoes or []))

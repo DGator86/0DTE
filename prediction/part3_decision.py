@@ -298,6 +298,20 @@ def build_v3_candidate_evaluations(
             model_versions["candidate_value"] = "legacy_ev_baseline"
 
         utilities[cid] = float(util)
+        # Propagate selector-level vetoes (negative EV, touch, illiquidity, …)
+        # so the pairwise ranker cannot promote a rejected SpreadCandidate.
+        selector_vetoes: tuple = ()
+        if isinstance(c, dict):
+            passes = c.get("passes_vetoes")
+            reasons = c.get("veto_reasons") or ()
+        else:
+            passes = getattr(c, "passes_vetoes", None)
+            reasons = getattr(c, "veto_reasons", None) or ()
+        if passes is False:
+            selector_vetoes = tuple(
+                f"selector:{r}" for r in reasons
+            ) or ("selector:vetoed",)
+
         evaluations.append(CandidateEvaluation(
             candidate_id=cid,
             legacy_score=(
@@ -311,6 +325,7 @@ def build_v3_candidate_evaluations(
             expected_shortfall=expected_shortfall,
             absolute_utility=float(util),
             model_versions=model_versions,
+            vetoes=selector_vetoes,
         ))
 
     # Pairwise ranking
@@ -320,8 +335,14 @@ def build_v3_candidate_evaluations(
         from prediction.models.candidate_rank import PairwiseCandidateRanker
         ranker = (rank_model if rank_model is not None
                   else PairwiseCandidateRanker())
-        if mode in ("candidate", "champion") and rank_model is None:
-            raise Part3DecisionError("candidate_rank required")
+        if mode in ("candidate", "champion"):
+            if rank_model is None:
+                raise Part3DecisionError("candidate_rank required")
+            if not getattr(rank_model, "fitted", False):
+                raise Part3DecisionError("candidate_rank_unusable")
+        vetoed_ids = {
+            e.candidate_id for e in evaluations if e.vetoes
+        }
         rank_inputs = [_as_rank_dict(c) for c in candidates
                        if str(_cand_field(c, "candidate_id")
                               or _cand_field(c, "v2_candidate_id") or "")
@@ -330,7 +351,7 @@ def build_v3_candidate_evaluations(
             getattr(snapshot, "snapshot_id", ""),
             rank_inputs,
             absolute_utilities=utilities,
-            vetoed_ids=set(),
+            vetoed_ids=vetoed_ids,
         )
         ranked_ids = list(getattr(ranking, "ordered_candidate_ids", ()) or [])
         if not ranked_ids and getattr(ranking, "top_candidate_id", None):
@@ -339,10 +360,14 @@ def build_v3_candidate_evaluations(
             getattr(ranking, "ranking_uncertainty", None) or 0.25)
     except Exception as exc:
         if mode in ("candidate", "champion"):
+            reason = "candidate_rank_unusable" if (
+                "unusable" in str(exc).lower()
+                or "candidate_rank_unusable" in str(exc)
+            ) else "ranking_failed"
             return tuple(
                 CandidateEvaluation(
                     candidate_id=e.candidate_id,
-                    vetoes=tuple(e.vetoes) + ("ranking_failed",),
+                    vetoes=tuple(e.vetoes) + (reason,),
                     diagnostics={"rank_error": str(exc)},
                     model_versions=dict(e.model_versions),
                 )
@@ -365,6 +390,7 @@ def build_v3_candidate_evaluations(
 
         if (rank is not None and rank <= 5
                 and ev.absolute_utility is not None
+                and not ev.vetoes
                 and "required_component_missing" not in (ev.vetoes or ())):
             c = cand_by_id.get(ev.candidate_id)
             mid, natural, credit_diag = _mid_and_natural_credit(c)
@@ -510,6 +536,8 @@ def build_v3_candidate_evaluations(
                         "natural_credit": natural,
                         "expected_credit": fill_price,
                         "conservative_credit": cons_fill,
+                        "entry_fees": float(est.entry_fees),
+                        "expected_exit_fees": float(est.expected_exit_fees),
                     })
                 except Exception as exc:
                     exec_diag["execution_status"] = "failed"

@@ -142,6 +142,9 @@ class ShadowRunner:
             gex_history_path=os.path.join(state_dir, "gex_history.json"),
         )
         self._risk = RiskManager(risk_cfg) if risk_cfg else None
+        # Separate candidate-account risk ledger when dual-paper is enabled.
+        # Created later once we know candidate_paper_db; placeholder for now.
+        self._candidate_risk = None
         # One RASConfig shared by the orchestrator (scores + actions), the
         # position monitor (action suppression), and the paper broker (whether
         # an "exit" action actually closes) — a single flag, never three that
@@ -396,14 +399,20 @@ class ShadowRunner:
         )
         self._candidate_paper = None
         if candidate_paper_db:
+            # Independent risk state for the V3 candidate account.
+            self._candidate_risk = (
+                RiskManager(risk_cfg) if risk_cfg else RiskManager()
+            )
             self._candidate_paper = PaperBroker(
                 db_path=candidate_paper_db,
                 cfg=paper_cfg, notifier=None, symbol=symbol,
                 position_monitor=PositionMonitor(
                     PositionRiskConfig(ras=self._ras_cfg)),
-                risk_manager=self._risk,
+                risk_manager=self._candidate_risk,
             )
-            log.info("Candidate paper account: %s", candidate_paper_db)
+            self._orch.candidate_risk_manager = self._candidate_risk
+            log.info("Candidate paper account: %s (separate risk ledger)",
+                     candidate_paper_db)
 
         log.info("Initialized. DB=%s symbol=%s interval=%ds", db_path, symbol, interval_s)
         log.info("Paper account: $%.0f start (simulated fills, no real orders).",
@@ -678,6 +687,8 @@ class ShadowRunner:
                 self._recorder.record_settlement(session_date, price)
         if self._risk:
             self._risk.close_positions()
+        if getattr(self, "_candidate_risk", None) is not None:
+            self._candidate_risk.close_positions()
         if n > 0:
             log.info("Settled %s: %d rows updated with EOD price.", session_date, n)
         else:

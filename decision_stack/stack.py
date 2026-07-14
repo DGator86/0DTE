@@ -34,8 +34,10 @@ class UnifiedDecisionStack:
     legacy_score_fn: Optional[Callable] = None
     hard_veto_fn: Optional[Callable] = None
     persist_fn: Optional[Callable] = None
-    # (candidate_id, session_date) -> tuple[str, ...] risk veto reasons.
-    # Called after V3 selection; rejections enter hard_vetoes before final auth.
+    # (candidate_id, session_date, account="v3"|"legacy") -> veto reason strings.
+    # Candidate-mode V3 vetoes must NOT enter global hard_vetoes (that would
+    # incorrectly HARD_VETO the legacy reference account). Champion-mode V3
+    # risk may also append to hard_vetoes for belt-and-suspenders.
     portfolio_risk_fn: Optional[Callable] = None
 
     def evaluate(
@@ -295,30 +297,38 @@ class UnifiedDecisionStack:
             v3_size = coerce_size_mult(
                 getattr(v3_result, "size_mult", None), default=1.0)
 
-        # Portfolio risk against the V3-selected candidate enters hard vetoes
-        # before final authority (champion must not bypass RiskManager).
+        # Portfolio risk is account-scoped:
+        #   * V3 / candidate account → apply to v3_final only (candidate mode
+        #     must not HARD_VETO the legacy reference account).
+        #   * Champion → also append to hard_vetoes (authoritative fail-closed).
         if (self.portfolio_risk_fn is not None
                 and str(v3_final).upper() == "TRADE"
                 and v3_cand):
             try:
                 risk_extra = self.portfolio_risk_fn(
-                    str(v3_cand), str(session_date)) or ()
-                if risk_extra:
-                    hard = hard + tuple(str(x) for x in risk_extra)
-                    diagnostics["portfolio_risk_vetoes"] = list(risk_extra)
-                    # Reflect risk into V3 final action so paper intents and
-                    # dual-account candidate mode also see the veto.
-                    from prediction.part3_decision import _apply_vetoes
-                    v3_final, risk_reasons = _apply_vetoes(v3_final, hard)
-                    v3_reasons = v3_reasons + tuple(risk_reasons)
+                    str(v3_cand), str(session_date), account="v3") or ()
+            except TypeError:
+                # Backward-compatible callables without the account kwarg.
+                try:
+                    risk_extra = self.portfolio_risk_fn(
+                        str(v3_cand), str(session_date)) or ()
+                except Exception as exc:
+                    diagnostics["portfolio_risk_error"] = str(exc)
+                    risk_extra = ("risk:check_failed",)
             except Exception as exc:
                 diagnostics["portfolio_risk_error"] = str(exc)
-                hard = hard + ("risk:check_failed",)
-                v3_final = "HARD_VETO"
-                v3_reasons = v3_reasons + ("risk:check_failed",)
+                risk_extra = ("risk:check_failed",)
+            if risk_extra:
+                diagnostics["v3_portfolio_risk_vetoes"] = list(risk_extra)
+                from prediction.part3_decision import _apply_vetoes
+                v3_final, risk_reasons = _apply_vetoes(
+                    v3_final, tuple(risk_extra))
+                v3_reasons = v3_reasons + tuple(risk_reasons)
+                if str(mode).lower() == "champion":
+                    hard = hard + tuple(str(x) for x in risk_extra)
 
         # 11–12. Hard vetoes already applied inside build_v3_decision;
-        # authority router re-checks (including portfolio risk).
+        # authority router re-checks (champion risk may be in hard).
         auth = resolve_authority(
             mode=mode,
             legacy_decision={
@@ -343,42 +353,50 @@ class UnifiedDecisionStack:
         )
         diagnostics["stages"].append("authority")
 
-        # If authority still wants TRADE on a non-V3 candidate (legacy
-        # shadow/reference), also portfolio-check that candidate.
+        # Reference / legacy-authority portfolio risk. Fail closed on errors.
         if (self.portfolio_risk_fn is not None
                 and auth.final_action == "TRADE"
                 and auth.selected_candidate_id
-                and str(auth.selected_candidate_id) != str(v3_cand or "")):
+                and str(getattr(auth, "authority_source", "") or "").lower()
+                in ("legacy", "")):
+            risk_extra: tuple = ()
             try:
-                risk_extra = self.portfolio_risk_fn(
-                    str(auth.selected_candidate_id), str(session_date)) or ()
-                if risk_extra:
-                    hard = hard + tuple(str(x) for x in risk_extra)
-                    diagnostics["portfolio_risk_vetoes_auth"] = list(risk_extra)
-                    auth = resolve_authority(
-                        mode=mode,
-                        legacy_decision={
-                            "action": legacy_action,
-                            "candidate_id": legacy_cand,
-                            "structure": legacy_struct,
-                            "direction": legacy_dir,
-                            "size_mult": legacy_size,
-                        },
-                        v3_decision={
-                            "statistical_action": v3_stat,
-                            "final_action": v3_final,
-                            "candidate_id": v3_cand,
-                            "structure": v3_struct,
-                            "direction": v3_dir,
-                            "size_mult": v3_size,
-                        },
-                        hard_vetoes=hard,
-                        fallback_policy=fallback_policy,
-                        legacy_size_mult=legacy_size,
-                        v3_size_mult=v3_size,
-                    )
+                try:
+                    risk_extra = tuple(self.portfolio_risk_fn(
+                        str(auth.selected_candidate_id), str(session_date),
+                        account="legacy") or ())
+                except TypeError:
+                    risk_extra = tuple(self.portfolio_risk_fn(
+                        str(auth.selected_candidate_id),
+                        str(session_date)) or ())
             except Exception as exc:
                 diagnostics["portfolio_risk_error_auth"] = str(exc)
+                risk_extra = ("risk:check_failed",)
+            if risk_extra:
+                hard = hard + tuple(str(x) for x in risk_extra)
+                diagnostics["legacy_portfolio_risk_vetoes"] = list(risk_extra)
+                auth = resolve_authority(
+                    mode=mode,
+                    legacy_decision={
+                        "action": legacy_action,
+                        "candidate_id": legacy_cand,
+                        "structure": legacy_struct,
+                        "direction": legacy_dir,
+                        "size_mult": legacy_size,
+                    },
+                    v3_decision={
+                        "statistical_action": v3_stat,
+                        "final_action": v3_final,
+                        "candidate_id": v3_cand,
+                        "structure": v3_struct,
+                        "direction": v3_dir,
+                        "size_mult": v3_size,
+                    },
+                    hard_vetoes=hard,
+                    fallback_policy=fallback_policy,
+                    legacy_size_mult=legacy_size,
+                    v3_size_mult=v3_size,
+                )
 
         disagreement = {
             "action": legacy_action != v3_final,
