@@ -52,6 +52,7 @@ def serialize_tick_result(
     feed_source: Optional[str] = None,
     paper_summary: Optional[dict] = None,
     market_status: Optional[dict] = None,
+    part3: Optional[dict] = None,
 ) -> dict:
     """Build live_state payload from a UnifiedOrchestrator tick."""
     regime = result.regime
@@ -253,6 +254,11 @@ def serialize_tick_result(
         "forecast": forecast or None,
         "parallel": parallel,
         "sigma_cones": sigma_cones,
+        "part3": part3 if part3 is not None else {
+            "note": "part3 decision not available",
+            "shadow_label": "SHADOW — not an executed order",
+            "mode": "shadow",
+        },
     }
     return payload
 
