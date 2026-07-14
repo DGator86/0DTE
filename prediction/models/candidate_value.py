@@ -46,16 +46,23 @@ from prediction.models.base import (
     interval_coverage,
     log_loss_score,
     pinball_loss,
+    rearrange_quantile_grid,
     rearrange_quantiles,
 )
 
 CANDIDATE_VALUE_VERSION = "v3.0.0-part1"
+CANDIDATE_FORECAST_V3_VERSION = "v3.0.0"
+CANDIDATE_LABEL_VERSION = "v3.0.0"
 QUANTILES = (0.1, 0.5, 0.9)
+# Part 3 expanded P&L quantile grid (§5.2)
+QUANTILES_V3 = (
+    0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95,
+)
 
 
 @dataclass(frozen=True)
 class CandidateForecast:
-    """Ranking output for one candidate (§11.6)."""
+    """Ranking output for one candidate (§11.6 / Part 1)."""
     candidate_id: str
     expected_net_pnl: float
     p_profit: float
@@ -100,6 +107,77 @@ class CandidateForecast:
         )
 
 
+@dataclass(frozen=True)
+class CandidateForecastV3:
+    """Distributional candidate forecast (Part 3 §5.3)."""
+
+    candidate_id: str
+    expected_net_pnl: float
+    p_profit: float
+    pnl_q05: float
+    pnl_q10: float
+    pnl_q25: float
+    pnl_q50: float
+    pnl_q75: float
+    pnl_q90: float
+    pnl_q95: float
+    expected_shortfall: float
+    p_target_first: Optional[float]
+    p_stop_first: Optional[float]
+    p_neither: Optional[float]
+    expected_time_in_trade: Optional[float]
+    fill_probability: float
+    expected_fill_fraction: float
+    conservative_fill_fraction: float
+    fill_uncertainty: float
+    model_uncertainty: float
+    forecast_uncertainty: float
+    ood_score: float
+    capital_required: float
+    maximum_loss: float
+    return_on_risk: Optional[float]
+    utility_score: float
+    model_version: str = CANDIDATE_FORECAST_V3_VERSION
+    diagnostics: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        qs = (
+            self.pnl_q05, self.pnl_q10, self.pnl_q25, self.pnl_q50,
+            self.pnl_q75, self.pnl_q90, self.pnl_q95,
+        )
+        for a, b in zip(qs, qs[1:]):
+            if b + 1e-12 < a:
+                raise ValueError(f"P&L quantiles not ordered: {qs}")
+        if self.expected_shortfall < -1e-12:
+            raise ValueError(
+                f"expected_shortfall must be >= 0, got {self.expected_shortfall}")
+
+    def to_dict(self) -> dict:
+        from dataclasses import asdict
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CandidateForecastV3":
+        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+    def to_legacy(self) -> CandidateForecast:
+        """Project to Part 1 CandidateForecast for compatibility."""
+        return CandidateForecast(
+            candidate_id=self.candidate_id,
+            expected_net_pnl=self.expected_net_pnl,
+            p_profit=self.p_profit,
+            pnl_q10=self.pnl_q10,
+            pnl_q50=self.pnl_q50,
+            pnl_q90=self.pnl_q90,
+            expected_shortfall=self.expected_shortfall,
+            fill_uncertainty=self.fill_uncertainty,
+            model_uncertainty=self.model_uncertainty,
+            utility_score=self.utility_score,
+            model_version=self.model_version,
+        )
+
+
 @dataclass
 class CandidateValueConfig:
     c_grid: tuple = (0.05, 0.1, 0.5, 1.0)
@@ -117,6 +195,8 @@ class CandidateValueConfig:
     l2_regularization: float = 1.0
     quantile_max_iter: int = 150
     quantiles: tuple = QUANTILES
+    # Part 3: set True (or pass QUANTILES_V3) for expanded distribution
+    expanded_distribution: bool = False
     # V3 selection / cross-fit
     bias_weight: float = 0.25
     downside_weight: float = 0.25
@@ -130,7 +210,12 @@ class CandidateValueConfig:
     hgb_learning_rate_grid: tuple = (0.05, 0.1)
     hgb_max_depth_grid: tuple = (2, 3)
     feature_version: str = "v2.0.0"
-    label_version: str = "v2.0.0"
+    label_version: str = CANDIDATE_LABEL_VERSION
+
+    def effective_quantiles(self) -> tuple:
+        if self.expanded_distribution and self.quantiles == QUANTILES:
+            return QUANTILES_V3
+        return tuple(float(q) for q in self.quantiles)
 
 
 def _elasticnet_regressor(cfg: CandidateValueConfig, params: dict):
@@ -336,7 +421,7 @@ class CandidateValueModel:
         self._base_profit = float(np.mean(y_profit)) if len(y_profit) else 0.5
 
         self.quantile_estimators = {}
-        for q in self.config.quantiles:
+        for q in self.config.effective_quantiles():
             est = _quantile_regressor(self.config, q)
             est.fit(X, y_pnl)
             self.quantile_estimators[q] = est
@@ -561,7 +646,8 @@ class CandidateValueModel:
         if not inner:
             return {"note": "insufficient_sessions_for_quantile_oof"}
 
-        pinballs = {q: [] for q in self.config.quantiles}
+        q_levels = self.config.effective_quantiles()
+        pinballs = {q: [] for q in q_levels}
         coverages = []
         widths = []
         downside_miss = []
@@ -580,27 +666,33 @@ class CandidateValueModel:
             X_tr = vec.transform([rows[i] for i in tr])
             X_va = vec.transform([rows[i] for i in va])
             raw = {}
-            for q in self.config.quantiles:
+            for q in q_levels:
                 est = _quantile_regressor(self.config, q)
                 est.fit(X_tr, y_pnl[tr])
                 raw[q] = np.asarray(est.predict(X_va), dtype=float)
                 pinballs[q].append(pinball_loss(y_pnl[va], raw[q], q))
-            # Crossing before rearrangement
-            crossed = np.mean(
-                (raw[0.1] > raw[0.5]) | (raw[0.5] > raw[0.9])
-                | (raw[0.1] > raw[0.9]))
-            crossings.append(float(crossed))
-            q10, q50, q90 = rearrange_quantiles(raw[0.1], raw[0.5], raw[0.9])
-            coverages.append(interval_coverage(y_pnl[va], q10, q90))
-            widths.append(float(np.mean(q90 - q10)))
-            # Downside miss: realized below q10
-            downside_miss.append(float(np.mean(y_pnl[va] < q10)))
+            # Crossing before rearrangement (adjacent quantile pairs)
+            sorted_q = sorted(raw)
+            crossed = 0.0
+            n_pairs = 0
+            for a, b in zip(sorted_q, sorted_q[1:]):
+                crossed += float(np.mean(raw[a] > raw[b]))
+                n_pairs += 1
+            crossings.append(crossed / max(n_pairs, 1))
+            ordered = rearrange_quantile_grid(raw)
+            lo_key = 0.10 if 0.10 in ordered else sorted_q[0]
+            hi_key = 0.90 if 0.90 in ordered else sorted_q[-1]
+            q_lo = ordered[lo_key]
+            q_hi = ordered[hi_key]
+            coverages.append(interval_coverage(y_pnl[va], q_lo, q_hi))
+            widths.append(float(np.mean(q_hi - q_lo)))
+            downside_miss.append(float(np.mean(y_pnl[va] < q_lo)))
             for j, idx in enumerate(va):
                 fam = _family_of(rows[idx])
                 by_family.setdefault(fam, []).append({
                     "y": float(y_pnl[idx]),
-                    "q10": float(q10[j]),
-                    "q90": float(q90[j]),
+                    "q10": float(q_lo[j]),
+                    "q90": float(q_hi[j]),
                 })
 
         family_metrics = {}
@@ -624,6 +716,7 @@ class CandidateValueModel:
             "quantile_crossing_rate_before_rearrangement": (
                 float(np.mean(crossings)) if crossings else None),
             "by_option_family": family_metrics,
+            "quantile_grid": list(q_levels),
         }
 
     def predict_components(self, rows: Sequence[dict]) -> dict:
@@ -644,18 +737,42 @@ class CandidateValueModel:
                 self.profit_estimator.predict_proba(X)[:, 1])
             p_profit = clip_probability(self.profit_calibrator.transform(raw))
 
-        preds = [self.quantile_estimators[q].predict(X)
-                 for q in self.config.quantiles]
-        q10, q50, q90 = rearrange_quantiles(*preds)
-        shortfall = np.maximum(-q10, 0.0)
+        qs = sorted(self.quantile_estimators.keys())
+        raw_q = {q: np.asarray(self.quantile_estimators[q].predict(X),
+                               dtype=float)
+                 for q in qs}
+        ordered = rearrange_quantile_grid(raw_q) if len(qs) != 3 else None
+        if ordered is None:
+            # Legacy 3-quantile path
+            q10, q50, q90 = rearrange_quantiles(
+                *[raw_q[q] for q in qs])
+            ordered = {qs[0]: q10, qs[1]: q50, qs[2]: q90}
+
+        def _q(level: float, default_key: float | None = None):
+            if level in ordered:
+                return ordered[level]
+            # nearest available
+            nearest = min(ordered.keys(), key=lambda k: abs(k - level))
+            return ordered[nearest]
+
+        q10 = _q(0.10)
+        q50 = _q(0.50)
+        q90 = _q(0.90)
+        q05 = _q(0.05)
+        shortfall = np.maximum(-q05, 0.0)
         return {
             "expected_net_pnl": exp,
             "p_profit": p_profit,
+            "pnl_q05": q05,
             "pnl_q10": q10,
+            "pnl_q25": _q(0.25),
             "pnl_q50": q50,
+            "pnl_q75": _q(0.75),
             "pnl_q90": q90,
+            "pnl_q95": _q(0.95),
             "expected_shortfall": shortfall,
             "model_uncertainty": np.full(n, self._model_uncertainty),
+            "quantile_grid": ordered,
         }
 
     def predict(
@@ -695,5 +812,91 @@ class CandidateValueModel:
             else:
                 util = fc.expected_net_pnl
             out.append(CandidateForecast(
+                **{**fc.to_dict(), "utility_score": util}))
+        return out
+
+    def predict_v3(
+        self,
+        rows: Sequence[dict],
+        *,
+        candidate_ids: Optional[Sequence[str]] = None,
+        fill_probability: Optional[Sequence[float]] = None,
+        expected_fill_fraction: Optional[Sequence[float]] = None,
+        conservative_fill_fraction: Optional[Sequence[float]] = None,
+        fill_uncertainty: Optional[Sequence[float]] = None,
+        forecast_uncertainty: Optional[Sequence[float]] = None,
+        ood_score: Optional[Sequence[float]] = None,
+        capital_required: Optional[Sequence[float]] = None,
+        maximum_loss: Optional[Sequence[float]] = None,
+        p_target_first: Optional[Sequence[Optional[float]]] = None,
+        p_stop_first: Optional[Sequence[Optional[float]]] = None,
+        p_neither: Optional[Sequence[Optional[float]]] = None,
+        expected_time_in_trade: Optional[Sequence[Optional[float]]] = None,
+        utility_fn=None,
+    ) -> list[CandidateForecastV3]:
+        """Part 3 distributional candidate forecasts (§5)."""
+        comps = self.predict_components(rows)
+        n = len(rows)
+        ids = list(candidate_ids) if candidate_ids is not None else [
+            f"cand_{i}" for i in range(n)]
+
+        def _arr(src, default):
+            if src is None:
+                return np.full(n, default, dtype=float)
+            return np.asarray(src, dtype=float)
+
+        fills = _arr(fill_uncertainty, 0.0)
+        p_fill = _arr(fill_probability, 0.5)
+        exp_ff = _arr(expected_fill_fraction, 0.5)
+        cons_ff = _arr(conservative_fill_fraction, 0.75)
+        f_unc = _arr(forecast_uncertainty, 0.0)
+        oods = _arr(ood_score, 0.0)
+        caps = _arr(capital_required, 0.0)
+        max_loss = _arr(maximum_loss, 0.0)
+
+        out: list[CandidateForecastV3] = []
+        for i in range(n):
+            ml = float(max_loss[i])
+            exp = float(comps["expected_net_pnl"][i])
+            ror = (exp / ml) if ml > 1e-12 else None
+            fc = CandidateForecastV3(
+                candidate_id=ids[i],
+                expected_net_pnl=exp,
+                p_profit=float(comps["p_profit"][i]),
+                pnl_q05=float(comps["pnl_q05"][i]),
+                pnl_q10=float(comps["pnl_q10"][i]),
+                pnl_q25=float(comps["pnl_q25"][i]),
+                pnl_q50=float(comps["pnl_q50"][i]),
+                pnl_q75=float(comps["pnl_q75"][i]),
+                pnl_q90=float(comps["pnl_q90"][i]),
+                pnl_q95=float(comps["pnl_q95"][i]),
+                expected_shortfall=float(comps["expected_shortfall"][i]),
+                p_target_first=(None if p_target_first is None
+                                else p_target_first[i]),
+                p_stop_first=(None if p_stop_first is None
+                              else p_stop_first[i]),
+                p_neither=(None if p_neither is None else p_neither[i]),
+                expected_time_in_trade=(
+                    None if expected_time_in_trade is None
+                    else expected_time_in_trade[i]),
+                fill_probability=float(p_fill[i]),
+                expected_fill_fraction=float(exp_ff[i]),
+                conservative_fill_fraction=float(cons_ff[i]),
+                fill_uncertainty=float(fills[i]),
+                model_uncertainty=float(comps["model_uncertainty"][i]),
+                forecast_uncertainty=float(f_unc[i]),
+                ood_score=float(oods[i]),
+                capital_required=float(caps[i]),
+                maximum_loss=ml,
+                return_on_risk=ror,
+                utility_score=0.0,
+                model_version=CANDIDATE_FORECAST_V3_VERSION,
+                diagnostics={"label_version": self.config.label_version},
+            )
+            if utility_fn is not None:
+                util = float(utility_fn(fc))
+            else:
+                util = fc.expected_net_pnl
+            out.append(CandidateForecastV3(
                 **{**fc.to_dict(), "utility_score": util}))
         return out

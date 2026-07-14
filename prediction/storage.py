@@ -152,6 +152,140 @@ CREATE TABLE IF NOT EXISTS structural_states (
     structural_version TEXT NOT NULL,
     state_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS regime_outputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    probabilities_json TEXT NOT NULL,
+    uncertainty REAL,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_regime_snapshot
+ON regime_outputs(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS competing_risk_outputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    forecast_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_competing_snapshot
+ON competing_risk_outputs(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS path_forecasts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    event_probabilities_json TEXT NOT NULL,
+    distribution_json TEXT,
+    diagnostics_json TEXT,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_path_snapshot
+ON path_forecasts(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS ensemble_outputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    forecast_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_ensemble_snapshot
+ON ensemble_outputs(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS candidate_rank_outputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    ranking_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_candidate_rank_snapshot
+ON candidate_rank_outputs(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS fill_records (
+    fill_record_id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    record_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_fill_session
+ON fill_records(session_date);
+CREATE INDEX IF NOT EXISTS ix_fill_candidate
+ON fill_records(candidate_id);
+
+CREATE TABLE IF NOT EXISTS meta_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    candidate_id TEXT,
+    model_version TEXT NOT NULL,
+    decision_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_meta_snapshot
+ON meta_decisions(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS ensemble_weight_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of_session TEXT NOT NULL,
+    target TEXT NOT NULL,
+    horizon TEXT,
+    weights_json TEXT NOT NULL,
+    losses_json TEXT NOT NULL,
+    penalties_json TEXT,
+    configuration_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_weight_session
+ON ensemble_weight_history(as_of_session);
+
+CREATE TABLE IF NOT EXISTS drift_events (
+    event_id TEXT PRIMARY KEY,
+    model_id TEXT NOT NULL,
+    as_of_session TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    status_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_drift_model_session
+ON drift_events(model_id, as_of_session);
+
+CREATE TABLE IF NOT EXISTS promotion_reviews (
+    review_id TEXT PRIMARY KEY,
+    model_group_id TEXT NOT NULL,
+    current_status TEXT NOT NULL,
+    proposed_status TEXT NOT NULL,
+    review_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS deployment_history (
+    deployment_id TEXT PRIMARY KEY,
+    deployed_at TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    active_models_json TEXT NOT NULL,
+    prior_models_json TEXT,
+    configuration_hash TEXT NOT NULL,
+    rollback_target_json TEXT,
+    deployed_by TEXT,
+    note TEXT
+);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -465,6 +599,415 @@ class PredictionStore:
                 row["state"] = json.loads(row.pop("state_json") or "{}")
             except (json.JSONDecodeError, TypeError):
                 row["state"] = {}
+            out.append(row)
+        return out
+
+    # ---- regime outputs (V3 Part 2 §35 / PR 9) ---------------------------------
+    def log_regime_output(
+        self,
+        snapshot_id: str,
+        model_version: str,
+        probabilities: dict,
+        *,
+        uncertainty: Optional[float] = None,
+        generated_at: Optional[str] = None,
+        mode: str = "shadow",
+    ) -> int:
+        self.require_schema()
+        import datetime as _dt
+        generated_at = generated_at or _dt.datetime.now(
+            _dt.timezone.utc).isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO regime_outputs "
+            "(snapshot_id, model_version, probabilities_json, uncertainty, "
+            "generated_at, mode) VALUES (?,?,?,?,?,?)",
+            (snapshot_id, model_version, _canonical_json(probabilities),
+             uncertainty, generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_regime_outputs(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM regime_outputs"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["probabilities"] = json.loads(
+                    row.pop("probabilities_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["probabilities"] = {}
+            out.append(row)
+        return out
+
+    # ---- competing risk / path / ensemble (V3 Part 2 §35 / PR 16) --------------
+    def log_competing_risk_output(
+        self, snapshot_id: str, target_name: str, horizon: str,
+        model_version: str, forecast: dict, *,
+        generated_at: Optional[str] = None, mode: str = "shadow",
+    ) -> int:
+        self.require_schema()
+        import datetime as _dt
+        generated_at = generated_at or _dt.datetime.now(
+            _dt.timezone.utc).isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO competing_risk_outputs "
+            "(snapshot_id, target_name, horizon, model_version, forecast_json, "
+            "generated_at, mode) VALUES (?,?,?,?,?,?,?)",
+            (snapshot_id, target_name, horizon, model_version,
+             _canonical_json(forecast), generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_competing_risk_outputs(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM competing_risk_outputs"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["forecast"] = json.loads(row.pop("forecast_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["forecast"] = {}
+            out.append(row)
+        return out
+
+    def log_path_forecast(
+        self, snapshot_id: str, model_version: str, horizon: str,
+        event_probabilities: dict, *,
+        distribution: Optional[dict] = None,
+        diagnostics: Optional[dict] = None,
+        generated_at: Optional[str] = None, mode: str = "shadow",
+    ) -> int:
+        self.require_schema()
+        import datetime as _dt
+        generated_at = generated_at or _dt.datetime.now(
+            _dt.timezone.utc).isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO path_forecasts "
+            "(snapshot_id, model_version, horizon, event_probabilities_json, "
+            "distribution_json, diagnostics_json, generated_at, mode) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (snapshot_id, model_version, horizon,
+             _canonical_json(event_probabilities),
+             _canonical_json(distribution or {}),
+             _canonical_json(diagnostics or {}),
+             generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_path_forecasts(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM path_forecasts"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            for src, dest in (
+                ("event_probabilities_json", "event_probabilities"),
+                ("distribution_json", "distribution"),
+                ("diagnostics_json", "diagnostics"),
+            ):
+                raw = row.pop(src, None)
+                try:
+                    row[dest] = json.loads(raw) if raw else {}
+                except (json.JSONDecodeError, TypeError):
+                    row[dest] = {}
+            out.append(row)
+        return out
+
+    def log_ensemble_output(
+        self, snapshot_id: str, target_name: str, horizon: str,
+        model_version: str, forecast: dict, *,
+        generated_at: Optional[str] = None, mode: str = "shadow",
+    ) -> int:
+        self.require_schema()
+        import datetime as _dt
+        generated_at = generated_at or _dt.datetime.now(
+            _dt.timezone.utc).isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO ensemble_outputs "
+            "(snapshot_id, target_name, horizon, model_version, forecast_json, "
+            "generated_at, mode) VALUES (?,?,?,?,?,?,?)",
+            (snapshot_id, target_name, horizon, model_version,
+             _canonical_json(forecast), generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_ensemble_outputs(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM ensemble_outputs"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["forecast"] = json.loads(row.pop("forecast_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["forecast"] = {}
+            out.append(row)
+        return out
+
+    # ---- candidate ranking (Part 3) -------------------------------------------
+    def log_candidate_ranking(
+        self,
+        snapshot_id: str,
+        model_version: str,
+        ranking: dict,
+        generated_at: str,
+        mode: str,
+    ) -> int:
+        self.require_schema()
+        cur = self.conn.execute(
+            "INSERT INTO candidate_rank_outputs "
+            "(snapshot_id, model_version, ranking_json, generated_at, mode) "
+            "VALUES (?,?,?,?,?)",
+            (snapshot_id, model_version, _canonical_json(ranking),
+             generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_candidate_rankings(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM candidate_rank_outputs"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["ranking"] = json.loads(row.pop("ranking_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["ranking"] = {}
+            out.append(row)
+        return out
+
+    # ---- fill records (Part 3) ------------------------------------------------
+    def log_fill_record(self, record) -> None:
+        """Idempotent upsert by fill_record_id. Validates via execution module."""
+        self.require_schema()
+        from execution.fill_records import FillRecord, validate_fill_record
+        if hasattr(record, "to_dict"):
+            rec = record
+            payload = record.to_dict()
+        else:
+            rec = FillRecord.from_dict(record)
+            payload = rec.to_dict()
+        validate_fill_record(rec)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO fill_records "
+            "(fill_record_id, snapshot_id, candidate_id, session_date, "
+            "record_json) VALUES (?,?,?,?,?)",
+            (rec.fill_record_id, rec.snapshot_id, rec.candidate_id,
+             rec.session_date, _canonical_json(payload)),
+        )
+        self.conn.commit()
+
+    def fetch_fill_records(
+        self,
+        *,
+        session_date: Optional[str] = None,
+        candidate_id: Optional[str] = None,
+        snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM fill_records"
+        conds, args = [], []
+        if session_date:
+            conds.append("session_date=?")
+            args.append(session_date)
+        if candidate_id:
+            conds.append("candidate_id=?")
+            args.append(candidate_id)
+        if snapshot_id:
+            conds.append("snapshot_id=?")
+            args.append(snapshot_id)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY session_date, fill_record_id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["record"] = json.loads(row.pop("record_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["record"] = {}
+            out.append(row)
+        return out
+
+    # ---- meta decisions (Part 3) ----------------------------------------------
+    def log_meta_decision(
+        self,
+        snapshot_id: str,
+        model_version: str,
+        decision: dict,
+        generated_at: str,
+        mode: str,
+        candidate_id=None,
+    ) -> int:
+        self.require_schema()
+        cur = self.conn.execute(
+            "INSERT INTO meta_decisions "
+            "(snapshot_id, candidate_id, model_version, decision_json, "
+            "generated_at, mode) VALUES (?,?,?,?,?,?)",
+            (snapshot_id, candidate_id, model_version,
+             _canonical_json(decision), generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_meta_decisions(self, snapshot_id=None) -> list:
+        self.require_schema()
+        sql = "SELECT * FROM meta_decisions"
+        args = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["decision"] = json.loads(row.pop("decision_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["decision"] = {}
+            out.append(row)
+            out.append(row)
+        return out
+
+    # ---- ensemble weights / drift (Part 3) ------------------------------------
+    def log_ensemble_weights(
+        self, *, as_of_session, target, weights, losses, configuration_hash,
+        created_at, horizon=None, penalties=None,
+    ) -> int:
+        self.require_schema()
+        cur = self.conn.execute(
+            "INSERT INTO ensemble_weight_history "
+            "(as_of_session, target, horizon, weights_json, losses_json, "
+            "penalties_json, configuration_hash, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (as_of_session, target, horizon, _canonical_json(weights),
+             _canonical_json(losses),
+             _canonical_json(penalties) if penalties is not None else None,
+             configuration_hash, created_at),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def log_drift_event(self, event_id, model_id, as_of_session, severity,
+                        status, created_at) -> None:
+        self.require_schema()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO drift_events "
+            "(event_id, model_id, as_of_session, severity, status_json, "
+            "created_at) VALUES (?,?,?,?,?,?)",
+            (event_id, model_id, as_of_session, severity,
+             _canonical_json(status), created_at),
+        )
+        self.conn.commit()
+
+    def fetch_drift_events(self, model_id=None) -> list:
+        self.require_schema()
+        sql = "SELECT * FROM drift_events"
+        args = []
+        if model_id:
+            sql += " WHERE model_id=?"
+            args.append(model_id)
+        sql += " ORDER BY created_at, event_id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["status"] = json.loads(row.pop("status_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["status"] = {}
+            out.append(row)
+        return out
+
+    def log_promotion_review(self, review_id, model_group_id, current_status,
+                             proposed_status, review, created_at,
+                             resolved_at=None) -> None:
+        self.require_schema()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO promotion_reviews "
+            "(review_id, model_group_id, current_status, proposed_status, "
+            "review_json, created_at, resolved_at) VALUES (?,?,?,?,?,?,?)",
+            (review_id, model_group_id, current_status, proposed_status,
+             _canonical_json(review), created_at, resolved_at),
+        )
+        self.conn.commit()
+
+    def log_deployment_history(self, deployment_id, deployed_at, mode,
+                               active_models, configuration_hash,
+                               prior_models=None, rollback_target=None,
+                               deployed_by=None, note=None) -> None:
+        self.require_schema()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO deployment_history "
+            "(deployment_id, deployed_at, mode, active_models_json, "
+            "prior_models_json, configuration_hash, rollback_target_json, "
+            "deployed_by, note) VALUES (?,?,?,?,?,?,?,?,?)",
+            (deployment_id, deployed_at, mode,
+             _canonical_json(active_models),
+             _canonical_json(prior_models) if prior_models is not None else None,
+             configuration_hash,
+             _canonical_json(rollback_target) if rollback_target is not None else None,
+             deployed_by, note),
+        )
+        self.conn.commit()
+
+    def fetch_deployment_history(self) -> list:
+        self.require_schema()
+        out = []
+        for r in self.conn.execute(
+            "SELECT * FROM deployment_history ORDER BY deployed_at"
+        ).fetchall():
+            row = dict(r)
+            for src, dest in (
+                ("active_models_json", "active_models"),
+                ("prior_models_json", "prior_models"),
+                ("rollback_target_json", "rollback_target"),
+            ):
+                try:
+                    row[dest] = json.loads(row.pop(src) or "null")
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    row[dest] = None
             out.append(row)
         return out
 

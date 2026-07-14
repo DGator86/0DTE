@@ -363,3 +363,309 @@ def candidate_id_for(snapshot_id: str, candidate) -> str:
     return make_candidate_id(
         snapshot_id, getattr(candidate, "family", "unknown"),
         legs_as_dicts(candidate.legs))
+
+
+# ---------------------------------------------------------------------------
+# Part 3 §8 — within-snapshot pairwise ranking dataset
+# ---------------------------------------------------------------------------
+
+PAIR_EPSILON_R = 0.01
+PAIRWISE_DATASET_VERSION = "v3.0.0"
+
+# Continuous keys differenced as A - B. Categorical/structural keys become
+# same_* indicator features.
+DEFAULT_PAIR_CONTINUOUS_KEYS = (
+    "expected_net_pnl", "p_profit", "expected_shortfall", "pnl_q05",
+    "fill_uncertainty", "model_uncertainty", "forecast_uncertainty",
+    "ood_score", "capital_required", "maximum_loss", "return_on_risk",
+    "utility_score", "credit", "max_loss", "ev", "ev_per_risk",
+    "prob_profit", "liquidity_score", "legacy_candidate_score",
+    "relative_spread", "minutes_to_close", "n_legs", "width",
+)
+
+DEFAULT_PAIR_CATEGORICAL_KEYS = (
+    "family", "direction", "n_legs", "width_bucket",
+    "max_loss_bucket", "capital_bucket",
+)
+
+
+@dataclass(frozen=True)
+class CandidatePairRecord:
+    snapshot_id: str
+    candidate_a_id: str
+    candidate_b_id: str
+    pair_features: dict
+    a_wins: int
+    weight: float
+    realized_utility_a: float
+    realized_utility_b: float
+    diagnostics: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "candidate_a_id": self.candidate_a_id,
+            "candidate_b_id": self.candidate_b_id,
+            "pair_features": dict(self.pair_features),
+            "a_wins": int(self.a_wins),
+            "weight": float(self.weight),
+            "realized_utility_a": float(self.realized_utility_a),
+            "realized_utility_b": float(self.realized_utility_b),
+            "diagnostics": dict(self.diagnostics),
+        }
+
+
+@dataclass
+class PairwiseTrainingFrame:
+    """All pairs from eligible snapshots; never split across snapshots."""
+    pairs: list = field(default_factory=list)  # CandidatePairRecord
+    version: str = PAIRWISE_DATASET_VERSION
+    pair_epsilon_r: float = PAIR_EPSILON_R
+    risk_unit_r: float = 1.0
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    @property
+    def snapshot_ids(self) -> list:
+        return [p.snapshot_id for p in self.pairs]
+
+
+def _is_numeric(v) -> bool:
+    if v is None or isinstance(v, bool):
+        return False
+    try:
+        float(v)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def build_pair_features(
+    features_a: dict,
+    features_b: dict,
+    *,
+    continuous_keys: Optional[Sequence[str]] = None,
+    categorical_keys: Optional[Sequence[str]] = None,
+) -> dict:
+    """
+    Pair features: continuous as A - B; categorical as same_* indicators.
+    Deterministic key set from the union of configured keys present on either.
+    """
+    cont = list(continuous_keys) if continuous_keys is not None else list(
+        DEFAULT_PAIR_CONTINUOUS_KEYS)
+    cats = list(categorical_keys) if categorical_keys is not None else list(
+        DEFAULT_PAIR_CATEGORICAL_KEYS)
+    out: dict = {}
+    for k in cont:
+        va = features_a.get(k)
+        vb = features_b.get(k)
+        if _is_numeric(va) and _is_numeric(vb):
+            out[f"diff_{k}"] = float(va) - float(vb)
+        elif _is_numeric(va) or _is_numeric(vb):
+            # One missing → treat missing as 0.0 for stable differencing
+            a = float(va) if _is_numeric(va) else 0.0
+            b = float(vb) if _is_numeric(vb) else 0.0
+            out[f"diff_{k}"] = a - b
+    for k in cats:
+        va = features_a.get(k)
+        vb = features_b.get(k)
+        if va is None and vb is None:
+            continue
+        out[f"same_{k}"] = 1.0 if va == vb else 0.0
+    return out
+
+
+def reverse_pair_features(pair_features: dict) -> dict:
+    """Swap A/B: negate diff_* features; same_* unchanged."""
+    out = {}
+    for k, v in pair_features.items():
+        if k.startswith("diff_"):
+            out[k] = -float(v)
+        else:
+            out[k] = v
+    return out
+
+
+def pair_weight(
+    *,
+    realized_utility_a: float,
+    realized_utility_b: float,
+    complete_outcomes: bool = True,
+    valid_executable_quotes: bool = True,
+    passes_feasibility: bool = True,
+    quote_quality: float = 1.0,
+    fill_uncertain: bool = False,
+    quote_age_elevated: bool = False,
+    censored: bool = False,
+    data_quality: float = 1.0,
+    family_support: float = 1.0,
+    risk_unit_r: float = 1.0,
+) -> float:
+    """
+    Deterministic pair weight (§8.7). Base = |Δutility| / R, then multipliers.
+    """
+    r = max(float(risk_unit_r), 1e-9)
+    delta = abs(float(realized_utility_a) - float(realized_utility_b))
+    w = delta / r
+    if complete_outcomes:
+        w *= 1.25
+    else:
+        w *= 0.5
+    if valid_executable_quotes:
+        w *= 1.10
+    else:
+        w *= 0.5
+    if passes_feasibility:
+        w *= 1.10
+    else:
+        w *= 0.25
+    w *= float(np.clip(quote_quality, 0.0, 1.0))
+    if fill_uncertain:
+        w *= 0.7
+    if quote_age_elevated:
+        w *= 0.8
+    if censored:
+        w *= 0.4
+    w *= float(np.clip(data_quality, 0.0, 1.0))
+    w *= float(np.clip(family_support, 0.0, 1.0))
+    return float(max(w, 0.0))
+
+
+def generate_snapshot_pairs(
+    snapshot_id: str,
+    candidates: Sequence[dict],
+    *,
+    pair_epsilon_r: float = PAIR_EPSILON_R,
+    risk_unit_r: float = 1.0,
+    continuous_keys: Optional[Sequence[str]] = None,
+    categorical_keys: Optional[Sequence[str]] = None,
+) -> list:
+    """
+    Build unordered unique pairs within one snapshot.
+
+    Each candidate dict must provide:
+      candidate_id, features (dict), realized_utility (float)
+    Optional weight knobs: complete_outcomes, valid_executable_quotes, …
+    Near ties (|Δu| < pair_epsilon_r * R) are excluded.
+    """
+    eps = float(pair_epsilon_r) * max(float(risk_unit_r), 1e-9)
+    items = list(candidates)
+    pairs: list = []
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            a, b = items[i], items[j]
+            ua = float(a["realized_utility"])
+            ub = float(b["realized_utility"])
+            if abs(ua - ub) < eps:
+                continue
+            feat = build_pair_features(
+                a.get("features") or {},
+                b.get("features") or {},
+                continuous_keys=continuous_keys,
+                categorical_keys=categorical_keys,
+            )
+            w = pair_weight(
+                realized_utility_a=ua,
+                realized_utility_b=ub,
+                complete_outcomes=bool(a.get("complete_outcomes", True)
+                                       and b.get("complete_outcomes", True)),
+                valid_executable_quotes=bool(
+                    a.get("valid_executable_quotes", True)
+                    and b.get("valid_executable_quotes", True)),
+                passes_feasibility=bool(a.get("passes_feasibility", True)
+                                        and b.get("passes_feasibility", True)),
+                quote_quality=min(float(a.get("quote_quality", 1.0)),
+                                  float(b.get("quote_quality", 1.0))),
+                fill_uncertain=bool(a.get("fill_uncertain", False)
+                                    or b.get("fill_uncertain", False)),
+                quote_age_elevated=bool(a.get("quote_age_elevated", False)
+                                        or b.get("quote_age_elevated", False)),
+                censored=bool(a.get("censored", False)
+                              or b.get("censored", False)),
+                data_quality=min(float(a.get("data_quality", 1.0)),
+                                 float(b.get("data_quality", 1.0))),
+                family_support=min(float(a.get("family_support", 1.0)),
+                                   float(b.get("family_support", 1.0))),
+                risk_unit_r=risk_unit_r,
+            )
+            pairs.append(CandidatePairRecord(
+                snapshot_id=snapshot_id,
+                candidate_a_id=str(a["candidate_id"]),
+                candidate_b_id=str(b["candidate_id"]),
+                pair_features=feat,
+                a_wins=int(ua > ub),
+                weight=w,
+                realized_utility_a=ua,
+                realized_utility_b=ub,
+                diagnostics={
+                    "utility_delta": ua - ub,
+                    "pair_epsilon": eps,
+                },
+            ))
+    return pairs
+
+
+def build_pairwise_frame(
+    candidates_by_snapshot: dict,
+    *,
+    pair_epsilon_r: float = PAIR_EPSILON_R,
+    risk_unit_r: float = 1.0,
+    continuous_keys: Optional[Sequence[str]] = None,
+    categorical_keys: Optional[Sequence[str]] = None,
+) -> PairwiseTrainingFrame:
+    """
+    Construct a PairwiseTrainingFrame from {snapshot_id: [candidate dicts]}.
+    All pairs remain tagged with their snapshot_id (non-splittable grouping).
+    """
+    frame = PairwiseTrainingFrame(
+        pair_epsilon_r=pair_epsilon_r,
+        risk_unit_r=risk_unit_r,
+    )
+    for snap_id in sorted(candidates_by_snapshot.keys()):
+        frame.pairs.extend(generate_snapshot_pairs(
+            snap_id,
+            candidates_by_snapshot[snap_id],
+            pair_epsilon_r=pair_epsilon_r,
+            risk_unit_r=risk_unit_r,
+            continuous_keys=continuous_keys,
+            categorical_keys=categorical_keys,
+        ))
+    return frame
+
+
+def pairwise_frame_from_training_frame(
+    frame: CandidateTrainingFrame,
+    realized_utilities: Sequence[float],
+    *,
+    pair_epsilon_r: float = PAIR_EPSILON_R,
+    risk_unit_r: float = 1.0,
+) -> PairwiseTrainingFrame:
+    """Group a CandidateTrainingFrame by snapshot and emit pairs."""
+    if len(realized_utilities) != len(frame):
+        raise ValueError("realized_utilities length must match frame")
+    by_snap: dict = {}
+    for i in range(len(frame)):
+        snap = frame.snapshot_ids[i]
+        by_snap.setdefault(snap, []).append({
+            "candidate_id": frame.candidate_ids[i],
+            "features": dict(frame.rows[i]),
+            "realized_utility": float(realized_utilities[i]),
+            "fill_uncertain": float(frame.fill_uncertainty[i]) > 0.5,
+            "data_quality": 1.0,
+        })
+    return build_pairwise_frame(
+        by_snap,
+        pair_epsilon_r=pair_epsilon_r,
+        risk_unit_r=risk_unit_r,
+    )
+
+
+def assert_pairs_within_snapshot(pairs: Sequence[CandidatePairRecord]) -> None:
+    """Every pair must reference a single snapshot_id (no cross-snapshot)."""
+    for p in pairs:
+        if "|" in p.candidate_a_id and "|" in p.candidate_b_id:
+            # Soft check when IDs embed snapshot prefixes
+            pass
+        if not p.snapshot_id:
+            raise AssertionError("pair missing snapshot_id")

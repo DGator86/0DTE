@@ -153,3 +153,98 @@ class PolicyDecision:
             source=str(d.get("source", SOURCE_LEGACY)),
             structure_code=str(d.get("structure_code", "")),
         )
+
+
+# ---------------------------------------------------------------------------
+# Part 3 final decision contract (§33)
+# ---------------------------------------------------------------------------
+
+FINAL_ACTIONS_V3 = ("TRADE", "NO_EDGE", "ABSTAIN", "HARD_VETO")
+
+
+@dataclass(frozen=True)
+class TradeDecisionV3:
+    snapshot_id: str
+    ts: str
+    symbol: str
+    action: str
+    statistical_action: str
+    selected_candidate_id: Optional[str]
+    direction: str
+    family: Optional[str]
+    p_positive_utility: Optional[float]
+    expected_order_value: Optional[float]
+    candidate_utility: Optional[float]
+    confidence: float
+    uncertainty: float
+    ood_score: Optional[float]
+    fill_probability: Optional[float]
+    hard_vetoes: tuple[str, ...]
+    reasons: tuple[str, ...]
+    policy_version: str
+    model_versions: dict
+    source: str
+    mode: str
+    diagnostics: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "ts": self.ts,
+            "symbol": self.symbol,
+            "action": self.action,
+            "statistical_action": self.statistical_action,
+            "selected_candidate_id": self.selected_candidate_id,
+            "direction": self.direction,
+            "family": self.family,
+            "p_positive_utility": self.p_positive_utility,
+            "expected_order_value": self.expected_order_value,
+            "candidate_utility": self.candidate_utility,
+            "confidence": self.confidence,
+            "uncertainty": self.uncertainty,
+            "ood_score": self.ood_score,
+            "fill_probability": self.fill_probability,
+            "hard_vetoes": list(self.hard_vetoes),
+            "reasons": list(self.reasons),
+            "policy_version": self.policy_version,
+            "model_versions": dict(self.model_versions),
+            "source": self.source,
+            "mode": self.mode,
+            "diagnostics": dict(self.diagnostics),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TradeDecisionV3":
+        return cls(
+            snapshot_id=str(d["snapshot_id"]),
+            ts=str(d["ts"]),
+            symbol=str(d.get("symbol", "")),
+            action=str(d["action"]),
+            statistical_action=str(d.get("statistical_action", d["action"])),
+            selected_candidate_id=d.get("selected_candidate_id"),
+            direction=str(d.get("direction", "none")),
+            family=d.get("family"),
+            p_positive_utility=(
+                None if d.get("p_positive_utility") is None
+                else float(d["p_positive_utility"])),
+            expected_order_value=(
+                None if d.get("expected_order_value") is None
+                else float(d["expected_order_value"])),
+            candidate_utility=(
+                None if d.get("candidate_utility") is None
+                else float(d["candidate_utility"])),
+            confidence=float(d.get("confidence", 0.0)),
+            uncertainty=float(d.get("uncertainty", 1.0)),
+            ood_score=(None if d.get("ood_score") is None
+                       else float(d["ood_score"])),
+            fill_probability=(
+                None if d.get("fill_probability") is None
+                else float(d["fill_probability"])),
+            hard_vetoes=tuple(d.get("hard_vetoes") or ()),
+            reasons=tuple(d.get("reasons") or ()),
+            policy_version=str(d.get("policy_version", "")),
+            model_versions=dict(d.get("model_versions") or {}),
+            source=str(d.get("source", "v3")),
+            mode=str(d.get("mode", "shadow")),
+            diagnostics=dict(d.get("diagnostics") or {}),
+        )
