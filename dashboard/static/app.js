@@ -2849,6 +2849,7 @@
       renderV2OpenPositions(live.paper);
       renderPhysDensity(v2Tick, live);
       renderRanker(v2Tick, live);
+      renderPart3(live, v2Tick);
       renderV2Playbook(candidate, live);
       renderRegime(live);
       renderReason(live, candidate);
