@@ -286,6 +286,67 @@ CREATE TABLE IF NOT EXISTS deployment_history (
     deployed_by TEXT,
     note TEXT
 );
+
+CREATE TABLE IF NOT EXISTS canonical_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    feature_version TEXT NOT NULL,
+    snapshot_schema_version TEXT,
+    raw_features_json TEXT,
+    standardized_features_json TEXT,
+    missingness_json TEXT,
+    source_timestamps_json TEXT,
+    source_ages_json TEXT,
+    quality_json TEXT,
+    snapshot_hash TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS forecast_bundles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    deployment_id TEXT,
+    model_group_id TEXT,
+    forecast_json TEXT NOT NULL,
+    uncertainty REAL,
+    ood_score REAL,
+    data_quality REAL,
+    generated_at TEXT NOT NULL,
+    mode TEXT
+);
+
+CREATE TABLE IF NOT EXISTS candidate_universes (
+    snapshot_id TEXT PRIMARY KEY,
+    generator_version TEXT,
+    configuration_hash TEXT,
+    candidate_count INTEGER,
+    excluded_count INTEGER,
+    generated_at TEXT NOT NULL,
+    diagnostics_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS unified_decisions (
+    snapshot_id TEXT PRIMARY KEY,
+    deployment_id TEXT,
+    deployment_mode TEXT,
+    authority_source TEXT,
+    legacy_action TEXT,
+    legacy_candidate_id TEXT,
+    v3_statistical_action TEXT,
+    v3_final_action TEXT,
+    v3_candidate_id TEXT,
+    final_action TEXT,
+    selected_candidate_id TEXT,
+    hard_vetoes_json TEXT,
+    reasons_json TEXT,
+    fallback_used INTEGER,
+    fallback_reason TEXT,
+    configuration_hash TEXT,
+    decision_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -1099,6 +1160,116 @@ class PredictionStore:
                 n += 1
         self.conn.commit()
         return n
+
+
+    # ---- UNIFIED decision-graph persistence (handoff §16) --------------------
+    def log_canonical_snapshot(self, row) -> None:
+        """Persist CanonicalSnapshot dict. Idempotent on snapshot_id."""
+        self.require_schema()
+        d = row if isinstance(row, dict) else (
+            row.to_dict() if hasattr(row, "to_dict") else dict(row))
+        import datetime as _dt
+        self.conn.execute(
+            "INSERT OR REPLACE INTO canonical_snapshots "
+            "(snapshot_id, symbol, ts, session_date, feature_version, "
+            "snapshot_schema_version, raw_features_json, "
+            "standardized_features_json, missingness_json, "
+            "source_timestamps_json, source_ages_json, quality_json, "
+            "snapshot_hash, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                d.get("snapshot_id"), d.get("symbol"), d.get("ts"),
+                d.get("session_date"), d.get("feature_version"),
+                d.get("snapshot_schema_version"),
+                _canonical_json(d.get("raw_features") or {}),
+                _canonical_json(d.get("standardized_features") or {}),
+                _canonical_json(d.get("missingness") or {}),
+                _canonical_json(d.get("source_timestamps") or {}),
+                _canonical_json(d.get("source_ages_seconds") or {}),
+                _canonical_json(d.get("quality") or {}),
+                d.get("snapshot_hash"),
+                _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            ),
+        )
+        self.conn.commit()
+
+    def log_forecast_bundle(self, payload) -> None:
+        self.require_schema()
+        d = payload if isinstance(payload, dict) else (
+            payload.to_dict() if hasattr(payload, "to_dict") else dict(payload))
+        import datetime as _dt
+        self.conn.execute(
+            "INSERT INTO forecast_bundles "
+            "(snapshot_id, deployment_id, model_group_id, forecast_json, "
+            "uncertainty, ood_score, data_quality, generated_at, mode) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                d.get("snapshot_id"),
+                d.get("deployment_id"),
+                d.get("model_group_id") or (
+                    (d.get("model_versions") or {}).get("group")),
+                _canonical_json(d),
+                d.get("uncertainty"),
+                d.get("ood_score"),
+                d.get("data_quality"),
+                _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                d.get("mode"),
+            ),
+        )
+        self.conn.commit()
+
+    def log_candidate_universe(self, row) -> None:
+        self.require_schema()
+        d = row if isinstance(row, dict) else (
+            row.to_dict() if hasattr(row, "to_dict") else dict(row))
+        self.conn.execute(
+            "INSERT OR REPLACE INTO candidate_universes "
+            "(snapshot_id, generator_version, configuration_hash, "
+            "candidate_count, excluded_count, generated_at, diagnostics_json) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                d.get("snapshot_id"),
+                d.get("generator_version"),
+                d.get("generator_configuration_hash") or d.get("configuration_hash"),
+                int(d.get("candidate_count") or 0),
+                int(d.get("excluded_count") or 0),
+                d.get("generated_at") or "",
+                _canonical_json(d.get("diagnostics") or {}),
+            ),
+        )
+        self.conn.commit()
+
+    def log_unified_decision(self, row) -> None:
+        self.require_schema()
+        d = row if isinstance(row, dict) else (
+            row.to_dict() if hasattr(row, "to_dict") else dict(row))
+        import datetime as _dt
+        self.conn.execute(
+            "INSERT OR REPLACE INTO unified_decisions "
+            "(snapshot_id, deployment_id, deployment_mode, authority_source, "
+            "legacy_action, legacy_candidate_id, v3_statistical_action, "
+            "v3_final_action, v3_candidate_id, final_action, "
+            "selected_candidate_id, hard_vetoes_json, reasons_json, "
+            "fallback_used, fallback_reason, configuration_hash, "
+            "decision_json, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                d.get("snapshot_id"), d.get("deployment_id"),
+                d.get("deployment_mode"), d.get("authority_source"),
+                d.get("legacy_action"), d.get("legacy_candidate_id"),
+                d.get("v3_statistical_action"), d.get("v3_final_action"),
+                d.get("v3_candidate_id"), d.get("final_action"),
+                d.get("selected_candidate_id"),
+                _canonical_json(d.get("hard_vetoes") or []),
+                _canonical_json(d.get("reasons") or []),
+                1 if d.get("fallback_used") else 0,
+                d.get("fallback_reason"),
+                d.get("configuration_hash"),
+                _canonical_json(d),
+                _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            ),
+        )
+        self.conn.commit()
 
     def settle_sigma_cones(self, now_iso: str, realized_spot: float,
                            *, realized_ts: Optional[str] = None) -> int:

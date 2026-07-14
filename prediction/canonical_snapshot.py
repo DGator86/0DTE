@@ -109,6 +109,26 @@ def _assert_no_policy_fields(features: Mapping[str, Any]) -> None:
                     f"post-routing field {k!r} forbidden in model features")
 
 
+def _parse_ts(value: Any):
+    """Parse ISO timestamps to timezone-aware UTC datetimes. Reject invalid."""
+    import datetime as _dt
+    if value is None or value == "":
+        return None
+    if isinstance(value, _dt.datetime):
+        ts = value
+    else:
+        text = str(value).replace("Z", "+00:00")
+        try:
+            ts = _dt.datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise CanonicalSnapshotError(
+                f"unparseable timestamp {value!r}") from exc
+    if ts.tzinfo is None:
+        raise CanonicalSnapshotError(
+            f"timestamp {value!r} lacks timezone — refuse naive comparison")
+    return ts.astimezone(_dt.timezone.utc)
+
+
 def _reject_future_sources(
     prediction_ts: str,
     source_timestamps: Mapping[str, Any],
@@ -116,10 +136,12 @@ def _reject_future_sources(
     """Reject any source timestamp strictly after the prediction timestamp."""
     if not prediction_ts:
         return
+    pred = _parse_ts(prediction_ts)
     for name, src_ts in source_timestamps.items():
         if src_ts is None or src_ts == "":
             continue
-        if str(src_ts) > str(prediction_ts):
+        src = _parse_ts(src_ts)
+        if src is not None and pred is not None and src > pred:
             raise CanonicalSnapshotError(
                 f"future-dated source {name!r}: {src_ts!r} > {prediction_ts!r}")
 
@@ -168,13 +190,10 @@ def build_canonical_snapshot(
     if snapshot_id:
         sid = snapshot_id
     else:
-        import datetime as _dt
-        ts_obj: Any = ts
-        if isinstance(ts, str):
-            try:
-                ts_obj = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            except ValueError:
-                ts_obj = _dt.datetime.now(_dt.timezone.utc)
+        ts_obj = _parse_ts(ts)
+        if ts_obj is None:
+            raise CanonicalSnapshotError(
+                f"cannot build snapshot_id without valid ts: {ts!r}")
         sid = make_snapshot_id(symbol, ts_obj, feature_version, source_seq)
 
     ss_version = structural_state_version

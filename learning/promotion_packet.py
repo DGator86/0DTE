@@ -75,6 +75,16 @@ def approve_promotion(packet: dict, *, reviewer: str, approval_note: str) -> dic
         raise ValueError("promotion requires configuration_hash")
     if not packet.get("fold_definitions"):
         raise ValueError("promotion requires fold_definitions")
+    if not packet.get("model_artifact_ids"):
+        raise ValueError("promotion requires nonempty model_artifact_ids")
+    if not packet.get("oos_metrics"):
+        raise ValueError("promotion requires oos_metrics")
+    if packet.get("bootstrap_intervals") is None:
+        raise ValueError("promotion requires bootstrap_intervals")
+    if "known_weaknesses" not in packet:
+        raise ValueError("promotion requires known_weaknesses review field")
+    if "unsupported_slices" not in packet:
+        raise ValueError("promotion requires unsupported_slices review field")
     out = dict(packet)
     out["reviewer"] = reviewer
     out["approval_note"] = approval_note

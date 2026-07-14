@@ -28,6 +28,8 @@ def _universe():
             {
                 "family": "put_credit",
                 "ev": 0.20,
+                "credit": 0.55,
+                "natural_credit": 0.45,
                 "prob_profit": 0.7,
                 "legs": [
                     {"right": "P", "side": "sell", "qty": 1, "strike": 490,
@@ -39,6 +41,8 @@ def _universe():
             {
                 "family": "call_debit",
                 "ev": 0.05,
+                "credit": -0.40,
+                "natural_credit": -0.48,
                 "prob_profit": 0.55,
                 "legs": [
                     {"right": "C", "side": "buy", "qty": 1, "strike": 500,
@@ -86,15 +90,26 @@ def test_midpoint_never_treated_as_filled():
         snapshot_id="s1", ts="t", session_date="2026-07-14", symbol="SPY",
         uncertainty=0.2, data_quality=0.9, ood_score=0.1,
     )
+    # Candidates with only EV (no credit) must not invent fill prices.
+    universe = build_candidate_universe(
+        snapshot_id="s1",
+        generated_at="t",
+        candidates=[{
+            "family": "put_credit",
+            "ev": 0.20,
+            "prob_profit": 0.7,
+            "legs": [
+                {"right": "P", "side": "sell", "qty": 1, "strike": 490,
+                 "expiration": "2026-07-14"},
+            ],
+        }],
+    )
     result = build_v3_decision(
-        snapshot=_snap(), forecast=forecast, universe=_universe(), mode="shadow")
-    assert result.execution is None or result.execution.get(
-        "note") == "midpoint_diagnostic_only"
+        snapshot=_snap(), forecast=forecast, universe=universe, mode="shadow")
     for ev in result.evaluations:
-        if ev.expected_fill_price is not None and ev.legacy_ev:
-            # conservative/natural should not equal raw mid when mid != 0
-            assert abs(ev.expected_fill_price - float(ev.legacy_ev)) > 1e-12 or \
-                float(ev.legacy_ev) == 0.0
+        # Without mid/natural credit, fill fields stay None — never fill_p=0.5
+        if ev.expected_fill_price is None:
+            assert ev.fill_probability is None
 
 
 def test_required_component_failure_abstain_in_champion():
@@ -109,13 +124,51 @@ def test_required_component_failure_abstain_in_champion():
         runtime=None,
         mode="champion",
     )
-    # Without runtime artifacts, champion path still produces a decision via
-    # baseline utilities in build_v3_candidate_evaluations — but top candidates
-    # get required_component_missing vetoes when value_model is None.
-    assert result.statistical_action in (
-        "ABSTAIN", "NO_EDGE", "TRADE", "NO_CANDIDATE")
-    if result.evaluations:
-        assert any(
-            "required_component_missing" in (e.vetoes or ())
-            for e in result.evaluations
-        ) or result.statistical_action == "ABSTAIN"
+    assert result.statistical_action == "ABSTAIN"
+    assert "required_component_missing" in result.reasons
+
+
+def test_partial_missing_artifacts_abstain():
+    """Any nonempty missing list must abstain — not only when all five missing."""
+    from prediction.runtime import LoadedArtifacts, PredictionRuntime
+    from prediction.deployment import DeploymentBundle
+
+    class _Art:
+        candidate_value = object()
+        candidate_rank = None  # missing
+        fill_probability = object()
+        fill_concession = object()
+        meta_model = object()
+
+    bundle = DeploymentBundle(
+        deployment_id="d", mode="champion",
+        prediction_model_group_id="g",
+        candidate_value_model_id="cv",
+        candidate_rank_model_id="cr",
+        fill_probability_model_id="fp",
+        fill_concession_model_id="fc",
+        meta_model_id="mm",
+        authority_source="v3", fallback_policy="abstain",
+    )
+    rt = PredictionRuntime(
+        bundle=bundle,
+        registry=None,  # type: ignore
+        artifacts=LoadedArtifacts(bundle=bundle),
+        strict=True,
+    )
+    rt.artifacts.candidate_value = _Art.candidate_value
+    rt.artifacts.candidate_rank = None
+    rt.artifacts.fill_probability = _Art.fill_probability
+    rt.artifacts.fill_concession = _Art.fill_concession
+    rt.artifacts.meta_model = _Art.meta_model
+
+    forecast = PredictionBundle(
+        snapshot_id="s1", ts="t", session_date="2026-07-14", symbol="SPY",
+        uncertainty=0.2, data_quality=0.9,
+    )
+    result = build_v3_decision(
+        snapshot=_snap(), forecast=forecast, universe=_universe(),
+        runtime=rt, mode="champion",
+    )
+    assert result.final_action == "ABSTAIN"
+    assert "required_component_missing" in result.reasons

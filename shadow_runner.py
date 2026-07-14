@@ -208,36 +208,78 @@ class ShadowRunner:
             from decision_stack.stack import UnifiedDecisionStack
             try:
                 bundle = load_deployment_bundle(deployment_path)
+                from dataclasses import replace as _dc_replace
+                from prediction.deployment import (
+                    configuration_hash as _cfg_hash,
+                    validate_deployment_bundle as _val_bundle,
+                )
+                overridden = False
                 if deployment_mode:
-                    from dataclasses import replace as _dc_replace
                     bundle = _dc_replace(bundle, mode=str(deployment_mode))
+                    overridden = True
                 if fallback_policy:
-                    from dataclasses import replace as _dc_replace
                     bundle = _dc_replace(
                         bundle, fallback_policy=str(fallback_policy))
+                    overridden = True
+                if overridden:
+                    # CLI overrides must revalidate and rehash — never report
+                    # a hash that describes a different mode/fallback.
+                    import uuid as _uuid
+                    bundle = _dc_replace(
+                        bundle,
+                        deployment_id=(
+                            f"{bundle.deployment_id}-ovr-"
+                            f"{_uuid.uuid4().hex[:8]}"),
+                        configuration_hash="",
+                    )
+                    _val_bundle(bundle)
+                    bundle = _dc_replace(
+                        bundle,
+                        configuration_hash=_cfg_hash(bundle.to_dict()),
+                    )
                 registry = ModelRegistry(models_dir)
+                # strict=True forces fail-closed; None lets candidate/champion
+                # auto-strict. Never pass False — that would disable
+                # fail-closed for candidate/champion modes.
                 runtime = PredictionRuntime.from_deployment_bundle(
-                    bundle, registry, strict=strict_artifacts)
+                    bundle, registry,
+                    strict=True if strict_artifacts else None,
+                )
                 self.deployment_bundle = bundle
                 self.prediction_runtime = runtime
+
+                def _persist(record, snapshot=None, universe=None,
+                             forecast=None, v3_result=None):
+                    from decision_stack.persistence import (
+                        persist_unified_decision,
+                    )
+                    persist_unified_decision(
+                        self._prediction_store, record,
+                        snapshot=snapshot, universe=universe,
+                        forecast=forecast,
+                    )
+
                 self.decision_stack = UnifiedDecisionStack(
                     deployment=bundle,
                     prediction_runtime=runtime,
                     legacy_config=self.champion,
                     stores={"prediction": self._prediction_store},
+                    persist_fn=_persist,
                 )
                 ids = runtime.component_ids()
                 log.info(
                     "Deployment loaded: id=%s mode=%s fallback=%s "
-                    "heuristic=%s feature=%s label=%s components=%s",
+                    "hash=%s heuristic=%s feature=%s label=%s "
+                    "strict=%s components=%s",
                     ids.get("deployment_id"), ids.get("mode"),
-                    ids.get("fallback_policy"), ids.get("heuristic"),
+                    ids.get("fallback_policy"),
+                    (bundle.configuration_hash or "")[:12],
+                    ids.get("heuristic"),
                     ids.get("feature_version"), ids.get("label_version"),
+                    runtime.strict,
                     {k: v for k, v in ids.items()
                      if k.endswith("_id") and v},
                 )
-                # When a trained group is present, prefer it over heuristic
-                # bundle provider.
                 if runtime.artifacts.model_group is not None:
                     from prediction.inference import (
                         make_bundle_provider as _mk_bp,
@@ -252,8 +294,12 @@ class ShadowRunner:
                     if runtime.artifacts.candidate_value is not None:
                         candidate_model = runtime.artifacts.candidate_value
             except (DeploymentError, PredictionRuntimeError) as exc:
-                if strict_artifacts or (
-                        deployment_mode in ("candidate", "champion")):
+                mode_now = deployment_mode
+                try:
+                    mode_now = bundle.mode  # noqa: F821 — set if load got that far
+                except Exception:
+                    pass
+                if strict_artifacts or mode_now in ("candidate", "champion"):
                     raise
                 log.warning("Deployment load degraded (shadow-safe): %s", exc)
 
@@ -489,28 +535,62 @@ class ShadowRunner:
             mult,
         )
 
-        if (result.decision is not None
-                and result.decision.decision == "TRADE"
-                and result.decision.gate_pass):
+        # Authoritative TRADE for notifications: prefer unified record when
+        # present (champion / fallback-aware); otherwise legacy decision.
+        auth = getattr(result, "authoritative_decision", None)
+        auth_action = None
+        if isinstance(auth, dict):
+            auth_action = auth.get("final_action")
+        notify_trade = False
+        if auth_action == "TRADE":
+            notify_trade = True
+        elif (auth_action is None
+              and result.decision is not None
+              and result.decision.decision == "TRADE"
+              and result.decision.gate_pass):
+            notify_trade = True
+        if notify_trade:
             ticket = Ticket.from_tick_result(result, self.symbol)
             self._notifier.send(ticket)
 
-        # Drive the paper broker: mark open positions and auto-execute exits/
-        # entries on simulated fills. Never raises into the tick loop.
+        # Drive the reference paper broker (legacy / shadow authority).
         try:
             for ev in self._paper.on_tick(now, result):
                 log.info("  %s  (paper equity=$%.2f)", ev, self._paper.cash)
         except Exception as exc:
             log.warning("paper broker error: %s", exc)
 
+        # Candidate dual-paper account: V3 track intents only.
+        if self._candidate_paper is not None:
+            try:
+                v3_intents = [
+                    i for i in (result.paper_intents or [])
+                    if i.get("track") == "v3"
+                ]
+                if v3_intents:
+                    cand_result = dataclasses.replace(
+                        result, paper_intents=v3_intents)
+                    for ev in self._candidate_paper.on_tick(now, cand_result):
+                        log.info("  [candidate] %s  (equity=$%.2f)",
+                                 ev, self._candidate_paper.cash)
+            except Exception as exc:
+                log.warning("candidate paper broker error: %s", exc)
+
         try:
+            paper_summary = self._paper.report(now)
+            if self._candidate_paper is not None:
+                paper_summary = {
+                    **paper_summary,
+                    "candidate_account": self._candidate_paper.report(now),
+                }
             write_live_state(
                 self.live_state_path,
                 serialize_tick_result(
                     result,
                     feed_source=getattr(self._feed, "last_source", None),
-                    paper_summary=self._paper.report(now),
+                    paper_summary=paper_summary,
                     market_status=market_status(now),
+                    part3=getattr(result, "part3", None),
                 ),
             )
         except Exception as exc:

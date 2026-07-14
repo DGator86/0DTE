@@ -74,9 +74,14 @@ class PredictionRuntime:
             raise PredictionRuntimeError(
                 "from_deployment_bundle requires a DeploymentBundle")
         mode = bundle.mode
-        strict_mode = (
-            bool(strict) if strict is not None
-            else mode in STRICT_ARTIFACT_MODES)
+        # Candidate/champion always fail closed. Explicit strict=False cannot
+        # disable that — only research/shadow may run non-strict.
+        if mode in STRICT_ARTIFACT_MODES:
+            strict_mode = True
+        elif strict is None:
+            strict_mode = False
+        else:
+            strict_mode = bool(strict)
         errors: list[dict] = []
         component_meta: dict = {}
         loaded = LoadedArtifacts(bundle=bundle)

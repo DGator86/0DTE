@@ -28,24 +28,35 @@ class LearningOrchestrator:
     state: dict = field(default_factory=dict)
 
     def run_daily(self, *, session_date: str, journal_rows: list | None = None,
-                  candidate_evaluations: list | None = None) -> dict:
+                  candidate_evaluations: list | None = None,
+                  settled_sessions: list | None = None) -> dict:
         settlement = settle_session_counterfactuals(
             session_date=session_date,
             journal_rows=journal_rows,
             candidate_evaluations=candidate_evaluations,
         )
         drift = evaluate_drift(metrics=self.state.get("drift_metrics"))
-        weights = update_dynamic_weights(
-            settled_sessions=[{"component_losses": {}}],
-            current_weights=self.state.get("weights"),
-        )
-        self.state["weights"] = weights
+        # Only update weights from caller-supplied settled sessions with
+        # real component losses — never invent empty loss records.
+        sessions = list(settled_sessions or self.state.get("settled_sessions") or [])
+        real_sessions = [
+            s for s in sessions
+            if isinstance(s, dict) and s.get("component_losses")
+        ]
+        weights = dict(self.state.get("weights") or {})
+        if real_sessions and settlement.get("complete"):
+            weights = update_dynamic_weights(
+                settled_sessions=real_sessions,
+                current_weights=weights,
+            )
+            self.state["weights"] = weights
         self.state["last_daily"] = session_date
         return {
             "session_date": session_date,
             "settlement": settlement,
             "drift": drift,
             "weights": weights,
+            "weight_update_applied": bool(real_sessions and settlement.get("complete")),
             "promoted": False,
         }
 

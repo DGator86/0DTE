@@ -275,42 +275,49 @@ def configuration_hash(pointer: dict) -> str:
     Accepts either a legacy pointer dict or a DeploymentBundle.to_dict()
     payload. Legacy-only pointers still hash; missing extended fields become
     null so adding any decision-relevant field changes the hash.
+    Empty strings are normalized to null for stable hashing across
+    pointer ↔ bundle conversions.
     """
+    def _norm(v):
+        if v == "":
+            return None
+        return v
+
     payload = {}
     for k in HASH_FIELDS:
         # Prefer explicit *_id keys when present.
         if k == "prediction_model_group":
-            payload[k] = (
+            payload[k] = _norm(
                 pointer.get("prediction_model_group_id")
                 if "prediction_model_group_id" in pointer
                 else pointer.get("prediction_model_group"))
         elif k == "candidate_value_model":
-            payload[k] = (
+            payload[k] = _norm(
                 pointer.get("candidate_value_model_id")
                 if "candidate_value_model_id" in pointer
                 else pointer.get("candidate_value_model"))
         elif k == "candidate_rank_model":
-            payload[k] = (
+            payload[k] = _norm(
                 pointer.get("candidate_rank_model_id")
                 if "candidate_rank_model_id" in pointer
                 else pointer.get("candidate_rank_model"))
         elif k == "fill_probability_model":
-            payload[k] = (
+            payload[k] = _norm(
                 pointer.get("fill_probability_model_id")
                 if "fill_probability_model_id" in pointer
                 else pointer.get("fill_probability_model"))
         elif k == "fill_concession_model":
-            payload[k] = (
+            payload[k] = _norm(
                 pointer.get("fill_concession_model_id")
                 if "fill_concession_model_id" in pointer
                 else pointer.get("fill_concession_model"))
         elif k == "meta_model":
-            payload[k] = (
+            payload[k] = _norm(
                 pointer.get("meta_model_id")
                 if "meta_model_id" in pointer
                 else pointer.get("meta_model"))
         else:
-            payload[k] = pointer.get(k)
+            payload[k] = _norm(pointer.get(k))
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"),
                    default=str).encode("utf-8")).hexdigest()
@@ -462,15 +469,31 @@ def rollback_deployment(
 ) -> dict:
     """
     Atomic pointer replacement to a prior deployment. Does not retrain.
+    Validates the prior as a complete DeploymentBundle and verifies
+    referenced model IDs are present in the pointer payload.
     Returns audit record.
     """
     validate_deployment_pointer(prior_pointer)
+    prior_bundle = DeploymentBundle.from_dict(prior_pointer)
+    validate_deployment_bundle(prior_bundle)
+    # Require that referenced artifact IDs are non-null when mode is strict.
+    if prior_bundle.requires_trained_artifacts():
+        for attr in (
+            "prediction_model_group_id", "candidate_value_model_id",
+            "candidate_rank_model_id", "fill_probability_model_id",
+            "fill_concession_model_id", "meta_model_id",
+        ):
+            if not getattr(prior_bundle, attr):
+                raise DeploymentError(
+                    f"rollback target missing required {attr}")
     previous = None
     if os.path.exists(path):
         try:
             previous = load_deployment_pointer(path)
         except DeploymentError:
             previous = None
+    # Write the caller-supplied prior pointer dict (not a re-serialized
+    # bundle) so the configuration_hash remains stable across rollback.
     ch = write_deployment_pointer(path, prior_pointer)
     return {
         "reason": reason,

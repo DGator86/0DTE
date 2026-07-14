@@ -1026,6 +1026,198 @@ class UnifiedOrchestrator:
         except Exception as exc:
             log.warning("feature snapshot logging failed: %s", exc)
 
+
+    def _legacy_decision_dict(self, decision, intent, snapshot_id: str,
+                              final_size_mult: float) -> dict:
+        """Map TradeDecision / stand-down into UnifiedDecisionStack legacy dict."""
+        if decision is None:
+            return {
+                "action": "NO_EDGE",
+                "candidate_id": None,
+                "structure": getattr(getattr(intent, "decision", None),
+                                     "structure", None),
+                "direction": getattr(getattr(intent, "decision", None),
+                                     "direction", None),
+                "size_mult": float(final_size_mult or 0.0),
+            }
+        action = (
+            "TRADE" if (
+                getattr(decision, "decision", None) == "TRADE"
+                and getattr(decision, "gate_pass", False)
+            ) else "NO_EDGE"
+        )
+        cand = getattr(decision, "candidate", None)
+        cid = None
+        structure = None
+        if cand is not None:
+            cid = (getattr(cand, "candidate_id", None)
+                   or getattr(cand, "v2_candidate_id", None)
+                   or getattr(cand, "_v2_candidate_id", None))
+            structure = getattr(cand, "family", None)
+            if not cid:
+                try:
+                    from prediction.candidate_universe import make_candidate_id
+                    from prediction.candidate_universe import _legs_from
+                    cid = make_candidate_id(
+                        snapshot_id,
+                        family=str(structure or "unknown"),
+                        legs=_legs_from(cand),
+                    )
+                    try:
+                        setattr(cand, "candidate_id", cid)
+                    except Exception:
+                        pass
+                except Exception:
+                    cid = None
+        return {
+            "action": action,
+            "candidate_id": cid,
+            "structure": structure or getattr(
+                getattr(intent, "decision", None), "structure", None),
+            "direction": (
+                getattr(decision, "direction", None)
+                or getattr(getattr(intent, "decision", None), "direction", None)),
+            "size_mult": float(final_size_mult or 0.0),
+        }
+
+    def _evaluate_unified_stack(
+            self, *, snap, now, snapshot_id: str, signals: dict,
+            intent, regime_state, decision, final_size_mult: float,
+            decide_pdf, cfg) -> dict:
+        """
+        Run UnifiedDecisionStack when configured. Builds one CanonicalSnapshot
+        and one CandidateUniverse from the shared select_spreads enumeration.
+        Returns a dict of TickResult unified-field kwargs (empty if no stack).
+        """
+        stack = getattr(self, "decision_stack", None)
+        if stack is None:
+            return {}
+        try:
+            from prediction.canonical_snapshot import build_canonical_snapshot
+            from prediction.candidate_universe import build_candidate_universe
+            from prediction.inference import live_feature_row
+        except Exception as exc:
+            log.warning("unified stack imports failed: %s", exc)
+            return {}
+
+        try:
+            row = live_feature_row(snap, signals)
+            ts_iso = now.astimezone(ET).isoformat()
+            session_date = now.astimezone(ET).date().isoformat()
+            canon = build_canonical_snapshot(
+                symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
+                ts=ts_iso,
+                session_date=session_date,
+                market=snap.market,
+                chain=getattr(snap, "chain", None),
+                raw_features=row,
+                snapshot_id=snapshot_id,
+                quality={
+                    "data_quality": float(signals.get("data_quality") or 0.85),
+                    "feature_coverage": min(1.0, len(row) / 40.0),
+                },
+                source_timestamps={
+                    "bars": ts_iso,
+                    "chain": ts_iso if getattr(snap, "chain", None) else None,
+                },
+            )
+
+            # Shared candidate universe — prefer tick shadow cands, else full enum.
+            cands = list(getattr(self, "_tick_shadow_cands", None) or [])
+            if not cands and getattr(snap, "chain", None) is not None:
+                try:
+                    from spread_selector import select_spreads, GammaContext
+                    rnd_s = extract_rnd(snap.chain, cfg.rnd)
+                    edge_s = compute_edge(
+                        rnd_s, snap.chain, cfg.rnd,
+                        physical_pdf=decide_pdf)
+                    ctx_s = GammaContext.from_market_snapshot(
+                        snap.market, pin_active=False)
+                    sel = select_spreads(
+                        snap.chain, rnd_s, edge_s, ctx_s, cfg.selector,
+                        physical_pdf=decide_pdf, target_families=None)
+                    cands = list(sel.all_candidates or sel.ranked or [])
+                except Exception as exc:
+                    log.warning("candidate universe enum failed: %s", exc)
+                    cands = list(getattr(decision, "all_candidates", None) or [])
+
+            universe = build_candidate_universe(
+                snapshot_id=snapshot_id,
+                generated_at=ts_iso,
+                candidates=cands,
+                generator_config={
+                    "selector_min_ev": getattr(cfg.selector, "min_ev", None),
+                },
+            )
+
+            # Capture universe for the stack without replacing a caller-provided fn.
+            stack.candidate_universe_fn = (
+                lambda snapshot, forecast=None, _u=universe: _u)
+
+            legacy = self._legacy_decision_dict(
+                decision, intent, snapshot_id, final_size_mult)
+            hard = tuple(getattr(regime_state, "vetoes", None) or ())
+            # Operational hard vetoes already reflected in legacy NO_EDGE /
+            # risk gates — also pass explicit names when present on signals.
+            for key in ("hard_veto", "op_risk_vetoes"):
+                extra = signals.get(key)
+                if isinstance(extra, (list, tuple)):
+                    hard = hard + tuple(str(x) for x in extra)
+
+            record = stack.evaluate(
+                canon,
+                legacy_decision=legacy,
+                hard_vetoes=hard,
+            )
+
+            # Prefer unified Part 3 payload for dashboard when available.
+            part3_payload = getattr(self, "_tick_part3", None)
+            if record is not None:
+                part3_payload = {
+                    **(part3_payload or {}),
+                    "unified": record.to_dict(),
+                    "statistical_action": record.v3_statistical_action,
+                    "final_action": record.v3_final_action,
+                    "selected_candidate_id": record.v3_candidate_id,
+                    "authority_source": record.authority_source,
+                    "deployment_id": record.deployment_id,
+                    "deployment_mode": record.deployment_mode,
+                    "fallback_used": record.fallback_used,
+                    "hard_vetoes": list(record.hard_vetoes),
+                    "reasons": list(record.reasons),
+                    "shadow_label": (
+                        f"{record.deployment_mode.upper()} — "
+                        f"authority={record.authority_source}"),
+                    "mode": record.deployment_mode,
+                }
+                self._tick_part3 = part3_payload
+
+            return {
+                "legacy_decision": legacy,
+                "v3_decision": {
+                    "statistical_action": record.v3_statistical_action,
+                    "final_action": record.v3_final_action,
+                    "candidate_id": record.v3_candidate_id,
+                    "structure": record.v3_structure,
+                    "direction": record.v3_direction,
+                },
+                "authoritative_decision": {
+                    "final_action": record.final_action,
+                    "selected_candidate_id": record.selected_candidate_id,
+                    "structure": record.final_structure,
+                    "direction": record.final_direction,
+                    "size_mult": record.final_size_mult,
+                },
+                "authority_source": record.authority_source,
+                "deployment_id": record.deployment_id,
+                "fallback_used": record.fallback_used,
+                "candidate_universe_summary": universe.to_dict(),
+                "part3": part3_payload,
+            }
+        except Exception as exc:
+            log.warning("unified decision stack failed: %s", exc)
+            return {}
+
     def tick(self, now: dt.datetime,
              position_contexts: Optional[list[PositionContext]] = None
              ) -> Optional[TickResult]:
@@ -1359,6 +1551,11 @@ class UnifiedOrchestrator:
                 final_size_mult=0.0,
                 matrix_stand_down=True,
             )
+            unified_fields = self._evaluate_unified_stack(
+                snap=snap, now=now, snapshot_id=snapshot_id, signals=signals,
+                intent=intent, regime_state=regime_state, decision=None,
+                final_size_mult=0.0, decide_pdf=decide_pdf, cfg=cfg,
+            )
             result = TickResult(
                 ts=now, regime=regime_state, intent=intent,
                 decision=None, final_size_mult=0.0,
@@ -1366,8 +1563,18 @@ class UnifiedOrchestrator:
                 ras_results=ras_results,
                 signals=pub_signals,
                 sigma_cones=getattr(self, "_tick_sigma_cones", None),
-                part3=getattr(self, "_tick_part3", None),
+                part3=unified_fields.get(
+                    "part3", getattr(self, "_tick_part3", None)),
                 paper_intents=paper_intents,
+                legacy_decision=unified_fields.get("legacy_decision"),
+                v3_decision=unified_fields.get("v3_decision"),
+                authoritative_decision=unified_fields.get(
+                    "authoritative_decision"),
+                authority_source=unified_fields.get("authority_source"),
+                deployment_id=unified_fields.get("deployment_id"),
+                fallback_used=bool(unified_fields.get("fallback_used")),
+                candidate_universe_summary=unified_fields.get(
+                    "candidate_universe_summary"),
             )
             if self.journal:
                 row = _no_trade_row(snap.market, intent, regime_state,
@@ -1537,6 +1744,11 @@ class UnifiedOrchestrator:
             final_size_mult=final_size,
             matrix_stand_down=matrix_stand_down,
         )
+        unified_fields = self._evaluate_unified_stack(
+            snap=snap, now=now, snapshot_id=snapshot_id, signals=signals,
+            intent=intent, regime_state=regime_state, decision=decision,
+            final_size_mult=final_size, decide_pdf=decide_pdf, cfg=cfg,
+        )
         return TickResult(
             ts=now, regime=regime_state, intent=intent,
             decision=decision,
@@ -1545,8 +1757,17 @@ class UnifiedOrchestrator:
             ras_results=ras_results,
             signals=pub_signals,
             sigma_cones=getattr(self, "_tick_sigma_cones", None),
-            part3=getattr(self, "_tick_part3", None),
+            part3=unified_fields.get("part3",
+                                     getattr(self, "_tick_part3", None)),
             paper_intents=paper_intents,
+            legacy_decision=unified_fields.get("legacy_decision"),
+            v3_decision=unified_fields.get("v3_decision"),
+            authoritative_decision=unified_fields.get("authoritative_decision"),
+            authority_source=unified_fields.get("authority_source"),
+            deployment_id=unified_fields.get("deployment_id"),
+            fallback_used=bool(unified_fields.get("fallback_used")),
+            candidate_universe_summary=unified_fields.get(
+                "candidate_universe_summary"),
         )
 
     def run_replay(self, timestamps: Sequence[dt.datetime]) -> list[TickResult]:

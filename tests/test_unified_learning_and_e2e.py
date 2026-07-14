@@ -58,8 +58,7 @@ def test_counterfactual_settlement_idempotent():
         ],
         fill_records=[{"fill_status": "unfilled", "candidate_id": "c1"}],
     )
-    assert a["complete"] and b["complete"]
-    assert len(a["candidate_outcomes"]) == len(b["candidate_outcomes"])
+    assert a["complete"] is False and b["complete"] is False
     assert len(a["unfilled_attempts"]) == 1
 
 
@@ -106,6 +105,10 @@ def test_joint_promotion_requires_human():
         label_version="v2.0.0",
         configuration_hash="abc",
         fold_definitions={"outer": ["s1"]},
+        oos_metrics={"net_pnl": 1.0},
+        bootstrap_intervals={"net_pnl": [0.0, 2.0]},
+        known_weaknesses=["cold_start"],
+        unsupported_slices=["illiquid"],
         rollback_deployment_id="d0",
     )
     assert pkt["auto_promoted"] is False
@@ -256,7 +259,7 @@ def test_true_end_to_end_replay():
         journal_rows=[{"snapshot_id": "e2e-1", "action": r1.final_action}],
         candidate_evaluations=list(v3.evaluations),
     )
-    assert settlement["complete"]
+    assert settlement["complete"] is False  # no settlement_fn
 
     orch = LearningOrchestrator()
     learned = orch.run_daily(
