@@ -786,6 +786,14 @@ html, body {
   text-transform: uppercase;
   font-size: 10px;
 }
+.chip.track-v3 {
+  color: var(--green, #3dd68c);
+  border-color: rgba(61,214,140,0.45);
+  background: rgba(61,214,140,0.10);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
 .chip.track-disagree {
   color: var(--amber);
   border-color: var(--amber);

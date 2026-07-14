@@ -7,8 +7,13 @@ WHAT THIS IS
     broker "fills" it against the live option chain, then marks the position to
     market every tick and exits it on a stop-loss, profit-target, trailing-stop,
     or end-of-day rule. Every closed trade is journaled with realized P&L and the
-    exit reason. NO REAL ORDERS ARE PLACED — it tracks a virtual cash account
-    (default $1000) so a strategy can prove itself before any real money.
+    exit reason. NO REAL ORDERS ARE PLACED — it tracks virtual cash accounts
+    (default $1000 per track) so strategies can prove themselves before any real
+    money.
+
+    Parallel tracks (legacy / v2 / v3): each prediction engine can open its own
+    paper position with an independent cash ledger. Journal `entry_ctx.fill_track`
+    tags which engine filled the trade for side-by-side comparison.
 
 POSITION MATH (per share, options are ×100)
     A position is the candidate's leg list. At entry we collect `entry_credit`
@@ -46,6 +51,10 @@ from risk_manager import PositionMonitor
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger("paper_broker")
 
+# Parallel paper tracks — each gets its own virtual cash ledger so legacy /
+# V2 prediction-policy / V3 Part-3 decisions can be compared side-by-side.
+PAPER_TRACKS = ("legacy", "v2", "v3")
+
 
 # --------------------------------------------------------------------------- #
 # Config                                                                        #
@@ -54,7 +63,11 @@ log = logging.getLogger("paper_broker")
 class PaperConfig:
     starting_cash: float = 1000.0
     multiplier: int = 100                 # option contract multiplier
-    max_open_positions: int = 1           # 0DTE: one structure at a time by default
+    max_open_positions: int = 1           # per-track cap (0DTE: one structure each)
+    # When True (default), open independent positions for each paper_intent
+    # track on the tick (legacy / v2 / v3). When False, only the legacy
+    # authoritative TradeDecision is filled (pre-triple-paper behavior).
+    parallel_tracks: bool = True
     # Risk fractions apply to CURRENT equity, not starting cash: the budget
     # compounds as the account grows and shrinks in a drawdown. Anchoring to
     # starting_cash both caps the upside path and keeps betting $500 when the
@@ -153,23 +166,56 @@ class PaperBroker:
         self.open_positions: list[PaperPosition] = []
         self._db = sqlite3.connect(db_path)
         self._init_db()
-        # Realized equity (starting + closed P&L). Open positions are in-memory
-        # only and cannot survive a process restart -- but closed-trade history
-        # is already persisted, so resume from the last recorded equity instead
-        # of silently resetting the account to starting_cash on every restart.
-        self.cash = self._restore_equity()
-        self._day_realized: dict[str, float] = {}   # ET date -> realized $ that day
-        self._day_start_cash: dict[str, float] = {} # ET date -> equity at first tick
-        self._day_entries: dict[str, int] = {}      # ET date -> entries opened
-        self._last_exit_at: Optional[dt.datetime] = None
-        self._last_exit_reason: str = ""
+        # Per-track realized cash (starting + closed P&L). Open positions are
+        # in-memory only and cannot survive a process restart — closed-trade
+        # history is persisted, so each track resumes from its last equity.
+        self.ledgers: dict[str, float] = self._restore_ledgers()
+        self._day_realized: dict[str, float] = {}   # f"{date}|{track}" -> $
+        self._day_start_cash: dict[str, float] = {} # f"{date}|{track}" -> equity
+        self._day_entries: dict[str, int] = {}      # f"{date}|{track}" -> n
+        self._last_exit_at: dict[str, Optional[dt.datetime]] = {
+            t: None for t in PAPER_TRACKS}
+        self._last_exit_reason: dict[str, str] = {t: "" for t in PAPER_TRACKS}
         self._ras_trail_mult: float = 1.0   # per-tick trailing giveback multiplier
 
-    def _restore_equity(self) -> float:
-        row = self._db.execute(
-            "SELECT equity_after FROM paper_trades ORDER BY closed_at DESC LIMIT 1"
-        ).fetchone()
-        return row[0] if row and row[0] is not None else self.cfg.starting_cash
+    @property
+    def cash(self) -> float:
+        """Backward-compat: legacy-track cash (pre-triple-paper single ledger)."""
+        return float(self.ledgers.get("legacy", self.cfg.starting_cash))
+
+    @cash.setter
+    def cash(self, value: float) -> None:
+        self.ledgers["legacy"] = float(value)
+
+    def _restore_ledgers(self) -> dict[str, float]:
+        ledgers = {t: float(self.cfg.starting_cash) for t in PAPER_TRACKS}
+        try:
+            rows = self._db.execute(
+                "SELECT equity_after, entry_ctx FROM paper_trades "
+                "ORDER BY closed_at"
+            ).fetchall()
+        except sqlite3.Error:
+            return ledgers
+        for equity_after, ctx_json in rows:
+            track = "legacy"
+            if ctx_json:
+                try:
+                    ctx = json.loads(ctx_json)
+                    t = str(ctx.get("fill_track") or "legacy").lower()
+                    if t in ledgers:
+                        track = t
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    track = "legacy"
+            if equity_after is not None:
+                ledgers[track] = float(equity_after)
+        return ledgers
+
+    def _track_of(self, pos: PaperPosition) -> str:
+        t = str((pos.entry_ctx or {}).get("fill_track") or "legacy").lower()
+        return t if t in self.ledgers else "legacy"
+
+    def _open_count(self, track: str) -> int:
+        return sum(1 for p in self.open_positions if self._track_of(p) == track)
 
     # -- persistence --------------------------------------------------------
     def _init_db(self) -> None:
@@ -204,7 +250,8 @@ class PaperBroker:
              pos.opened_at.isoformat(), now.isoformat(), round(hold_min, 1),
              round(pos.entry_credit, 4), round(credit_now, 4),
              round(pos.max_profit_ps, 4), round(pos.max_loss_ps, 4),
-             round(pnl_ps, 4), round(pnl_dollars, 2), reason, round(self.cash, 2),
+             round(pnl_ps, 4), round(pnl_dollars, 2), reason,
+             round(self.ledgers[self._track_of(pos)], 2),
              json.dumps(pos.entry_ctx) if pos.entry_ctx else None,
              round(pos.peak_pnl_ps, 4)),
         )
@@ -213,10 +260,19 @@ class PaperBroker:
     # -- public API ---------------------------------------------------------
     @property
     def equity(self) -> float:
-        """Realized cash + unrealized mark of open positions (set by last mark)."""
+        """Sum of per-track realized cash + unrealized marks."""
         unreal = sum(p.last_pnl_ps * self.cfg.multiplier * p.contracts
                      for p in self.open_positions)
-        return self.cash + unreal
+        return sum(self.ledgers.values()) + unreal
+
+    def track_equity(self, track: str, *, include_unrealized: bool = True) -> float:
+        cash = float(self.ledgers.get(track, self.cfg.starting_cash))
+        if not include_unrealized:
+            return cash
+        unreal = sum(
+            p.last_pnl_ps * self.cfg.multiplier * p.contracts
+            for p in self.open_positions if self._track_of(p) == track)
+        return cash + unreal
 
     def on_tick(self, now: dt.datetime, result) -> list[str]:
         """Drive the broker for one tick from a unified_loop TickResult. Returns a
@@ -242,10 +298,17 @@ class PaperBroker:
             if ev:
                 events.append(ev)
 
-        # 2) maybe open a new position from a TRADE decision
-        ev = self._maybe_open(now, result, chain, cmid, pmid, spr)
-        if ev:
-            events.append(ev)
+        # 2) maybe open new positions — parallel tracks when paper_intents set
+        intents = list(getattr(result, "paper_intents", None) or [])
+        if intents and self.cfg.parallel_tracks:
+            for intent in intents:
+                ev = self._maybe_open_intent(now, result, intent, chain, cmid, pmid, spr)
+                if ev:
+                    events.append(ev)
+        else:
+            ev = self._maybe_open(now, result, chain, cmid, pmid, spr)
+            if ev:
+                events.append(ev)
 
         return events
 
@@ -267,28 +330,70 @@ class PaperBroker:
             credit_now = pos.entry_credit - pnl_ps
             net_ps = pnl_ps
             pnl_dollars = net_ps * self.cfg.multiplier * pos.contracts
-            self.cash += pnl_dollars
+            track = self._track_of(pos)
+            self.ledgers[track] = self.ledgers.get(track, self.cfg.starting_cash) + pnl_dollars
             date = now.astimezone(ET).date().isoformat()
-            self._day_realized[date] = self._day_realized.get(date, 0.0) + pnl_dollars
+            key = f"{date}|{track}"
+            self._day_realized[key] = self._day_realized.get(key, 0.0) + pnl_dollars
             self.open_positions.remove(pos)
             self.position_monitor.release(pos.id)
             pos.entry_ctx["ras_at_exit"] = ras.score
             pos.entry_ctx["ras_exit_note"] = "chain_unavailable"
-            self._last_exit_at = now
-            self._last_exit_reason = "ras_invalidate"
+            self._last_exit_at[track] = now
+            self._last_exit_reason[track] = "ras_invalidate"
             self._record(pos, now, credit_now, net_ps, pnl_dollars, "ras_invalidate")
             self._notify("PAPER EXIT",
-                         f"{pos.family} {pos.strikes_str()} ras_invalidate "
+                         f"[{track}] {pos.family} {pos.strikes_str()} ras_invalidate "
                          f"(no chain) pnl=${pnl_dollars:+.2f}")
-            return (f"PAPER EXIT {pos.family} ras_invalidate (no chain) "
+            return (f"PAPER EXIT [{track}] {pos.family} ras_invalidate (no chain) "
                     f"pnl=${pnl_dollars:+.2f}")
         return None
 
     # -- entry --------------------------------------------------------------
     def _maybe_open(self, now, result, chain, cmid, pmid, spr) -> Optional[str]:
+        """Legacy single-path open (used when paper_intents absent / parallel off)."""
         dec = getattr(result, "decision", None)
         if dec is None or getattr(dec, "decision", None) != "TRADE" or not getattr(dec, "gate_pass", False):
             return None
+        cand = getattr(dec, "candidate", None)
+        if cand is None:
+            return None
+        sig = getattr(result, "signals", None) or {}
+        mode_l = str(sig.get("policy_mode") or "").lower()
+        # Pre-triple-paper: champion tagged the single fill as v2.
+        track = "v2" if mode_l == "champion" else "legacy"
+        return self._open_candidate(
+            now, result, cand, chain, cmid, pmid, spr,
+            track=track,
+            size_mult=float(getattr(result, "final_size_mult", 1.0) or 1.0),
+            gate_kelly=getattr(dec, "gate_kelly", None),
+            gate_score=getattr(dec, "gate_score", None),
+        )
+
+    def _maybe_open_intent(self, now, result, intent, chain, cmid, pmid, spr) -> Optional[str]:
+        """Open from a parallel paper_intent dict ({track, candidate, ...})."""
+        if not isinstance(intent, dict):
+            return None
+        track = str(intent.get("track") or "").lower()
+        if track not in PAPER_TRACKS:
+            return None
+        cand = intent.get("candidate")
+        if cand is None:
+            return None
+        return self._open_candidate(
+            now, result, cand, chain, cmid, pmid, spr,
+            track=track,
+            size_mult=float(intent.get("size_mult") or 1.0),
+            gate_kelly=intent.get("gate_kelly"),
+            gate_score=intent.get("gate_score"),
+            intent_meta=intent,
+        )
+
+    def _open_candidate(
+            self, now, result, cand, chain, cmid, pmid, spr, *,
+            track: str, size_mult: float = 1.0,
+            gate_kelly=None, gate_score=None,
+            intent_meta: Optional[dict] = None) -> Optional[str]:
         # Belt-and-suspenders: never open during session warmup even if a
         # misconfigured gate somehow passed. GateConfig.morning_entry_time is
         # the single source of truth (default 10:00 ET = 30m after the open).
@@ -297,65 +402,65 @@ class PaperBroker:
             entry_open = GateConfig().morning_entry_time
             sig = getattr(result, "signals", None) or {}
             if float(sig.get("session_warmup") or 0.0) >= 1.0:
-                log.info("paper entry suppressed: session_warmup")
+                log.info("paper entry suppressed [%s]: session_warmup", track)
                 return None
             if now.astimezone(ET).time() < entry_open:
-                log.info("paper entry suppressed: before morning_entry_time %s",
-                         entry_open.strftime("%H:%M"))
+                log.info("paper entry suppressed [%s]: before morning_entry_time %s",
+                         track, entry_open.strftime("%H:%M"))
                 return None
         except Exception:
             pass
-        cand = getattr(dec, "candidate", None)
-        if cand is None:
-            return None
-        if len(self.open_positions) >= self.cfg.max_open_positions:
+        if self._open_count(track) >= self.cfg.max_open_positions:
             return None
 
         date = now.astimezone(ET).date().isoformat()
-        day_start = self._day_start_cash.setdefault(date, self.cash)
-        if self._day_realized.get(date, 0.0) <= -self.cfg.daily_loss_limit_frac * day_start:
-            return None                                     # daily loss limit hit; stand down
-        if self._day_entries.get(date, 0) >= self.cfg.max_trades_per_day:
-            return None                                     # enough for one session
+        key = f"{date}|{track}"
+        track_cash = float(self.ledgers.get(track, self.cfg.starting_cash))
+        day_start = self._day_start_cash.setdefault(key, track_cash)
+        if self._day_realized.get(key, 0.0) <= -self.cfg.daily_loss_limit_frac * day_start:
+            return None
+        if self._day_entries.get(key, 0) >= self.cfg.max_trades_per_day:
+            return None
 
-        # Re-entry cooldown: a regime that persists re-emits the same ticket
-        # every tick; one position per regime, not one per minute.
-        if self._last_exit_at is not None:
-            cool = (self.cfg.stop_cooldown_min if self._last_exit_reason == "stop"
+        last_exit = self._last_exit_at.get(track)
+        if last_exit is not None:
+            cool = (self.cfg.stop_cooldown_min
+                    if self._last_exit_reason.get(track) == "stop"
                     else self.cfg.reentry_cooldown_min)
-            since = (now - self._last_exit_at).total_seconds() / 60.0
+            since = (now - last_exit).total_seconds() / 60.0
             if since < cool:
                 return None
 
         legs = tuple(cand.legs)
         slip_entry = self._slippage_ps(legs, spr)
-        entry_credit = float(cand.credit) - slip_entry      # worse than mid by slippage
+        entry_credit = float(cand.credit) - slip_entry
 
         mp, ml = self._payoff_extents(legs, chain.spot, entry_credit)
         if ml <= 0:
-            return None                                     # degenerate / no defined risk
+            return None
 
-        # size against CURRENT equity, the regime size multiplier, and the
-        # gate's conviction (score -> Kelly fraction)
-        size_mult = float(getattr(result, "final_size_mult", 1.0)) or 1.0
         kelly = 1.0
         if self.cfg.use_gate_kelly:
-            k = getattr(dec, "gate_kelly", None)
+            k = gate_kelly
             if isinstance(k, (int, float)) and 0.0 < k <= 1.0:
                 kelly = float(k)
-        risk_budget = self.cash * self.cfg.risk_per_trade_frac
+        risk_budget = track_cash * self.cfg.risk_per_trade_frac
         per_contract_risk = ml * self.cfg.multiplier
         contracts = int(np.floor((risk_budget * size_mult * kelly) / per_contract_risk))
-        # never risk more than the cash on hand
-        contracts = min(contracts, int(np.floor(self.cash / per_contract_risk)))
+        contracts = min(contracts, int(np.floor(track_cash / per_contract_risk)))
         if contracts < 1:
-            return None                                     # can't afford even one lot
+            return None
 
         intent = getattr(result, "intent", None)
         regime = getattr(result, "regime", None)
         intent_dec = getattr(intent, "decision", None) if intent is not None else None
         structure = getattr(intent_dec, "structure", None) if intent_dec else None
         direction = getattr(intent_dec, "direction", None) if intent_dec else None
+        meta = intent_meta or {}
+        if meta.get("structure"):
+            structure = meta.get("structure")
+        if meta.get("direction"):
+            direction = meta.get("direction")
         structure_class = structure_class_from_family(cand.family)
         position_bias = derive_position_bias(
             direction or "none", structure or "", structure_class)
@@ -376,14 +481,9 @@ class PaperBroker:
         if entry_snapshot is None:
             log.warning("opening paper position WITHOUT entry_snapshot — "
                         "RAS will not monitor this trade")
-        # Parallel-policy provenance for journal Legacy / V2 delineation.
-        # Authoritative fill track follows policy_mode only (champion → v2).
-        # In shadow/legacy modes the paper broker still follows the matrix.
         sig = getattr(result, "signals", None) or {}
         policy_mode = sig.get("policy_mode")
         policy_source = sig.get("policy_source")
-        mode_l = str(policy_mode or "").lower()
-        fill_track = "v2" if mode_l == "champion" else "legacy"
         try:
             disagree = float(sig.get("policy_disagreement") or 0.0) >= 1.0
         except (TypeError, ValueError):
@@ -400,7 +500,7 @@ class PaperBroker:
             "position_bias": position_bias,
             "conviction": (intent.decision.conviction if intent is not None else None),
             "capture": (intent.decision.capture if intent is not None else None),
-            "gate_score": getattr(dec, "gate_score", None),
+            "gate_score": gate_score,
             "ev": getattr(cand, "ev", None),
             "ev_per_risk": getattr(cand, "ev_per_risk", None),
             "prob_profit": getattr(cand, "prob_profit", None),
@@ -409,14 +509,11 @@ class PaperBroker:
             "gate_kelly": kelly,
             "spot": getattr(chain, "spot", None),
             "risk_budget": round(risk_budget, 2),
-            "equity_at_entry": round(self.cash, 2),
+            "equity_at_entry": round(track_cash, 2),
             "entry_snapshot": (entry_snapshot_to_dict(entry_snapshot)
                                if entry_snapshot is not None else None),
-            # Filled from the first RAS evaluation after entry (RAS needs a
-            # registered position context, so it cannot exist at open time).
             "ras_at_entry": None,
-            # Track delineation (Legacy vs V2 parallel shadow)
-            "fill_track": fill_track,
+            "fill_track": track,
             "policy_mode": policy_mode,
             "policy_source": policy_source,
             "policy_disagreement": 1.0 if disagree else 0.0,
@@ -427,6 +524,11 @@ class PaperBroker:
             "v2_policy_action": sig.get("v2_policy_action"),
             "v2_policy_direction": sig.get("v2_policy_direction"),
             "v2_policy_confidence": sig.get("v2_policy_confidence"),
+            "v3_action": meta.get("v3_action") or (
+                (getattr(result, "part3", None) or {})
+                .get("decision_summary", {}) or {}).get("action"),
+            "v3_selected_candidate_id": meta.get("candidate_id"),
+            "intent_reason": meta.get("reason"),
         }
 
         pos = PaperPosition(
@@ -437,11 +539,11 @@ class PaperBroker:
         )
         self.open_positions.append(pos)
         self.position_monitor.register(pos.id, entry_ctx)
-        self._day_entries[date] = self._day_entries.get(date, 0) + 1
+        self._day_entries[key] = self._day_entries.get(key, 0) + 1
         self._notify("PAPER ENTRY",
-                     f"{pos.family} {pos.strikes_str()} x{contracts} "
+                     f"[{track}] {pos.family} {pos.strikes_str()} x{contracts} "
                      f"entry={entry_credit:+.2f} maxP={mp:.2f} maxL={ml:.2f}")
-        return (f"PAPER ENTRY {pos.family} {pos.strikes_str()} x{contracts} "
+        return (f"PAPER ENTRY [{track}] {pos.family} {pos.strikes_str()} x{contracts} "
                 f"entry={entry_credit:+.2f}")
 
     # -- management / exit --------------------------------------------------
@@ -502,21 +604,24 @@ class PaperBroker:
         slip_exit = self._slippage_ps(pos.legs, spr)
         net_ps = pnl_ps - slip_exit
         pnl_dollars = net_ps * self.cfg.multiplier * pos.contracts
-        self.cash += pnl_dollars
+        track = self._track_of(pos)
+        self.ledgers[track] = self.ledgers.get(track, self.cfg.starting_cash) + pnl_dollars
         date = now.astimezone(ET).date().isoformat()
-        self._day_realized[date] = self._day_realized.get(date, 0.0) + pnl_dollars
+        key = f"{date}|{track}"
+        self._day_realized[key] = self._day_realized.get(key, 0.0) + pnl_dollars
 
         self.open_positions.remove(pos)
         self.position_monitor.release(pos.id)
         pos.entry_ctx["ras_at_exit"] = pos.entry_ctx.get("ras_score")
-        self._last_exit_at = now
-        self._last_exit_reason = reason
+        self._last_exit_at[track] = now
+        self._last_exit_reason[track] = reason
         self._record(pos, now, credit_now, net_ps, pnl_dollars, reason)
+        eq = self.ledgers[track]
         self._notify("PAPER EXIT",
-                     f"{pos.family} {pos.strikes_str()} {reason} "
-                     f"pnl=${pnl_dollars:+.2f} equity=${self.cash:.2f}")
-        return (f"PAPER EXIT {pos.family} {reason} pnl=${pnl_dollars:+.2f} "
-                f"equity=${self.cash:.2f}")
+                     f"[{track}] {pos.family} {pos.strikes_str()} {reason} "
+                     f"pnl=${pnl_dollars:+.2f} equity=${eq:.2f}")
+        return (f"PAPER EXIT [{track}] {pos.family} {reason} pnl=${pnl_dollars:+.2f} "
+                f"equity=${eq:.2f}")
 
     def _exit_reason(self, pos, now, pnl_ps, ras_exit: bool = False) -> Optional[str]:
         cfg = self.cfg
@@ -604,22 +709,60 @@ class PaperBroker:
     def report(self, now: Optional[dt.datetime] = None) -> dict:
         now = now or dt.datetime.now(ET)
         rows = list(self._db.execute(
-            "SELECT pnl_dollars, exit_reason, equity_after FROM paper_trades ORDER BY closed_at"))
+            "SELECT pnl_dollars, exit_reason, equity_after, entry_ctx "
+            "FROM paper_trades ORDER BY closed_at"))
         n = len(rows)
         pnls = [r[0] for r in rows]
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
         gross_win = sum(wins)
         gross_loss = -sum(losses)
-        equity_curve = [self.cfg.starting_cash] + [r[2] for r in rows]
-        peak = equity_curve[0]
-        max_dd = 0.0
-        for e in equity_curve:
-            peak = max(peak, e)
-            max_dd = max(max_dd, peak - e)
         by_reason: dict[str, int] = {}
+        by_track: dict[str, dict] = {
+            t: {"trades": 0, "total_pnl": 0.0, "wins": 0,
+                "equity": round(self.track_equity(t), 2),
+                "open_positions": self._open_count(t)}
+            for t in PAPER_TRACKS
+        }
         for r in rows:
             by_reason[r[1]] = by_reason.get(r[1], 0) + 1
+            track = "legacy"
+            if r[3]:
+                try:
+                    ctx = json.loads(r[3])
+                    t = str(ctx.get("fill_track") or "legacy").lower()
+                    if t in by_track:
+                        track = t
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    track = "legacy"
+            by_track[track]["trades"] += 1
+            by_track[track]["total_pnl"] = round(
+                by_track[track]["total_pnl"] + float(r[0] or 0.0), 2)
+            if float(r[0] or 0.0) > 0:
+                by_track[track]["wins"] += 1
+        for t, bt in by_track.items():
+            nt = bt["trades"]
+            bt["win_rate"] = (bt["wins"] / nt) if nt else 0.0
+            bt["total_pnl"] = round(bt["total_pnl"], 2)
+            bt.pop("wins", None)
+
+        # Backward-compat equity curve uses legacy ledger (single-account era).
+        legacy_equity_curve = [self.cfg.starting_cash]
+        for r in rows:
+            track = "legacy"
+            if r[3]:
+                try:
+                    ctx = json.loads(r[3])
+                    track = str(ctx.get("fill_track") or "legacy").lower()
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    track = "legacy"
+            if track == "legacy" and r[2] is not None:
+                legacy_equity_curve.append(float(r[2]))
+        peak = legacy_equity_curve[0]
+        max_dd = 0.0
+        for e in legacy_equity_curve:
+            peak = max(peak, e)
+            max_dd = max(max_dd, peak - e)
         return {
             "trades": n,
             "win_rate": (len(wins) / n) if n else 0.0,
@@ -628,10 +771,13 @@ class PaperBroker:
             "avg_loss": round(-gross_loss / len(losses), 2) if losses else 0.0,
             "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
             "max_drawdown": round(max_dd, 2),
-            "equity": round(equity_curve[-1], 2),
+            "equity": round(self.track_equity("legacy"), 2),
             "open_positions": len(self.open_positions),
             "open": [self._open_position_view(p, now) for p in self.open_positions],
             "by_exit_reason": by_reason,
+            "by_track": by_track,
+            "ledgers": {t: round(float(self.ledgers.get(t, self.cfg.starting_cash)), 2)
+                        for t in PAPER_TRACKS},
         }
 
     def print_report(self) -> None:

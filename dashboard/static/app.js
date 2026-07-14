@@ -575,13 +575,29 @@
       $("v2-paper-metrics").innerHTML = '<div class="metric"><span class="k">status</span><span class="v sm">no data</span></div>';
       return;
     }
-    const pnlCls = num(paper.total_pnl) > 0 ? "pos" : num(paper.total_pnl) < 0 ? "neg" : "";
-    $("v2-paper-metrics").innerHTML = [
-      metricCard("Equity", money(paper.equity, 0), "info"),
-      metricCard("Total P&L", money(paper.total_pnl, 0), pnlCls),
+    const by = paper.by_track || {};
+    const tracks = ["legacy", "v2", "v3"];
+    const cards = [
+      metricCard("Equity (legacy)", money(paper.equity, 0), "info"),
+      metricCard("Total P&L", money(paper.total_pnl, 0),
+        num(paper.total_pnl) > 0 ? "pos" : num(paper.total_pnl) < 0 ? "neg" : ""),
       metricCard("Win rate", pct(paper.win_rate)),
       metricCard("Closed trades", paper.trades),
-    ].join("");
+    ];
+    tracks.forEach((t) => {
+      const bt = by[t] || {};
+      const pnl = num(bt.total_pnl);
+      cards.push(metricCard(
+        t.toUpperCase() + " P&L",
+        money(bt.total_pnl != null ? bt.total_pnl : 0, 0),
+        pnl > 0 ? "pos" : pnl < 0 ? "neg" : ""
+      ));
+      cards.push(metricCard(
+        t.toUpperCase() + " n/open",
+        `${bt.trades != null ? bt.trades : 0}/${bt.open_positions != null ? bt.open_positions : 0}`
+      ));
+    });
+    $("v2-paper-metrics").innerHTML = cards.join("");
   }
 
   function renderV2Funnel(ticks) {
@@ -657,7 +673,8 @@
   /* ---------------- track helpers (Legacy vs V3) ---------------- */
   function fillTrack(ctx) {
     ctx = ctx || {};
-    if (ctx.fill_track === "v2" || ctx.fill_track === "legacy") return ctx.fill_track;
+    if (ctx.fill_track === "v2" || ctx.fill_track === "legacy"
+        || ctx.fill_track === "v3") return ctx.fill_track;
     const mode = String(ctx.policy_mode || "").toLowerCase();
     if (mode === "champion") return "v2";
     return "legacy";
@@ -1139,14 +1156,23 @@
   function renderPaper(paper) {
     if (!paper || paper.trades == null) { $("paper-metrics").innerHTML = '<div class="metric"><span class="k">status</span><span class="v sm">no data</span></div>'; return; }
     const pnlCls = num(paper.total_pnl) > 0 ? "pos" : num(paper.total_pnl) < 0 ? "neg" : "";
-    $("paper-metrics").innerHTML = [
-      metricCard("Equity", money(paper.equity, 0), "info"),
+    const by = paper.by_track || {};
+    const cards = [
+      metricCard("Equity (legacy)", money(paper.equity, 0), "info"),
       metricCard("Total P&L", money(paper.total_pnl, 0), pnlCls),
       metricCard("Win rate", pct(paper.win_rate)),
       metricCard("Profit factor", paper.profit_factor != null ? fmt(paper.profit_factor, 2) : "—"),
       metricCard("Closed trades", paper.trades),
       metricCard("Best exit", topReason(paper.by_exit_reason)),
-    ].join("");
+    ];
+    ["legacy", "v2", "v3"].forEach((t) => {
+      const bt = by[t] || {};
+      const p = num(bt.total_pnl);
+      cards.push(metricCard(t.toUpperCase() + " P&L",
+        money(bt.total_pnl != null ? bt.total_pnl : 0, 0),
+        p > 0 ? "pos" : p < 0 ? "neg" : ""));
+    });
+    $("paper-metrics").innerHTML = cards.join("");
   }
   function topReason(m) {
     if (!m) return "—";

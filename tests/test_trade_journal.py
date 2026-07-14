@@ -153,8 +153,9 @@ def test_daily_loss_limit_tracks_day_start_equity(tmp_path):
     b.on_tick(T[0], _result(ENTRY))
     b.on_tick(T[1], _result(_chain(736, 3.90, 0.50)))       # big stop-loss
     day = T[0].astimezone(ET).date().isoformat()
+    key = f"{day}|legacy"
     # force the day's realized loss past 50% of day-start equity
-    b._day_realized[day] = -0.51 * b._day_start_cash[day]
+    b._day_realized[key] = -0.51 * b._day_start_cash[key]
     b.on_tick(T[40], _result(ENTRY))                        # past cooldown, but loss-limited
     assert not b.open_positions
 
