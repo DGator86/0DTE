@@ -239,6 +239,9 @@ def serialize_tick_result(
                     }],
                 }
 
+    part3_payload = part3
+    if part3_payload is None:
+        part3_payload = getattr(result, "part3", None)
     payload = {
         "ts": result.ts.isoformat(),
         "status": "live",
@@ -254,7 +257,7 @@ def serialize_tick_result(
         "forecast": forecast or None,
         "parallel": parallel,
         "sigma_cones": sigma_cones,
-        "part3": part3 if part3 is not None else {
+        "part3": part3_payload if part3_payload is not None else {
             "note": "part3 decision not available",
             "shadow_label": "SHADOW — not an executed order",
             "mode": "shadow",

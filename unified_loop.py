@@ -96,6 +96,8 @@ class TickResult:
     signals: dict = field(default_factory=dict)
     # MTF sigma-cone panes for the Prediction tab (also journaled in store).
     sigma_cones: Optional[dict] = None
+    # Part 3 shadow decision payload for live_state / dashboard assessment.
+    part3: Optional[dict] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -489,6 +491,50 @@ class UnifiedOrchestrator:
                 store=self.prediction_store,
             )
             signals.update(ranking.signals())
+            # Part 3 shadow decision (observation-only) for dashboard assessment.
+            try:
+                from prediction.part3_shadow import build_part3_live_payload
+                ts_iso = getattr(snap, "ts", None)
+                if hasattr(ts_iso, "isoformat"):
+                    ts_iso = ts_iso.isoformat()
+                else:
+                    ts_iso = str(signals.get("ts") or snapshot_id)
+                hard = list(getattr(self, "_tick_hard_vetoes", None) or [])
+                for v in (signals.get("_hard_vetoes") or []):
+                    hard.append(str(v))
+                # Also surface regime / risk veto strings already on signals
+                for key in ("stand_down_reason", "no_trade_reason"):
+                    if signals.get(key):
+                        hard.append(str(signals[key]))
+                # Dedupe while preserving order
+                seen = set()
+                hard_u = []
+                for h in hard:
+                    if h and h not in seen:
+                        seen.add(h)
+                        hard_u.append(h)
+                self._tick_part3 = build_part3_live_payload(
+                    snapshot_id=snapshot_id,
+                    ts=str(ts_iso),
+                    symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
+                    candidates=shadow_cands,
+                    forecasts=ranking.forecasts,
+                    signals=signals,
+                    hard_vetoes=hard_u,
+                    mode=str(getattr(self, "policy_mode", "shadow") or "shadow"),
+                    store=self.prediction_store,
+                    direction=str(signals.get("v2_policy_direction")
+                                  or signals.get("policy_direction")
+                                  or "unknown"),
+                )
+            except Exception as exc:
+                log.warning("Part 3 shadow payload failed: %s", exc)
+                self._tick_part3 = {
+                    "note": f"part3 shadow failed: {type(exc).__name__}: {exc}",
+                    "shadow_label": "SHADOW — not an executed order",
+                    "mode": str(getattr(self, "policy_mode", "shadow") or "shadow"),
+                    "component_errors": {"part3": f"{type(exc).__name__}: {exc}"},
+                }
             # Annotate the live (legacy) candidate with V2 utility when present.
             if decision is not None and decision.candidate is not None:
                 live_id = None
@@ -775,6 +821,7 @@ class UnifiedOrchestrator:
             return None
 
         self._tick_prediction_bundle = None
+        self._tick_part3 = None
         snapshot_id = self._next_snapshot_id(now)
         cfg = self.engine_cfg or EngineConfig()
 
@@ -1059,6 +1106,28 @@ class UnifiedOrchestrator:
             signals, signals_json = self._signals_with_ras(signals, ras_results)
             pub_signals = {k: v for k, v in signals.items()
                            if not str(k).startswith("_")}
+            # Stand-down: overlay HARD_VETO so assessment sees operational veto
+            # separately from the statistical Part 3 action.
+            if getattr(self, "_tick_part3", None):
+                p3 = dict(self._tick_part3)
+                ds = dict(p3.get("decision_summary") or {})
+                vetoes = [str(v) for v in (regime_state.vetoes or [])]
+                if not vetoes:
+                    reason = (
+                        signals.get("stand_down_reason")
+                        or signals.get("no_trade_reason")
+                        or f"stand_down:{regime_state.dominant_regime}"
+                    )
+                    vetoes = [str(reason)]
+                ds["hard_vetoes"] = vetoes
+                ds["statistical_action"] = (
+                    ds.get("statistical_action") or ds.get("action"))
+                ds["action"] = "HARD_VETO"
+                ds["reasons"] = list(ds.get("reasons") or []) + [
+                    f"hard_veto:{v}" for v in vetoes
+                ]
+                p3["decision_summary"] = ds
+                self._tick_part3 = p3
             result = TickResult(
                 ts=now, regime=regime_state, intent=intent,
                 decision=None, final_size_mult=0.0,
@@ -1066,6 +1135,7 @@ class UnifiedOrchestrator:
                 ras_results=ras_results,
                 signals=pub_signals,
                 sigma_cones=getattr(self, "_tick_sigma_cones", None),
+                part3=getattr(self, "_tick_part3", None),
             )
             if self.journal:
                 row = _no_trade_row(snap.market, intent, regime_state,
@@ -1233,6 +1303,7 @@ class UnifiedOrchestrator:
             ras_results=ras_results,
             signals=pub_signals,
             sigma_cones=getattr(self, "_tick_sigma_cones", None),
+            part3=getattr(self, "_tick_part3", None),
         )
 
     def run_replay(self, timestamps: Sequence[dt.datetime]) -> list[TickResult]:
