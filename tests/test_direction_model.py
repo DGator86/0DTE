@@ -120,9 +120,12 @@ class TestDirectionModel:
         cal_s = set(meta["calibration_sessions"])
         train_s = set(meta["train_sessions"])
         assert cal_s and fit_s
-        assert not fit_s & cal_s                       # embargoed inner split
-        assert fit_s | cal_s <= train_s
+        assert fit_s <= train_s
+        assert cal_s <= train_s
+        # V3: calibrator fitted on cross-fitted OOF scores (not joint HP slice)
+        assert meta["calibration_metrics"].get("crossfit") is True
         assert meta["calibration_metrics"]["n"] > 0
+        assert meta["inner_selection"].get("selection_metric") == "log_loss"
         assert meta["decision_threshold"] == pytest.approx(0.58)
         assert 0.0 <= meta["uncertainty"] <= 1.0
 
