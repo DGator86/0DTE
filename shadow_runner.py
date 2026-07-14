@@ -109,11 +109,21 @@ class ShadowRunner:
         prediction_db: Optional[str] = None,  # None = <state_dir>/prediction_store.sqlite
         use_legacy_directional_tilt: bool = True,
         enable_v2_parallel: bool = True,      # heuristic bundle + ranker always on
+        deployment_path: Optional[str] = None,
+        models_dir: str = "models",
+        deployment_mode: Optional[str] = None,
+        fallback_policy: Optional[str] = None,
+        strict_artifacts: bool = False,
+        reference_paper_db: Optional[str] = None,
+        candidate_paper_db: Optional[str] = None,
     ) -> None:
         self.symbol = symbol
         self.interval_s = interval_s
         self.live_state_path = live_state_path
         self.policy_mode = policy_mode
+        self.deployment_bundle = None
+        self.prediction_runtime = None
+        self.decision_stack = None
 
         self._jrn = Journal(db_path)
         # Adaptive state (GEX percentile window, scale books) lives next to the
@@ -182,6 +192,71 @@ class ShadowRunner:
                      "legacy_tilt=%s",
                      policy_mode, pred_db, use_legacy_directional_tilt)
 
+        # Unified deployment bundle + PredictionRuntime (UNIFIED handoff PR1+).
+        # Default shadow deployment allows labeled heuristic baseline.
+        # Candidate/champion refuse heuristic substitution.
+        if deployment_path is None:
+            deployment_path = os.path.join("configs", "deployment.json")
+        if deployment_path and os.path.isfile(deployment_path):
+            from prediction.deployment import (
+                DeploymentBundle, load_deployment_bundle, DeploymentError,
+            )
+            from prediction.registry import ModelRegistry
+            from prediction.runtime import (
+                PredictionRuntime, PredictionRuntimeError,
+            )
+            from decision_stack.stack import UnifiedDecisionStack
+            try:
+                bundle = load_deployment_bundle(deployment_path)
+                if deployment_mode:
+                    from dataclasses import replace as _dc_replace
+                    bundle = _dc_replace(bundle, mode=str(deployment_mode))
+                if fallback_policy:
+                    from dataclasses import replace as _dc_replace
+                    bundle = _dc_replace(
+                        bundle, fallback_policy=str(fallback_policy))
+                registry = ModelRegistry(models_dir)
+                runtime = PredictionRuntime.from_deployment_bundle(
+                    bundle, registry, strict=strict_artifacts)
+                self.deployment_bundle = bundle
+                self.prediction_runtime = runtime
+                self.decision_stack = UnifiedDecisionStack(
+                    deployment=bundle,
+                    prediction_runtime=runtime,
+                    legacy_config=self.champion,
+                    stores={"prediction": self._prediction_store},
+                )
+                ids = runtime.component_ids()
+                log.info(
+                    "Deployment loaded: id=%s mode=%s fallback=%s "
+                    "heuristic=%s feature=%s label=%s components=%s",
+                    ids.get("deployment_id"), ids.get("mode"),
+                    ids.get("fallback_policy"), ids.get("heuristic"),
+                    ids.get("feature_version"), ids.get("label_version"),
+                    {k: v for k, v in ids.items()
+                     if k.endswith("_id") and v},
+                )
+                # When a trained group is present, prefer it over heuristic
+                # bundle provider.
+                if runtime.artifacts.model_group is not None:
+                    from prediction.inference import (
+                        make_bundle_provider as _mk_bp,
+                        make_physical_forecast_provider as _mk_pf,
+                    )
+                    bundle_provider = _mk_bp(
+                        symbol=symbol,
+                        group=runtime.artifacts.model_group,
+                        store=self._prediction_store,
+                    )
+                    physical_provider = _mk_pf(bundle_provider)
+                    if runtime.artifacts.candidate_value is not None:
+                        candidate_model = runtime.artifacts.candidate_value
+            except (DeploymentError, PredictionRuntimeError) as exc:
+                if strict_artifacts or (
+                        deployment_mode in ("candidate", "champion")):
+                    raise
+                log.warning("Deployment load degraded (shadow-safe): %s", exc)
+
         self._orch = UnifiedOrchestrator(
             feed=self._feed, journal=self._jrn, risk_manager=self._risk,
             engine_cfg=engine_cfg, classifier_cfg=classifier_cfg,
@@ -195,6 +270,8 @@ class ShadowRunner:
             physical_forecast_provider=physical_provider,
             candidate_value_model=candidate_model,
             use_legacy_directional_tilt=use_legacy_directional_tilt,
+            decision_stack=self.decision_stack,
+            deployment_bundle=self.deployment_bundle,
         )
         # Record every tick (market + chain + incremental bars) so a REAL-data
         # walk-forward becomes possible. ~1 MB/session gzipped; you cannot
@@ -210,11 +287,22 @@ class ShadowRunner:
         # exits. No real orders are ever placed.
         paper_cfg = dataclasses.replace(paper_cfg or PaperConfig(),
                                         ras_exit_enabled=ras_exit)
+        primary_paper_db = (
+            reference_paper_db or paper_db or "paper.sqlite")
         self._paper = PaperBroker(
-            db_path=paper_db or "paper.sqlite",
+            db_path=primary_paper_db,
             cfg=paper_cfg, notifier=self._notifier, symbol=symbol,
             position_monitor=PositionMonitor(PositionRiskConfig(ras=self._ras_cfg)),
         )
+        self._candidate_paper = None
+        if candidate_paper_db:
+            self._candidate_paper = PaperBroker(
+                db_path=candidate_paper_db,
+                cfg=paper_cfg, notifier=None, symbol=symbol,
+                position_monitor=PositionMonitor(
+                    PositionRiskConfig(ras=self._ras_cfg)),
+            )
+            log.info("Candidate paper account: %s", candidate_paper_db)
 
         log.info("Initialized. DB=%s symbol=%s interval=%ds", db_path, symbol, interval_s)
         log.info("Paper account: $%.0f start (simulated fills, no real orders).",
@@ -507,6 +595,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-v2-parallel", dest="enable_v2_parallel",
                    action="store_false",
                    help="Disable V2 heuristic bundle / ranker / prediction store")
+    p.add_argument("--deployment", dest="deployment_path", default=None,
+                   help="Deployment bundle JSON "
+                        "(default: configs/deployment.json when present)")
+    p.add_argument("--models-dir", dest="models_dir", default="models",
+                   help="Model registry directory")
+    p.add_argument("--mode", dest="deployment_mode", default=None,
+                   choices=["research", "shadow", "advisory", "candidate",
+                            "champion"],
+                   help="Override deployment mode (default: from bundle)")
+    p.add_argument("--fallback-policy", dest="fallback_policy", default=None,
+                   choices=["abstain", "legacy", "no_trade"],
+                   help="Override fallback policy for champion failures")
+    p.add_argument("--strict-artifacts", dest="strict_artifacts",
+                   action="store_true",
+                   help="Fail closed on missing deployment artifacts")
+    p.add_argument("--reference-paper-db", dest="reference_paper_db",
+                   default=None,
+                   help="Reference (legacy) paper account sqlite path")
+    p.add_argument("--candidate-paper-db", dest="candidate_paper_db",
+                   default=None,
+                   help="Candidate (V3) paper account sqlite path")
     return p
 
 
@@ -542,6 +651,13 @@ if __name__ == "__main__":
         prediction_db=args.prediction_db,
         use_legacy_directional_tilt=args.use_legacy_directional_tilt,
         enable_v2_parallel=args.enable_v2_parallel,
+        deployment_path=args.deployment_path,
+        models_dir=args.models_dir,
+        deployment_mode=args.deployment_mode,
+        fallback_policy=args.fallback_policy,
+        strict_artifacts=args.strict_artifacts,
+        reference_paper_db=args.reference_paper_db,
+        candidate_paper_db=args.candidate_paper_db,
     )
 
     if args.report:

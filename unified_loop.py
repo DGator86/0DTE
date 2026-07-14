@@ -101,6 +101,14 @@ class TickResult:
     # Parallel paper fills: list of {track, candidate, size_mult, ...} for
     # legacy / v2 / v3. PaperBroker opens each track independently.
     paper_intents: list = field(default_factory=list)
+    # Unified decision stack (UNIFIED handoff §11.2) — optional until fully wired.
+    legacy_decision: Optional[object] = None
+    v3_decision: Optional[object] = None
+    authoritative_decision: Optional[object] = None
+    authority_source: Optional[str] = None
+    deployment_id: Optional[str] = None
+    fallback_used: bool = False
+    candidate_universe_summary: Optional[dict] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +182,11 @@ class UnifiedOrchestrator:
     # signature: (snap, signals, intent, regime_state) -> PredictionBundle|None.
     prediction_bundle: Optional[object] = None
     prediction_bundle_provider: Optional[Callable] = None
+    # Unified decision stack (UNIFIED handoff). When set, tick() can produce
+    # UnifiedDecisionRecord alongside the legacy path. Legacy remains
+    # authoritative until deployment mode says otherwise.
+    decision_stack: Optional[object] = None
+    deployment_bundle: Optional[object] = None
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
