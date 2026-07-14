@@ -146,6 +146,12 @@ CREATE TABLE IF NOT EXISTS uncertainty_outputs (
 );
 CREATE INDEX IF NOT EXISTS ix_uncertainty_snapshot
 ON uncertainty_outputs(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS structural_states (
+    snapshot_id TEXT PRIMARY KEY,
+    structural_version TEXT NOT NULL,
+    state_json TEXT NOT NULL
+);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -403,6 +409,62 @@ class PredictionStore:
                     row[dest] = json.loads(raw) if raw else None
                 except (json.JSONDecodeError, TypeError):
                     row[dest] = None
+            out.append(row)
+        return out
+
+    # ---- structural states (V3 Part 2 §35 / PR 7) ------------------------------
+    def log_structural_state(
+        self,
+        snapshot_id: str,
+        state: dict,
+        *,
+        structural_version: Optional[str] = None,
+    ) -> None:
+        """Persist a StructuralState.to_dict() payload (idempotent)."""
+        self.require_schema()
+        version = structural_version or str(
+            state.get("version") or "v3.0.0")
+        self.conn.execute(
+            "INSERT OR REPLACE INTO structural_states "
+            "(snapshot_id, structural_version, state_json) VALUES (?,?,?)",
+            (snapshot_id, version, _canonical_json(state)),
+        )
+        self.conn.commit()
+
+    def fetch_structural_state(
+        self, snapshot_id: str,
+    ) -> Optional[dict]:
+        self.require_schema()
+        row = self.conn.execute(
+            "SELECT * FROM structural_states WHERE snapshot_id=?",
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        try:
+            out["state"] = json.loads(out.pop("state_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            out["state"] = {}
+        return out
+
+    def fetch_structural_states(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM structural_states"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY snapshot_id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["state"] = json.loads(row.pop("state_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["state"] = {}
             out.append(row)
         return out
 

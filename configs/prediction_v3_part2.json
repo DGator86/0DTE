@@ -1,0 +1,43 @@
+{
+  "structural_state": {
+    "velocity_windows": [1, 5, 15],
+    "stability_window_minutes": 15,
+    "concentration_top_n": 5,
+    "epsilon": 1e-9,
+    "fallback_order": ["hybrid", "oi", "volume"]
+  },
+  "regime_model": {
+    "classes": [
+      "long_gamma_pin",
+      "short_gamma_trend",
+      "flip_transition",
+      "volatility_expansion"
+    ],
+    "minimum_sessions": 40,
+    "minimum_effective_sessions": 20,
+    "minimum_rows": 500
+  },
+  "mixture_experts": {
+    "shrinkage_sessions": 40
+  },
+  "competing_risk": {
+    "base_step_minutes": 1,
+    "same_bar_policy": "adverse_first"
+  },
+  "conformal": {
+    "coverages": [0.8, 0.9]
+  },
+  "path_model": {
+    "block_min": 5,
+    "block_max": 15,
+    "n_paths_shadow": 5000,
+    "n_paths_offline": 20000,
+    "condition_temperature": 1.0,
+    "min_effective_support": 30.0,
+    "max_source_session_weight": 0.1,
+    "decision_facing_max_backoff": 5
+  },
+  "ensemble": {
+    "maximum_component_weight": 0.6
+  }
+}
