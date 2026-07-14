@@ -189,8 +189,48 @@ def build_v3_candidate_evaluations(
         try:
             from prediction.adapters import (
                 AdapterError, adapt_candidate_forecast_v3, candidate_value_rows,
+                verify_candidate_feature_schema,
             )
-            rows, ids = candidate_value_rows(candidates)
+            mkt = getattr(snapshot, "market", None)
+            raw = getattr(snapshot, "raw_features", None) or {}
+            spot = None
+            if mkt is not None:
+                spot = getattr(mkt, "spot", None)
+            if spot is None:
+                spot = raw.get("spot")
+            rows, ids = candidate_value_rows(
+                candidates,
+                snapshot_id=str(getattr(snapshot, "snapshot_id", "") or ""),
+                spot=float(spot) if spot is not None else None,
+                call_wall=(getattr(mkt, "call_wall", None)
+                           if mkt is not None else raw.get("call_wall")),
+                put_wall=(getattr(mkt, "put_wall", None)
+                          if mkt is not None else raw.get("put_wall")),
+                gamma_flip=(getattr(mkt, "gamma_flip", None)
+                            if mkt is not None else raw.get("gamma_flip")),
+                minutes_to_close=raw.get("minutes_to_close"),
+                net_gex=(getattr(mkt, "net_gex", None)
+                         if mkt is not None else raw.get("net_gex")),
+                data_quality=(
+                    float(getattr(forecast, "data_quality"))
+                    if forecast is not None
+                    and getattr(forecast, "data_quality", None) is not None
+                    else None),
+            )
+            # Schema parity: refuse silent median-imputation of trained cols.
+            meta = getattr(value_model, "metadata", None) or {}
+            trained_names = None
+            vec = getattr(value_model, "vectorizer", None)
+            if vec is not None and getattr(vec, "feature_names", None):
+                trained_names = list(vec.feature_names)
+            missing_feats = verify_candidate_feature_schema(
+                rows,
+                expected_hash=meta.get("candidate_feature_schema_hash"),
+                trained_feature_names=trained_names,
+            )
+            if missing_feats and mode in ("candidate", "champion"):
+                raise AdapterError(
+                    f"candidate feature schema mismatch; missing={missing_feats[:8]}")
             preds = value_model.predict_v3(rows, candidate_ids=ids)
             for pred in preds:
                 adapted = adapt_candidate_forecast_v3(pred)
@@ -437,14 +477,25 @@ def build_v3_candidate_evaluations(
                     concession = float(
                         abs(mid - fill_price) if mid is not None else 0.0)
                     fees = float(est.entry_fees) + float(est.expected_exit_fees)
+                    if ev.expected_net_pnl is None:
+                        if mode in ("candidate", "champion"):
+                            raise Part3DecisionError(
+                                "expected_net_pnl required for EOV")
+                        net_for_eov = 0.0
+                    else:
+                        net_for_eov = float(ev.expected_net_pnl)
                     eov = float(expected_order_value(
                         p_fill=fill_p,
-                        expected_net_pnl_given_fill=float(ev.absolute_utility),
+                        expected_net_pnl_given_fill=net_for_eov,
                     ))
                     exec_diag.update({
                         "fallback_level": est.fallback_level,
                         "model_versions": dict(est.model_versions),
                         "execution_status": "ok",
+                        "mid_credit": mid,
+                        "natural_credit": natural,
+                        "expected_credit": fill_price,
+                        "conservative_credit": cons_fill,
                     })
                 except Exception as exc:
                     exec_diag["execution_status"] = "failed"
@@ -522,13 +573,15 @@ def build_v3_decision(
             component_errors={"forecast": "None"},
         )
     if mode in ("candidate", "champion"):
-        # Do not invent default uncertainty/OOD when forecast fields missing.
-        if getattr(forecast, "uncertainty", None) is None:
-            return V3DecisionResult(
-                statistical_action="UNAVAILABLE",
-                final_action="UNAVAILABLE",
-                reasons=("forecast_uncertainty_unavailable",),
-            )
+        # Require uncertainty, OOD, and data_quality — all must be present
+        # (None is missing; 0.0 is a valid observed value).
+        for field_name in ("uncertainty", "ood_score", "data_quality"):
+            if getattr(forecast, field_name, None) is None:
+                return V3DecisionResult(
+                    statistical_action="UNAVAILABLE",
+                    final_action="UNAVAILABLE",
+                    reasons=(f"forecast_{field_name}_unavailable",),
+                )
 
     missing = _required_part3_missing(runtime)
     if mode in ("candidate", "champion") and missing:
@@ -582,10 +635,50 @@ def build_v3_decision(
         )
 
     top = ranked[0]
-    uncertainty = float(getattr(forecast, "uncertainty", None) or 0.3)
-    ood = float(getattr(forecast, "ood_score", None) or 0.1)
-    dq = float(getattr(forecast, "data_quality", None) or 0.8)
-    p_pos = float(top.p_positive_pnl or 0.5)
+    # Explicit None checks — never use truthiness defaults that turn 0.0 into
+    # optimistic values (data_quality=0 → 0.8, p_pos=0 → 0.5, etc.).
+    unc_raw = getattr(forecast, "uncertainty", None)
+    ood_raw = getattr(forecast, "ood_score", None)
+    dq_raw = getattr(forecast, "data_quality", None)
+    p_pos_raw = top.p_positive_pnl
+    if mode in ("candidate", "champion"):
+        required = {
+            "uncertainty": unc_raw,
+            "ood_score": ood_raw,
+            "data_quality": dq_raw,
+            "p_positive_pnl": p_pos_raw,
+        }
+        missing_fields = [n for n, v in required.items() if v is None]
+        if missing_fields:
+            return V3DecisionResult(
+                statistical_action="UNAVAILABLE",
+                final_action="UNAVAILABLE",
+                candidate_id=top.candidate_id,
+                reasons=("forecast_fields_unavailable",) + tuple(
+                    f"missing:{n}" for n in missing_fields),
+                evaluations=evaluations,
+                selected_candidate_evaluation=top.to_dict(),
+                component_errors={"missing_fields": ",".join(missing_fields)},
+            )
+        if top.expected_net_pnl is None:
+            return V3DecisionResult(
+                statistical_action="UNAVAILABLE",
+                final_action="UNAVAILABLE",
+                candidate_id=top.candidate_id,
+                reasons=("expected_net_pnl_unavailable",),
+                evaluations=evaluations,
+                selected_candidate_evaluation=top.to_dict(),
+            )
+        uncertainty = float(unc_raw)
+        ood = float(ood_raw)
+        dq = float(dq_raw)
+        p_pos = float(p_pos_raw)
+    else:
+        # Research/shadow: labeled defaults only when truly absent (None).
+        uncertainty = float(unc_raw) if unc_raw is not None else 0.3
+        ood = float(ood_raw) if ood_raw is not None else 0.1
+        dq = float(dq_raw) if dq_raw is not None else 0.8
+        p_pos = float(p_pos_raw) if p_pos_raw is not None else 0.5
     eov = float(top.expected_order_value
                 if top.expected_order_value is not None else 0.0)
     util = float(top.absolute_utility

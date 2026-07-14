@@ -197,6 +197,21 @@ class ShadowRunner:
         # Candidate/champion refuse heuristic substitution.
         if deployment_path is None:
             deployment_path = os.path.join("configs", "deployment.json")
+        requested_mode = str(
+            deployment_mode or policy_mode or "shadow").lower()
+        strict_required = (
+            bool(strict_artifacts)
+            or requested_mode in ("candidate", "champion")
+            or str(policy_mode or "").lower() in ("candidate", "champion")
+        )
+        if deployment_path and not os.path.isfile(deployment_path):
+            if strict_required:
+                from prediction.deployment import DeploymentError
+                raise DeploymentError(
+                    f"deployment file required for mode={requested_mode!r} "
+                    f"but not found: {deployment_path}")
+            log.warning("Deployment file missing (shadow-safe): %s",
+                        deployment_path)
         if deployment_path and os.path.isfile(deployment_path):
             from prediction.deployment import (
                 DeploymentBundle, load_deployment_bundle, DeploymentError,
@@ -274,14 +289,27 @@ class ShadowRunner:
                         persist_unified_decision,
                     )
                     evaluations = None
+                    meta_row = None
+                    fill_attempts = None
                     if v3_result is not None:
                         evaluations = getattr(v3_result, "evaluations", None)
                         if evaluations is None and isinstance(v3_result, dict):
                             evaluations = v3_result.get("evaluations")
+                        meta_row = getattr(v3_result, "meta", None)
+                        if meta_row is None and isinstance(v3_result, dict):
+                            meta_row = v3_result.get("meta") or v3_result.get(
+                                "meta_decision")
+                        if meta_row is None and hasattr(v3_result, "to_dict"):
+                            d = v3_result.to_dict()
+                            meta_row = d.get("meta") or d.get("meta_decision")
+                        fill_attempts = getattr(v3_result, "fill_attempts", None)
+                        if fill_attempts is None and isinstance(v3_result, dict):
+                            fill_attempts = v3_result.get("fill_attempts")
                     persist_unified_decision(
                         self._prediction_store, record,
                         snapshot=snapshot, universe=universe,
                         forecast=forecast, evaluations=evaluations,
+                        fill_attempts=fill_attempts, meta_row=meta_row,
                     )
 
                 self.decision_stack = UnifiedDecisionStack(

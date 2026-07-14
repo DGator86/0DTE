@@ -4,13 +4,17 @@ prediction/adapters.py
 Typed adapters between trained V3 model contracts and the decision stack.
 
 Never use permissive getattr() chains that silently invent 0.5 / EV-as-utility.
+Candidate-value serving must use the same feature builder as training.
 
 NOT financial advice.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Mapping, Optional, Sequence
 
+from prediction.candidate_dataset import build_candidate_feature_row
 from prediction.models.candidate_value import CandidateForecastV3
 from prediction.models.fill_probability import (
     fill_features_from_attempt,
@@ -67,30 +71,127 @@ def adapt_candidate_forecast_v3(forecast: Any) -> dict:
     }
 
 
+def candidate_feature_schema_hash(rows: Sequence[Mapping]) -> str:
+    """Deterministic hash of the union of feature keys (matches training)."""
+    keys = sorted({k for r in rows for k in r.keys()})
+    return hashlib.sha256(
+        json.dumps(keys, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def verify_candidate_feature_schema(
+    rows: Sequence[Mapping],
+    *,
+    expected_hash: Optional[str] = None,
+    trained_feature_names: Optional[Sequence[str]] = None,
+) -> list[str]:
+    """
+    Return list of trained feature names missing from serving rows.
+
+    Prefer ``trained_feature_names`` from the fitted vectorizer. Schema hash
+    is a secondary check used when the name list is unavailable.
+    """
+    if not rows:
+        return list(trained_feature_names or []) or ["<empty_rows>"]
+    present = set().union(*(r.keys() for r in rows))
+    if trained_feature_names:
+        return [n for n in trained_feature_names if n not in present]
+    if expected_hash:
+        got = candidate_feature_schema_hash(rows)
+        if got != expected_hash:
+            return [f"schema_hash:{got}!={expected_hash}"]
+    return []
+
+
 def candidate_value_rows(
     candidates: Sequence[Any],
+    *,
+    snapshot_id: str = "",
+    spot: Optional[float] = None,
+    call_wall: Optional[float] = None,
+    put_wall: Optional[float] = None,
+    gamma_flip: Optional[float] = None,
+    minutes_to_close: Optional[float] = None,
+    net_gex: Optional[float] = None,
+    bundle: Optional[dict] = None,
+    data_quality: Optional[float] = None,
 ) -> tuple[list[dict], list[str]]:
-    """Build feature rows + ids for CandidateValueModel.predict_v3."""
+    """
+    Build feature rows + ids for CandidateValueModel.predict_v3.
+
+    Uses ``build_candidate_feature_row`` — the same builder training uses —
+    so train/serve feature names stay aligned for SpreadCandidate objects.
+    Dict candidates already shaped as feature rows are passed through.
+    """
     rows: list[dict] = []
     ids: list[str] = []
     for c in candidates:
-        if isinstance(c, dict):
+        if isinstance(c, dict) and "legs" not in c and "family" in c:
+            # Already a feature-ish dict (training-shaped) — keep as-is.
             d = dict(c)
             cid = str(d.get("candidate_id") or d.get("v2_candidate_id") or "")
+            rows.append(d)
+            ids.append(cid)
+            continue
+        # SpreadCandidate (or dict with legs) → canonical feature builder
+        if isinstance(c, dict):
+            # Minimal duck type for build_candidate_feature_row
+            from types import SimpleNamespace
+            legs_raw = c.get("legs") or ()
+            legs = []
+            for lg in legs_raw:
+                if isinstance(lg, dict):
+                    legs.append(SimpleNamespace(
+                        strike=float(lg.get("strike") or 0),
+                        kind=str(lg.get("kind") or lg.get("right") or "P"),
+                        qty=int(lg.get("qty") or 1),
+                    ))
+                else:
+                    legs.append(lg)
+            cand_obj = SimpleNamespace(
+                legs=legs,
+                family=c.get("family"),
+                credit=c.get("credit"),
+                max_loss=c.get("max_loss"),
+                capital=c.get("capital"),
+                theta=c.get("theta"),
+                gamma=c.get("gamma"),
+                prob_profit=c.get("prob_profit"),
+                prob_touch_short=c.get("prob_touch_short"),
+                distance_to_wall=c.get("distance_to_wall"),
+                liquidity_score=c.get("liquidity_score"),
+                wall_safety=c.get("wall_safety"),
+                gamma_safety=c.get("gamma_safety"),
+                touch_safety=c.get("touch_safety"),
+                score=c.get("score"),
+                ev=c.get("ev"),
+                ev_per_risk=c.get("ev_per_risk"),
+                execution=c.get("execution"),
+            )
+            cid = str(c.get("candidate_id") or c.get("v2_candidate_id") or "")
         else:
-            d = {
-                "family": getattr(c, "family", None),
-                "ev": getattr(c, "ev", None),
-                "credit": getattr(c, "credit", None),
-                "max_loss": getattr(c, "max_loss", None),
-                "prob_profit": getattr(c, "prob_profit", None),
-                "capital": getattr(c, "capital", None),
-                "score": getattr(c, "score", None),
-            }
+            cand_obj = c
             cid = str(
                 getattr(c, "candidate_id", None)
                 or getattr(c, "v2_candidate_id", None)
                 or "")
+        spot_v = float(spot) if spot is not None else float(
+            getattr(cand_obj, "spot", None) or 0.0) or 1.0
+        d = build_candidate_feature_row(
+            cand_obj,
+            snapshot_id=snapshot_id,
+            spot=spot_v,
+            call_wall=call_wall,
+            put_wall=put_wall,
+            gamma_flip=gamma_flip,
+            minutes_to_close=minutes_to_close,
+            net_gex=net_gex,
+            bundle=bundle,
+            data_quality=data_quality,
+        )
+        # Preserve family string for diagnostics (not always in feature row)
+        if getattr(cand_obj, "family", None) and "family" not in d:
+            d["family"] = getattr(cand_obj, "family")
         rows.append(d)
         ids.append(cid)
     return rows, ids
@@ -137,7 +238,6 @@ def fill_attempt_features_from_candidate(
         "requested_quantity": float(requested_quantity),
         "family": family,
     }
-    # Attach optional candidate diagnostics without breaking schema
     if isinstance(candidate, dict):
         attempt.setdefault(
             "option_price_scale",
@@ -148,7 +248,9 @@ def fill_attempt_features_from_candidate(
 __all__ = [
     "AdapterError",
     "adapt_candidate_forecast_v3",
+    "candidate_feature_schema_hash",
     "candidate_value_rows",
     "fill_attempt_features_from_candidate",
     "fill_features_from_attempt",
+    "verify_candidate_feature_schema",
 ]

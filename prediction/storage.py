@@ -1468,9 +1468,25 @@ class PredictionStore:
                             ed.get("ranking_uncertainty"),
                         ),
                     )
-                # Execution estimate fields when present on the evaluation
-                if any(ed.get(k) is not None for k in (
-                        "fill_probability", "expected_credit", "mid_credit")):
+                # Execution estimate fields from CandidateEvaluation contract
+                # + diagnostics (mid/natural stamped by Part 3 path).
+                diag = ed.get("diagnostics") or {}
+                mid_c = (
+                    ed.get("mid_credit")
+                    if ed.get("mid_credit") is not None
+                    else diag.get("mid_credit"))
+                nat_c = (
+                    ed.get("natural_credit")
+                    if ed.get("natural_credit") is not None
+                    else diag.get("natural_credit"))
+                exp_c = (
+                    ed.get("expected_fill_price")
+                    if ed.get("expected_fill_price") is not None
+                    else ed.get("expected_credit")
+                    if ed.get("expected_credit") is not None
+                    else diag.get("expected_credit"))
+                p_fill = ed.get("fill_probability")
+                if any(v is not None for v in (mid_c, nat_c, exp_c, p_fill)):
                     self.conn.execute(
                         "INSERT OR REPLACE INTO candidate_execution_estimates "
                         "(snapshot_id, candidate_id, mid_credit, "
@@ -1478,12 +1494,20 @@ class PredictionStore:
                         "estimate_json) VALUES (?,?,?,?,?,?,?)",
                         (
                             sid, cid,
-                            ed.get("mid_credit"),
-                            ed.get("natural_credit"),
-                            ed.get("expected_credit") or ed.get(
-                                "expected_fill_credit"),
-                            ed.get("fill_probability"),
-                            _canonical_json(ed.get("diagnostics") or ed),
+                            mid_c,
+                            nat_c,
+                            exp_c,
+                            p_fill,
+                            _canonical_json({
+                                "diagnostics": diag,
+                                "conservative_fill_price": ed.get(
+                                    "conservative_fill_price"),
+                                "expected_concession": ed.get(
+                                    "expected_concession"),
+                                "fees": ed.get("fees"),
+                                "expected_order_value": ed.get(
+                                    "expected_order_value"),
+                            }),
                         ),
                     )
             for attempt in (fill_attempts or ()):

@@ -115,7 +115,7 @@ def test_midpoint_never_treated_as_filled():
 def test_required_component_failure_abstain_in_champion():
     forecast = PredictionBundle(
         snapshot_id="s1", ts="t", session_date="2026-07-14", symbol="SPY",
-        uncertainty=0.2, data_quality=0.9,
+        uncertainty=0.2, data_quality=0.9, ood_score=0.1,
     )
     result = build_v3_decision(
         snapshot=_snap(),
@@ -164,7 +164,7 @@ def test_partial_missing_artifacts_abstain():
 
     forecast = PredictionBundle(
         snapshot_id="s1", ts="t", session_date="2026-07-14", symbol="SPY",
-        uncertainty=0.2, data_quality=0.9,
+        uncertainty=0.2, data_quality=0.9, ood_score=0.1,
     )
     result = build_v3_decision(
         snapshot=_snap(), forecast=forecast, universe=_universe(),

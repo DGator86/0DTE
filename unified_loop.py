@@ -466,11 +466,12 @@ class UnifiedOrchestrator:
             from spread_selector import select_spreads, GammaContext
 
             rcfg = self.candidate_ranker_cfg or RankerConfig()
-            shadow_cands = []
-            if decision is not None:
+            shadow_cands = list(getattr(self, "_tick_shared_cands", None) or [])
+            if not shadow_cands and decision is not None:
                 shadow_cands = list(decision.all_candidates or [])
-            # §14.4: generate outside the routed family for research / NT ticks
-            if getattr(rcfg, "shadow_all_families", True) or not shadow_cands:
+            # Prefer the shared tick universe; only regenerate when absent.
+            if not shadow_cands and (
+                    getattr(rcfg, "shadow_all_families", True)):
                 try:
                     rnd_s = extract_rnd(snap.chain, cfg.rnd)
                     edge_s = compute_edge(
@@ -487,6 +488,8 @@ class UnifiedOrchestrator:
                     log.warning("shadow candidate gen failed: %s", exc)
             if not shadow_cands:
                 return decision
+            self._tick_shared_cands = list(shadow_cands)
+            self._tick_shadow_cands = list(shadow_cands)
             mkt = snap.market
             minutes_left = None
             try:
@@ -620,6 +623,79 @@ class UnifiedOrchestrator:
                 best, best_u = c, u
         return best
 
+    def _ensure_shared_candidate_universe(
+            self, snap, decide_pdf, cfg, *, pin_active: bool = False,
+            snapshot_id: str = "", now: Optional[dt.datetime] = None) -> list:
+        """
+        Generate the tick's candidate set exactly once (all families).
+
+        Legacy decide() and the unified V3 stack both consume this immutable
+        list — never re-run select_spreads for the same tick.
+        """
+        existing = list(getattr(self, "_tick_shared_cands", None) or [])
+        if existing:
+            return existing
+        if snap is None or getattr(snap, "chain", None) is None:
+            self._tick_shared_cands = []
+            return []
+        try:
+            from spread_selector import select_spreads, GammaContext
+            rnd_s = extract_rnd(snap.chain, cfg.rnd)
+            edge_s = compute_edge(
+                rnd_s, snap.chain, cfg.rnd, physical_pdf=decide_pdf)
+            ctx_s = GammaContext.from_market_snapshot(
+                snap.market, pin_active=pin_active)
+            sel = select_spreads(
+                snap.chain, rnd_s, edge_s, ctx_s, cfg.selector,
+                physical_pdf=decide_pdf, target_families=None)
+            cands = list(sel.all_candidates or sel.ranked or [])
+        except Exception as exc:
+            log.warning("shared candidate universe generation failed: %s", exc)
+            cands = []
+        # Stamp stable candidate ids when missing
+        if snapshot_id and cands:
+            try:
+                from prediction.candidate_universe import (
+                    make_candidate_id, _legs_from,
+                )
+                for c in cands:
+                    if getattr(c, "candidate_id", None) or getattr(
+                            c, "v2_candidate_id", None):
+                        continue
+                    cid = make_candidate_id(
+                        snapshot_id,
+                        family=str(getattr(c, "family", None) or "unknown"),
+                        legs=_legs_from(c),
+                    )
+                    try:
+                        setattr(c, "candidate_id", cid)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        self._tick_shared_cands = cands
+        self._tick_shadow_cands = list(cands)
+        if snapshot_id and cands:
+            try:
+                from prediction.candidate_universe import build_candidate_universe
+                ts_iso = (now.astimezone(ET).isoformat()
+                          if now is not None else snapshot_id)
+                self._tick_shared_universe = build_candidate_universe(
+                    snapshot_id=snapshot_id,
+                    generated_at=ts_iso,
+                    candidates=cands,
+                    generator_config={
+                        "selector_min_ev": getattr(cfg.selector, "min_ev", None),
+                        "shared": True,
+                    },
+                )
+            except Exception as exc:
+                log.warning("build_candidate_universe failed: %s", exc)
+                self._tick_shared_universe = None
+        else:
+            self._tick_shared_universe = None
+        return cands
+
     def _resolve_structure_candidate(
             self, snap, decide_pdf, cfg, *, structure: str, direction: str,
             pin_active: bool, density_mode: str = "vrp",
@@ -631,6 +707,7 @@ class UnifiedOrchestrator:
             return None
         try:
             from decision_engine import decide
+            shared = list(getattr(self, "_tick_shared_cands", None) or [])
             dec = decide(
                 snap.market, snap.chain, cfg,
                 physical_pdf=decide_pdf,
@@ -638,7 +715,8 @@ class UnifiedOrchestrator:
                 direction=direction or "both",
                 physical_density_mode=density_mode,
                 physical_moments=density_moments,
-                pin_active=pin_active)
+                pin_active=pin_active,
+                precomputed_candidates=shared if shared else None)
             if dec is None or dec.candidate is None:
                 return None
             # Prediction-engine paper fills: require gate pass so we don't
@@ -1114,36 +1192,31 @@ class UnifiedOrchestrator:
     def _unified_unavailable_fields(
             self, *, reason: str, decision=None, intent=None,
             final_size_mult: float = 0.0, snapshot_id: str = "",
-            exc: Optional[BaseException] = None) -> dict:
-        """Fail-closed TickResult unified fields for candidate/champion."""
+            exc: Optional[BaseException] = None,
+            now: Optional[dt.datetime] = None) -> dict:
+        """
+        Fail-closed TickResult unified fields for candidate/champion.
+
+        Always routes through resolve_authority() — never a hand-rolled
+        fallback. Persists a UnifiedDecisionRecord when a store is available.
+        """
+        from decision_stack.authority import resolve_authority
+        from decision_stack.contracts import UnifiedDecisionRecord
+
         mode = self._deployment_mode()
         dep = getattr(self, "deployment_bundle", None)
-        dep_id = getattr(dep, "deployment_id", None) if dep else None
+        dep_id = str(getattr(dep, "deployment_id", "") or "") if dep else ""
+        cfg_hash = str(
+            getattr(dep, "configuration_hash", "") or "") if dep else ""
+        fallback = str(
+            getattr(dep, "fallback_policy", "abstain") if dep else "abstain"
+        ).lower()
         legacy = self._legacy_decision_dict(
             decision, intent, snapshot_id, final_size_mult)
         reasons = [reason]
         if exc is not None:
             reasons.append(f"{type(exc).__name__}:{exc}")
-        # Apply deployment fallback for authoritative action.
-        fallback = str(
-            getattr(dep, "fallback_policy", "abstain") if dep else "abstain"
-        ).lower()
-        if fallback == "legacy":
-            auth_action = legacy.get("action") or "NO_EDGE"
-            auth_cid = legacy.get("candidate_id")
-            auth_struct = legacy.get("structure")
-            auth_dir = legacy.get("direction")
-            auth_size = float(legacy.get("size_mult") or 0.0)
-            fallback_used = True
-            authority = "legacy_fallback"
-        else:
-            auth_action = "UNAVAILABLE"
-            auth_cid = None
-            auth_struct = None
-            auth_dir = None
-            auth_size = 0.0
-            fallback_used = False
-            authority = "v3_unavailable"
+
         v3 = {
             "statistical_action": "UNAVAILABLE",
             "final_action": "UNAVAILABLE",
@@ -1152,35 +1225,89 @@ class UnifiedOrchestrator:
             "direction": None,
             "reasons": tuple(reasons),
         }
+        auth = resolve_authority(
+            mode=mode,
+            legacy_decision=legacy,
+            v3_decision=v3,
+            hard_vetoes=(),
+            fallback_policy=fallback,
+            legacy_size_mult=float(legacy.get("size_mult") or 0.0),
+            v3_size_mult=0.0,
+        )
+        ts_iso = ""
+        session_date = ""
+        if now is not None:
+            ts_iso = now.astimezone(ET).isoformat()
+            session_date = now.astimezone(ET).date().isoformat()
+        record = UnifiedDecisionRecord(
+            snapshot_id=str(snapshot_id or ""),
+            ts=ts_iso,
+            session_date=session_date,
+            symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
+            deployment_id=dep_id,
+            deployment_mode=str(mode),
+            authority_source=auth.authority_source,
+            legacy_action=str(legacy.get("action") or "NO_EDGE"),
+            legacy_candidate_id=legacy.get("candidate_id"),
+            legacy_structure=legacy.get("structure"),
+            legacy_direction=legacy.get("direction"),
+            legacy_size_mult=float(legacy.get("size_mult") or 0.0),
+            v3_statistical_action="UNAVAILABLE",
+            v3_final_action="UNAVAILABLE",
+            selected_candidate_id=auth.selected_candidate_id,
+            final_action=auth.final_action,
+            final_structure=auth.final_structure,
+            final_direction=auth.final_direction,
+            final_size_mult=auth.final_size_mult,
+            reasons=tuple(auth.reasons) + tuple(reasons),
+            fallback_used=auth.fallback_used,
+            fallback_reason=auth.fallback_reason or reason,
+            configuration_hash=cfg_hash,
+            diagnostics={"unavailable_reason": reason},
+        )
+        # Persist fail-closed record so it does not disappear from the journal.
+        store = getattr(self, "prediction_store", None)
+        stack = getattr(self, "decision_stack", None)
+        try:
+            if stack is not None and getattr(stack, "persist_fn", None):
+                stack.persist_fn(record, snapshot=None, universe=None,
+                                 forecast=None, v3_result=None)
+            elif store is not None:
+                from decision_stack.persistence import persist_unified_decision
+                persist_unified_decision(store, record)
+        except Exception as persist_exc:
+            log.warning("unavailable decision persist failed: %s", persist_exc)
+
         part3_payload = {
             **(getattr(self, "_tick_part3", None) or {}),
+            "unified": record.to_dict(),
             "statistical_action": "UNAVAILABLE",
             "final_action": "UNAVAILABLE",
-            "selected_candidate_id": None,
-            "authority_source": authority,
+            "selected_candidate_id": auth.selected_candidate_id,
+            "authority_source": auth.authority_source,
             "deployment_id": dep_id,
             "deployment_mode": mode,
-            "fallback_used": fallback_used,
-            "reasons": reasons,
+            "fallback_used": auth.fallback_used,
+            "reasons": list(record.reasons),
             "mode": mode,
             "shadow_label": f"{mode.upper()} — UNAVAILABLE ({reason})",
         }
         self._tick_part3 = part3_payload
         self._tick_unified_v3 = v3
         self._tick_authoritative = {
-            "final_action": auth_action,
-            "selected_candidate_id": auth_cid,
-            "structure": auth_struct,
-            "direction": auth_dir,
-            "size_mult": auth_size,
+            "final_action": auth.final_action,
+            "selected_candidate_id": auth.selected_candidate_id,
+            "structure": auth.final_structure,
+            "direction": auth.final_direction,
+            "size_mult": auth.final_size_mult,
         }
         return {
             "legacy_decision": legacy,
             "v3_decision": v3,
             "authoritative_decision": self._tick_authoritative,
-            "authority_source": authority,
+            "authority_source": auth.authority_source,
             "deployment_id": dep_id,
-            "fallback_used": fallback_used,
+            "fallback_used": auth.fallback_used,
             "candidate_universe_summary": None,
             "part3": part3_payload,
         }
@@ -1217,7 +1344,7 @@ class UnifiedOrchestrator:
                 return self._unified_unavailable_fields(
                     reason="unified_import_failed", decision=decision,
                     intent=intent, final_size_mult=final_size_mult,
-                    snapshot_id=snapshot_id, exc=exc)
+                    snapshot_id=snapshot_id, exc=exc, now=now)
             return {}
 
         try:
@@ -1249,33 +1376,22 @@ class UnifiedOrchestrator:
                 source_ages_seconds=ages,
             )
 
-            # Shared candidate universe — prefer tick shadow cands, else full enum.
-            cands = list(getattr(self, "_tick_shadow_cands", None) or [])
-            if not cands and getattr(snap, "chain", None) is not None:
-                try:
-                    from spread_selector import select_spreads, GammaContext
-                    rnd_s = extract_rnd(snap.chain, cfg.rnd)
-                    edge_s = compute_edge(
-                        rnd_s, snap.chain, cfg.rnd,
-                        physical_pdf=decide_pdf)
-                    ctx_s = GammaContext.from_market_snapshot(
-                        snap.market, pin_active=False)
-                    sel = select_spreads(
-                        snap.chain, rnd_s, edge_s, ctx_s, cfg.selector,
-                        physical_pdf=decide_pdf, target_families=None)
-                    cands = list(sel.all_candidates or sel.ranked or [])
-                except Exception as exc:
-                    log.warning("candidate universe enum failed: %s", exc)
-                    cands = list(getattr(decision, "all_candidates", None) or [])
-
-            universe = build_candidate_universe(
-                snapshot_id=snapshot_id,
-                generated_at=ts_iso,
-                candidates=cands,
-                generator_config={
-                    "selector_min_ev": getattr(cfg.selector, "min_ev", None),
-                },
-            )
+            # One immutable shared universe for V1 + V3 (built earlier in tick).
+            universe = getattr(self, "_tick_shared_universe", None)
+            cands = list(getattr(self, "_tick_shared_cands", None) or [])
+            if not cands:
+                cands = list(getattr(self, "_tick_shadow_cands", None) or [])
+            if universe is None:
+                universe = build_candidate_universe(
+                    snapshot_id=snapshot_id,
+                    generated_at=ts_iso,
+                    candidates=cands,
+                    generator_config={
+                        "selector_min_ev": getattr(cfg.selector, "min_ev", None),
+                        "shared": True,
+                    },
+                )
+                self._tick_shared_universe = universe
 
             # Capture universe for the stack without replacing a caller-provided fn.
             stack.candidate_universe_fn = (
@@ -1358,7 +1474,7 @@ class UnifiedOrchestrator:
                 return self._unified_unavailable_fields(
                     reason="unified_stack_exception", decision=decision,
                     intent=intent, final_size_mult=final_size_mult,
-                    snapshot_id=snapshot_id, exc=exc)
+                    snapshot_id=snapshot_id, exc=exc, now=now)
             return {}
 
     def tick(self, now: dt.datetime,
@@ -1371,6 +1487,8 @@ class UnifiedOrchestrator:
         self._tick_prediction_bundle = None
         self._tick_part3 = None
         self._tick_shadow_cands = []
+        self._tick_shared_cands = []
+        self._tick_shared_universe = None
         self._tick_shadow_forecasts = {}
         self._tick_paper_intents = []
         self._tick_unified_v3 = None
@@ -1647,6 +1765,18 @@ class UnifiedOrchestrator:
             v2_result = self._build_v2_physical_result(
                 snap, signals, intent, rnd, cfg)
 
+        # ---- Shared candidate universe (once per tick, before V1 + V3) ----
+        # Both legacy decide() and the unified stack consume this immutable set.
+        decide_pdf_for_universe = phys_pdf
+        if (v2_result is not None and not self.use_legacy_directional_tilt
+                and self.physical_pdf is None):
+            decide_pdf_for_universe = v2_result.as_callable()
+        if snap.chain is not None:
+            self._ensure_shared_candidate_universe(
+                snap, decide_pdf_for_universe, cfg,
+                pin_active=bool(pin.is_pin),
+                snapshot_id=snapshot_id, now=now)
+
         # ---- Stand-down: regime unstable or NT cell (or champion NO_TRADE) ----
         if stand_down_now:
             decide_pdf = phys_pdf
@@ -1778,6 +1908,7 @@ class UnifiedOrchestrator:
             # prices the live decision (or vice versa), re-price the same
             # candidate set under the other density and journal both EVs.
             pin_active = bool(pin.is_pin)
+            shared = list(getattr(self, "_tick_shared_cands", None) or []) or None
             if (v2_result is not None and self.physical_pdf is None
                     and density_mode != "v2"):
                 try:
@@ -1788,7 +1919,8 @@ class UnifiedOrchestrator:
                         direction=live_direction,
                         physical_density_mode="v2",
                         physical_moments=v2_result.moments,
-                        pin_active=pin_active)
+                        pin_active=pin_active,
+                        precomputed_candidates=shared)
                     if shadow.candidate is not None:
                         signals["phys_v2_shadow_ev"] = shadow.candidate.ev
                         signals["phys_v2_shadow_family"] = shadow.candidate.family
@@ -1801,7 +1933,8 @@ class UnifiedOrchestrator:
                               direction=live_direction,
                               physical_density_mode=density_mode,
                               physical_moments=density_moments,
-                              pin_active=pin_active)
+                              pin_active=pin_active,
+                              precomputed_candidates=shared)
             signals["phys_density_mode"] = density_mode
             if (decision.candidate is not None
                     and isinstance(decision.candidate.ev, (int, float))):
@@ -1819,7 +1952,8 @@ class UnifiedOrchestrator:
                             target_structure=raw_struct,
                             direction=raw_intent.decision.direction,
                             physical_density_mode=density_mode,
-                            pin_active=False)
+                            pin_active=False,
+                            precomputed_candidates=shared)
                         if cf.candidate is not None:
                             signals["cf_debit_ev"] = cf.candidate.ev
                             signals["cf_debit_family"] = cf.candidate.family
@@ -1831,7 +1965,8 @@ class UnifiedOrchestrator:
                         target_structure="IF",
                         direction="both",
                         physical_density_mode=density_mode,
-                        pin_active=True)
+                        pin_active=True,
+                        precomputed_candidates=shared)
                     if cf.candidate is not None:
                         signals["cf_premium_ev"] = cf.candidate.ev
                         signals["cf_premium_family"] = cf.candidate.family
