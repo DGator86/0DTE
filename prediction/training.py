@@ -26,6 +26,8 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import math
+import sqlite3
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -591,9 +593,14 @@ def run_shadow_predictions(store, group: PredictionModelGroup,
     if hasattr(store, "require_schema"):
         try:
             store.require_schema()
-        except RuntimeError:
+        except RuntimeError as exc:
             # Schema migration failed — leave legacy loop operational; skip
             # V3 shadow journaling rather than crashing the process.
+            warnings.warn(
+                f"shadow predictions skipped due to schema migration failure: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return 0
 
     frame = load_training_frame(store, group.feature_version,
@@ -665,7 +672,11 @@ def run_shadow_predictions(store, group: PredictionModelGroup,
                     diagnostics=unc.diagnostics,
                     generated_at=generated_at,
                 )
-            except Exception:
-                pass  # never break shadow journaling on optional table
+            except (RuntimeError, sqlite3.Error) as exc:
+                warnings.warn(
+                    f"uncertainty journaling skipped: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         n += 1
     return n

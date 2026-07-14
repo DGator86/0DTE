@@ -180,7 +180,7 @@ class PredictionStore:
             self.conn.commit()
             self.schema_ok = True
             self.schema_error = None
-        except Exception as exc:  # noqa: BLE001 — fail closed for V3 path
+        except sqlite3.Error as exc:
             self.schema_ok = False
             self.schema_error = str(exc)
 
@@ -188,7 +188,8 @@ class PredictionStore:
         """Raise if migrations failed — V3 shadow path must stop."""
         if not self.schema_ok:
             raise RuntimeError(
-                f"prediction store schema migration failed: {self.schema_error}")
+                "prediction store schema migration failed: "
+                f"{self.schema_error or 'unknown error'}")
 
     # ---- feature snapshots ---------------------------------------------------
     def log_feature_snapshot(self, row) -> None:

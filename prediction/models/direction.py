@@ -273,15 +273,10 @@ class DirectionModel:
 
             if len(p_oof) >= 5 and len(np.unique(y_oof)) >= 2:
                 cal_sessions = sorted(set(sess_oof))
-                # Sessions used purely for HP inner-train prefixes (approx):
-                # everything not solely in the last cal-like holdouts.
-                fit_sessions = [s for s in uniq if s in set(sess_oof) or True]
-                # Record HP-fit sessions as those appearing in any inner train
+                # Record HP-fit sessions as those appearing in any inner train.
                 inner = inner_folds_for_train(uniq, xfit_cfg)
-                hp_fit = sorted({s for inf in inner
-                                 for s in inf["train_sessions"]})
-                if hp_fit:
-                    fit_sessions = hp_fit
+                fit_sessions = sorted({s for inf in inner
+                                       for s in inf["train_sessions"]}) or uniq
 
                 if self.config.calibration == "auto":
                     self.calibrator, cal_diag = select_calibrator(

@@ -6,10 +6,14 @@ and end-to-end shadow replay determinism.
 """
 from __future__ import annotations
 
+import sqlite3
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from prediction.contracts import PredictionBundle
+import prediction.training as training
 from prediction.uncertainty import compose_uncertainty
 
 
@@ -146,3 +150,56 @@ def test_e2e_replay_determinism_shadow_bundle(tmp_path):
     roundtrip = PredictionBundle.from_dict(preds[0]["predictions"])
     assert roundtrip.snapshot_id == preds[0]["snapshot_id"]
     assert roundtrip.uncertainty_components or roundtrip.uncertainty is not None
+
+
+def test_run_shadow_predictions_warns_when_schema_is_unavailable():
+    store = SimpleNamespace(
+        require_schema=lambda: (_ for _ in ()).throw(
+            RuntimeError("prediction store schema migration failed: boom"))
+    )
+    group = SimpleNamespace(feature_version="v3-test")
+    with pytest.warns(RuntimeWarning, match="schema migration failed"):
+        assert training.run_shadow_predictions(store, group) == 0
+
+
+def test_run_shadow_predictions_warns_when_uncertainty_logging_fails(monkeypatch):
+    class _Frame(SimpleNamespace):
+        def __len__(self):
+            return len(self.rows)
+
+    frame = _Frame(
+        rows=[{"signal": 1.0}],
+        sessions=["2026-07-14"],
+        quality=[{"feature_coverage": 1.0}],
+        snapshot_ids=["snap-1"],
+        ts=["2026-07-14T14:30:00Z"],
+    )
+    monkeypatch.setattr(training, "load_training_frame",
+                        lambda *args, **kwargs: frame)
+
+    bundle = PredictionBundle(
+        snapshot_id="snap-1",
+        ts="2026-07-14T14:30:00Z",
+        session_date="2026-07-14",
+        symbol="SPY",
+        p_up_30m=0.55,
+        uncertainty=0.2,
+    )
+    monkeypatch.setattr(training, "build_prediction_bundle",
+                        lambda *args, **kwargs: bundle)
+
+    class _Store:
+        def require_schema(self):
+            return None
+
+        def log_prediction(self, **kwargs):
+            return None
+
+        def log_uncertainty_output(self, *args, **kwargs):
+            raise sqlite3.OperationalError("no such table: uncertainty_outputs")
+
+    group = SimpleNamespace(feature_version="v3-test",
+                            group_version="group-v3",
+                            uncertainty=lambda: 0.1)
+    with pytest.warns(RuntimeWarning, match="uncertainty journaling skipped"):
+        assert training.run_shadow_predictions(_Store(), group) == 1
