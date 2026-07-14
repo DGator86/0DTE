@@ -215,6 +215,18 @@ CREATE TABLE IF NOT EXISTS candidate_rank_outputs (
 );
 CREATE INDEX IF NOT EXISTS ix_candidate_rank_snapshot
 ON candidate_rank_outputs(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS fill_records (
+    fill_record_id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    record_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_fill_session
+ON fill_records(session_date);
+CREATE INDEX IF NOT EXISTS ix_fill_candidate
+ON fill_records(candidate_id);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -744,6 +756,59 @@ class PredictionStore:
                 row["ranking"] = json.loads(row.pop("ranking_json") or "{}")
             except (json.JSONDecodeError, TypeError):
                 row["ranking"] = {}
+            out.append(row)
+        return out
+
+    # ---- fill records (Part 3) ------------------------------------------------
+    def log_fill_record(self, record) -> None:
+        """Idempotent upsert by fill_record_id. Validates via execution module."""
+        self.require_schema()
+        from execution.fill_records import FillRecord, validate_fill_record
+        if hasattr(record, "to_dict"):
+            rec = record
+            payload = record.to_dict()
+        else:
+            rec = FillRecord.from_dict(record)
+            payload = rec.to_dict()
+        validate_fill_record(rec)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO fill_records "
+            "(fill_record_id, snapshot_id, candidate_id, session_date, "
+            "record_json) VALUES (?,?,?,?,?)",
+            (rec.fill_record_id, rec.snapshot_id, rec.candidate_id,
+             rec.session_date, _canonical_json(payload)),
+        )
+        self.conn.commit()
+
+    def fetch_fill_records(
+        self,
+        *,
+        session_date: Optional[str] = None,
+        candidate_id: Optional[str] = None,
+        snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM fill_records"
+        conds, args = [], []
+        if session_date:
+            conds.append("session_date=?")
+            args.append(session_date)
+        if candidate_id:
+            conds.append("candidate_id=?")
+            args.append(candidate_id)
+        if snapshot_id:
+            conds.append("snapshot_id=?")
+            args.append(snapshot_id)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY session_date, fill_record_id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["record"] = json.loads(row.pop("record_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["record"] = {}
             out.append(row)
         return out
 
