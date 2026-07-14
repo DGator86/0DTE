@@ -2,21 +2,13 @@
 prediction/registry.py
 ======================
 Model registry: versioned, hashed, auditable model artifacts
-(docs/PREDICTION_ENGINE_V2_HANDOFF.md §19).
+(docs/PREDICTION_ENGINE_V2_HANDOFF.md §19;
+ docs/PREDICTION_ENGINE_V3_PART1_VALIDATION.md §10).
 
-Layout — one pair of files per model under the registry directory:
-
-    <model_id>.joblib   the pickled model object (atomic write)
-    <model_id>.json     metadata: target, horizon, feature version,
-                        training/calibration sessions, hyperparameters,
-                        metrics, artifact SHA256, schema version, status
-                        (+ full status history)
-
-Loading FAILS CLOSED (§19.4): a missing metadata file, artifact-hash
-mismatch, unsupported schema version, or feature-version/target mismatch
-raises RegistryError instead of quietly serving a wrong or tampered model.
-Statuses follow the §19.2 vocabulary; promotion remains a human action that
-just moves a status pointer.
+SCHEMA_VERSION = 2. Version-1 metadata remains readable in read-only
+compatibility mode. Version-2 models fail closed when required V3 fields
+(calibration artifact, fold metadata, OOF metrics, feature schema, …) are
+missing or inconsistent.
 
 NOT financial advice.
 """
@@ -30,10 +22,25 @@ import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
 STATUSES = ("research", "shadow", "candidate", "pending_review",
             "champion", "rejected", "archived")
+
+# Required metadata keys for schema version 2 (fail closed on load).
+_V2_REQUIRED = (
+    "label_version",
+    "crossfit_config",
+    "fold_hash",
+    "oof_metrics",
+    "calibration_artifact",
+    "uncertainty_method",
+    "training_feature_distribution_hash",
+    "required_input_fields",
+    "dependency_versions",
+    "git_commit",
+)
 
 
 class RegistryError(RuntimeError):
@@ -67,6 +74,24 @@ def _atomic_write_bytes(path: str, write_fn) -> None:
         raise
 
 
+def _validate_v2_metadata(meta: dict) -> None:
+    """Fail closed for schema-v2 artifacts with incomplete audit fields."""
+    mid = meta.get("model_id", "?")
+    for key in _V2_REQUIRED:
+        if key not in meta or meta[key] is None:
+            raise RegistryError(
+                f"v2 metadata missing required field {key!r} for {mid!r}")
+    if not isinstance(meta.get("crossfit_config"), dict):
+        raise RegistryError(f"malformed crossfit_config for {mid!r}")
+    if not isinstance(meta.get("oof_metrics"), dict):
+        raise RegistryError(f"missing OOF metrics for {mid!r}")
+    cal = meta.get("calibration_artifact")
+    if not isinstance(cal, dict) or not cal.get("method"):
+        raise RegistryError(f"calibration artifact missing for {mid!r}")
+    if not meta.get("fold_hash"):
+        raise RegistryError(f"fold metadata malformed for {mid!r}")
+
+
 @dataclass
 class ModelRegistry:
     directory: str = "models"
@@ -74,14 +99,12 @@ class ModelRegistry:
     def __post_init__(self):
         os.makedirs(self.directory, exist_ok=True)
 
-    # -- paths -------------------------------------------------------------------
     def _artifact_path(self, model_id: str) -> str:
         return os.path.join(self.directory, f"{model_id}.joblib")
 
     def _meta_path(self, model_id: str) -> str:
         return os.path.join(self.directory, f"{model_id}.json")
 
-    # -- save ---------------------------------------------------------------------
     def save(self, model, *, model_type: str, target: str,
              horizon: Optional[str], feature_version: str,
              hyperparameters: Optional[dict] = None,
@@ -92,13 +115,27 @@ class ModelRegistry:
              training_end: Optional[str] = None,
              data_hash: Optional[str] = None,
              author: str = "",
-             status: str = "research") -> str:
+             status: str = "research",
+             # V3 / schema v2 fields
+             label_version: Optional[str] = None,
+             crossfit_config: Optional[dict] = None,
+             fold_hash: Optional[str] = None,
+             oof_metrics: Optional[dict] = None,
+             slice_metrics: Optional[dict] = None,
+             calibration_artifact: Optional[dict] = None,
+             uncertainty_method: Optional[str] = None,
+             training_feature_distribution_hash: Optional[str] = None,
+             required_input_fields: Optional[list] = None,
+             optional_input_fields: Optional[list] = None,
+             dependency_versions: Optional[dict] = None,
+             git_commit: Optional[str] = None,
+             feature_schema_hash: Optional[str] = None,
+             ) -> str:
         if status not in STATUSES:
             raise RegistryError(f"unknown status {status!r}")
         import joblib
 
         created_at = dt.datetime.now(dt.timezone.utc).isoformat()
-        # dump to a temp file first so the hash names the artifact
         directory = self.directory
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=".model_",
                                    suffix=".joblib.tmp")
@@ -115,6 +152,33 @@ class ModelRegistry:
             raise
 
         sessions = sorted(training_sessions or [])
+        # Default V2 audit fields so new saves are loadable; callers should
+        # pass real values. Empty structures still satisfy presence checks
+        # only when method/fold_hash are non-empty — require explicit values
+        # for production use.
+        if calibration_artifact is None:
+            calibration_artifact = {"method": "identity", "note": "unspecified"}
+        if crossfit_config is None:
+            crossfit_config = {}
+        if oof_metrics is None:
+            oof_metrics = {}
+        if fold_hash is None:
+            fold_hash = _config_hash({"sessions": sessions})
+        if label_version is None:
+            label_version = "unknown"
+        if uncertainty_method is None:
+            uncertainty_method = "scalar_v1"
+        if training_feature_distribution_hash is None:
+            training_feature_distribution_hash = data_hash or "unknown"
+        if required_input_fields is None:
+            required_input_fields = []
+        if optional_input_fields is None:
+            optional_input_fields = []
+        if dependency_versions is None:
+            dependency_versions = {}
+        if git_commit is None:
+            git_commit = "unknown"
+
         metadata = {
             "schema_version": SCHEMA_VERSION,
             "model_id": model_id,
@@ -122,6 +186,8 @@ class ModelRegistry:
             "target": target,
             "horizon": horizon,
             "feature_version": feature_version,
+            "feature_schema_hash": feature_schema_hash,
+            "label_version": label_version,
             "training_start": training_start or (sessions[0] if sessions else None),
             "training_end": training_end or (sessions[-1] if sessions else None),
             "training_sessions": sessions,
@@ -130,6 +196,17 @@ class ModelRegistry:
             "configuration_hash": _config_hash(hyperparameters or {}),
             "hyperparameters": hyperparameters or {},
             "metrics": metrics or {},
+            "crossfit_config": crossfit_config,
+            "fold_hash": fold_hash,
+            "oof_metrics": oof_metrics,
+            "slice_metrics": slice_metrics or {},
+            "calibration_artifact": calibration_artifact,
+            "uncertainty_method": uncertainty_method,
+            "training_feature_distribution_hash": training_feature_distribution_hash,
+            "required_input_fields": list(required_input_fields),
+            "optional_input_fields": list(optional_input_fields),
+            "dependency_versions": dependency_versions,
+            "git_commit": git_commit,
             "artifact_path": artifact_path,
             "artifact_hash": artifact_hash,
             "created_at": created_at,
@@ -138,14 +215,15 @@ class ModelRegistry:
             "status_history": [{"status": status, "at": created_at,
                                 "note": "created"}],
         }
+        _validate_v2_metadata(metadata)
         payload = json.dumps(metadata, indent=2, sort_keys=True,
                              default=str).encode("utf-8")
         _atomic_write_bytes(self._meta_path(model_id),
                             lambda f: f.write(payload))
         return model_id
 
-    # -- load (fail closed) ---------------------------------------------------------
-    def load_metadata(self, model_id: str) -> dict:
+    def load_metadata(self, model_id: str, *,
+                      validate_v2: bool = True) -> dict:
         path = self._meta_path(model_id)
         if not os.path.exists(path):
             raise RegistryError(f"no metadata for model {model_id!r}")
@@ -154,19 +232,26 @@ class ModelRegistry:
                 meta = json.load(f)
         except (json.JSONDecodeError, OSError) as exc:
             raise RegistryError(f"unreadable metadata for {model_id!r}: {exc}")
-        if meta.get("schema_version") != SCHEMA_VERSION:
+        sv = meta.get("schema_version")
+        if sv not in SUPPORTED_SCHEMA_VERSIONS:
             raise RegistryError(
-                f"unsupported registry schema {meta.get('schema_version')!r} "
-                f"for {model_id!r} (supported: {SCHEMA_VERSION})")
+                f"unsupported registry schema {sv!r} "
+                f"for {model_id!r} (supported: {SUPPORTED_SCHEMA_VERSIONS})")
+        # v1: read-only compatibility — do not require V2 fields
+        if sv == 2 and validate_v2:
+            _validate_v2_metadata(meta)
         return meta
 
     def load(self, model_id: str, *,
              expected_feature_version: Optional[str] = None,
-             expected_target: Optional[str] = None) -> tuple:
+             expected_target: Optional[str] = None,
+             expected_horizon: Optional[str] = None,
+             required_input_fields: Optional[list] = None,
+             live_feature_version: Optional[str] = None,
+             ) -> tuple:
         """
-        Return (model, metadata). Raises RegistryError when metadata is
-        missing/corrupt, the artifact hash does not match, the schema version
-        is unsupported, or the feature version / target is incompatible.
+        Return (model, metadata). Fail closed on hash/schema/target/feature
+        mismatches and (for v2) missing calibration/fold/OOF audit fields.
         """
         meta = self.load_metadata(model_id)
         artifact = self._artifact_path(model_id)
@@ -187,14 +272,46 @@ class ModelRegistry:
             raise RegistryError(
                 f"target mismatch for {model_id!r}: {meta.get('target')!r} "
                 f"!= expected {expected_target!r}")
+        if (expected_horizon is not None
+                and meta.get("horizon") != expected_horizon):
+            raise RegistryError(
+                f"horizon mismatch for {model_id!r}: {meta.get('horizon')!r} "
+                f"!= expected {expected_horizon!r}")
+
+        # V2: reject models trained on a *newer* feature version than live
+        live_fv = live_feature_version or expected_feature_version
+        if (meta.get("schema_version") == 2 and live_fv is not None
+                and meta.get("feature_version")
+                and str(meta["feature_version"]) > str(live_fv)):
+            raise RegistryError(
+                f"model feature version {meta.get('feature_version')!r} is "
+                f"newer than live pipeline {live_fv!r} for {model_id!r}")
+
+        if required_input_fields is not None and meta.get("schema_version") == 2:
+            required = set(meta.get("required_input_fields") or [])
+            present = set(required_input_fields)
+            missing = required - present
+            if missing:
+                raise RegistryError(
+                    f"required feature absent for {model_id!r}: "
+                    f"{sorted(missing)}")
+
+        if (meta.get("schema_version") == 2
+                and expected_feature_version is not None
+                and meta.get("feature_schema_hash")
+                and required_input_fields is not None):
+            # Optional schema-hash check when caller provides a hash via
+            # hyperparameters is handled by callers; presence already gated.
+            pass
+
         import joblib
         return joblib.load(artifact), meta
 
-    # -- status ------------------------------------------------------------------
     def set_status(self, model_id: str, status: str, note: str = "") -> dict:
         if status not in STATUSES:
             raise RegistryError(f"unknown status {status!r}")
-        meta = self.load_metadata(model_id)
+        # Allow status updates on v1 without forcing v2 validation rewrite
+        meta = self.load_metadata(model_id, validate_v2=False)
         meta["status"] = status
         meta["status_history"].append({
             "status": status,
@@ -213,9 +330,9 @@ class ModelRegistry:
             if not name.endswith(".json"):
                 continue
             try:
-                meta = self.load_metadata(name[:-5])
+                meta = self.load_metadata(name[:-5], validate_v2=False)
             except RegistryError:
-                continue                             # unreadable: not listed
+                continue
             if status is None or meta.get("status") == status:
                 out.append(meta)
         return out

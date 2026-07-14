@@ -26,6 +26,8 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import math
+import sqlite3
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -196,10 +198,11 @@ def train_direction_models(frame: TrainingFrame,
     Walk-forward evaluation + final fit for each direction horizon.
 
     Per fold: a fresh DirectionModel is fitted on the fold's TRAIN sessions
-    only (its inner calibration split also stays inside them) and produces
-    out-of-sample probabilities for the TEST sessions, which are scored
-    against the required baselines. The returned final models are trained on
-    ALL sessions and are intended for shadow inference only.
+    only (inner OOF hyperparameter selection + independent OOF calibrator;
+    V3 Part 1 §5) and produces out-of-sample probabilities for the TEST
+    sessions, which are scored against the required baselines. The returned
+    final models are trained on ALL sessions and are intended for shadow
+    inference only.
     """
     base_cfg = config or DirectionModelConfig()
     out = {"folds": grouped_session_folds(frame.sessions, n_folds,
@@ -471,6 +474,12 @@ def build_prediction_bundle(group: PredictionModelGroup, row: dict, *,
                             symbol: str = "SPY",
                             quality: Optional[dict] = None,
                             structural: Optional[dict] = None,
+                            uncertainty_components: Optional[dict] = None,
+                            uncertainty_reasons: Optional[tuple] = None,
+                            ood_score: Optional[float] = None,
+                            ood_percentile: Optional[float] = None,
+                            calibration_support: Optional[float] = None,
+                            ensemble_size: Optional[int] = None,
                             ) -> PredictionBundle:
     """
     Assemble one PredictionBundle from the model group for one observation
@@ -480,6 +489,9 @@ def build_prediction_bundle(group: PredictionModelGroup, row: dict, *,
 
     `structural` supplies spot/put_wall/call_wall for range-survival feature
     rows when those are not already on `row`.
+
+    V3 optional uncertainty fields are passthroughs for the shadow path;
+    they must not alter legacy live decisions.
     """
     kw: dict = {}
     for h, model in group.direction.items():
@@ -521,13 +533,35 @@ def build_prediction_bundle(group: PredictionModelGroup, row: dict, *,
                 pass
 
     cov = (quality or {}).get("feature_coverage")
+    comps = dict(uncertainty_components or {})
+    reasons = tuple(uncertainty_reasons or ())
+    # Prefer composite from components when provided; else group scalar.
+    unc = None
+    if comps and comps.get("composite") is not None:
+        unc = _f(comps.get("composite"))
+    else:
+        unc = _f(group.uncertainty())
+
+    diagnostics = {}
+    if reasons:
+        diagnostics["uncertainty_reasons"] = list(reasons)
+        if "ABSTAIN_SHADOW" in reasons:
+            diagnostics["ABSTAIN_SHADOW"] = True
+
     return PredictionBundle(
         snapshot_id=snapshot_id, ts=ts, session_date=session_date,
         symbol=symbol,
-        uncertainty=_f(group.uncertainty()),
+        uncertainty=unc,
         data_quality=_f(cov), feature_coverage=_f(cov),
         feature_version=group.feature_version,
         model_versions=group.model_versions(),
+        diagnostics=diagnostics,
+        uncertainty_components=comps,
+        uncertainty_reasons=reasons,
+        ood_score=_f(ood_score),
+        ood_percentile=_f(ood_percentile),
+        calibration_support=_f(calibration_support),
+        ensemble_size=ensemble_size,
         **kw)
 
 
@@ -552,9 +586,23 @@ def run_shadow_predictions(store, group: PredictionModelGroup,
     """
     Predict every stored observation (optionally one session) with the model
     group and journal the PredictionBundle to prediction_outputs with
-    mode="shadow". Nothing in the live decision path reads these rows —
+    mode="shadow". Optionally journals uncertainty_outputs when the store
+    schema supports it. Nothing in the live decision path reads these rows —
     the legacy engine remains authoritative (§23.2).
     """
+    if hasattr(store, "require_schema"):
+        try:
+            store.require_schema()
+        except RuntimeError as exc:
+            # Schema migration failed — leave legacy loop operational; skip
+            # V3 shadow journaling rather than crashing the process.
+            warnings.warn(
+                f"shadow predictions skipped due to schema migration failure: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return 0
+
     frame = load_training_frame(store, group.feature_version,
                                 require_labels=False)
     n = 0
@@ -562,10 +610,42 @@ def run_shadow_predictions(store, group: PredictionModelGroup,
     for i in range(len(frame)):
         if session_date and frame.sessions[i] != session_date:
             continue
+        q = frame.quality[i] if frame.quality else {}
+        # Deterministic DQ uncertainty from quality fields (inspectable).
+        from prediction.uncertainty import (
+            compose_uncertainty, data_quality_uncertainty,
+        )
+        dq_u, dq_reasons = data_quality_uncertainty(
+            feature_coverage=q.get("feature_coverage"),
+            required_field_coverage=q.get("required_field_coverage"),
+            max_source_age_sec=q.get("max_source_age_sec"),
+            missingness_count=int(q.get("missingness_count") or 0),
+        )
+        # Scalar model uncertainty from the group as the calibration proxy.
+        cal_u = group.uncertainty()
+        unc = compose_uncertainty(
+            calibration=cal_u,
+            data_quality=dq_u,
+            extra_reasons=dq_reasons,
+        )
+        comps = {
+            "ensemble": unc.ensemble,
+            "conformal": unc.conformal,
+            "out_of_distribution": unc.out_of_distribution,
+            "calibration": unc.calibration,
+            "data_quality": unc.data_quality,
+            "model_age": unc.model_age,
+            "composite": unc.composite,
+        }
         bundle = build_prediction_bundle(
             group, frame.rows[i],
             snapshot_id=frame.snapshot_ids[i], ts=frame.ts[i],
-            session_date=frame.sessions[i], quality=frame.quality[i])
+            session_date=frame.sessions[i], quality=q,
+            uncertainty_components=comps,
+            uncertainty_reasons=unc.reasons,
+            calibration_support=(
+                None if cal_u is None else float(1.0 - float(cal_u))),
+        )
         store.log_prediction(
             snapshot_id=bundle.snapshot_id,
             model_group_version=group.group_version,
@@ -573,5 +653,30 @@ def run_shadow_predictions(store, group: PredictionModelGroup,
             uncertainty=bundle.uncertainty,
             generated_at=generated_at,
             mode=mode)
+        if hasattr(store, "log_uncertainty_output"):
+            try:
+                store.log_uncertainty_output(
+                    bundle.snapshot_id,
+                    group.group_version,
+                    float(bundle.uncertainty
+                          if bundle.uncertainty is not None else unc.composite),
+                    {
+                        "ensemble": unc.ensemble,
+                        "conformal": unc.conformal,
+                        "out_of_distribution": unc.out_of_distribution,
+                        "calibration": unc.calibration,
+                        "data_quality": unc.data_quality,
+                        "model_age": unc.model_age,
+                    },
+                    reasons=list(unc.reasons),
+                    diagnostics=unc.diagnostics,
+                    generated_at=generated_at,
+                )
+            except (RuntimeError, sqlite3.Error) as exc:
+                warnings.warn(
+                    f"uncertainty journaling skipped: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         n += 1
     return n

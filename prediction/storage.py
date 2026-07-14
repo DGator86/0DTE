@@ -119,6 +119,33 @@ CREATE TABLE IF NOT EXISTS sigma_cone_journal (
 );
 CREATE INDEX IF NOT EXISTS ix_cone_session ON sigma_cone_journal(session_date);
 CREATE INDEX IF NOT EXISTS ix_cone_settle ON sigma_cone_journal(settled, settle_by);
+
+CREATE TABLE IF NOT EXISTS model_evaluations (
+    evaluation_id TEXT PRIMARY KEY,
+    model_id TEXT NOT NULL,
+    model_type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    horizon TEXT,
+    feature_version TEXT NOT NULL,
+    label_version TEXT,
+    fold_definition_json TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    slice_metrics_json TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS uncertainty_outputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    model_group_version TEXT NOT NULL,
+    composite REAL NOT NULL,
+    components_json TEXT NOT NULL,
+    reasons_json TEXT,
+    diagnostics_json TEXT,
+    generated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_uncertainty_snapshot
+ON uncertainty_outputs(snapshot_id);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -142,12 +169,27 @@ def make_candidate_id(snapshot_id: str, family: str, legs: list) -> str:
 @dataclass
 class PredictionStore:
     db_path: str = "prediction_store.sqlite"
+    schema_ok: bool = True
+    schema_error: Optional[str] = None
 
     def __post_init__(self):
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(_CREATE)
-        self.conn.commit()
+        try:
+            self.conn.executescript(_CREATE)
+            self.conn.commit()
+            self.schema_ok = True
+            self.schema_error = None
+        except sqlite3.Error as exc:
+            self.schema_ok = False
+            self.schema_error = str(exc)
+
+    def require_schema(self) -> None:
+        """Raise if migrations failed — V3 shadow path must stop."""
+        if not self.schema_ok:
+            raise RuntimeError(
+                "prediction store schema migration failed: "
+                f"{self.schema_error or 'unknown error'}")
 
     # ---- feature snapshots ---------------------------------------------------
     def log_feature_snapshot(self, row) -> None:
@@ -253,6 +295,114 @@ class PredictionStore:
                                                 or "{}")
             except (json.JSONDecodeError, TypeError):
                 row["predictions"] = {}
+            out.append(row)
+        return out
+
+    # ---- model evaluations + uncertainty (V3 Part 1 §9) ------------------------
+    def log_model_evaluation(
+        self,
+        evaluation_id: str,
+        *,
+        model_id: str,
+        model_type: str,
+        target: str,
+        feature_version: str,
+        fold_definition: dict,
+        metrics: dict,
+        horizon: Optional[str] = None,
+        label_version: Optional[str] = None,
+        slice_metrics: Optional[dict] = None,
+        created_at: Optional[str] = None,
+    ) -> None:
+        self.require_schema()
+        import datetime as _dt
+        created_at = created_at or _dt.datetime.now(_dt.timezone.utc).isoformat()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO model_evaluations "
+            "(evaluation_id, model_id, model_type, target, horizon, "
+            "feature_version, label_version, fold_definition_json, "
+            "metrics_json, slice_metrics_json, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (evaluation_id, model_id, model_type, target, horizon,
+             feature_version, label_version,
+             _canonical_json(fold_definition), _canonical_json(metrics),
+             _canonical_json(slice_metrics) if slice_metrics is not None else None,
+             created_at),
+        )
+        self.conn.commit()
+
+    def fetch_model_evaluations(self, model_id: Optional[str] = None) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM model_evaluations"
+        args: list = []
+        if model_id:
+            sql += " WHERE model_id=?"
+            args.append(model_id)
+        sql += " ORDER BY created_at, evaluation_id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            for src, dest in (("fold_definition_json", "fold_definition"),
+                              ("metrics_json", "metrics"),
+                              ("slice_metrics_json", "slice_metrics")):
+                raw = row.pop(src, None)
+                try:
+                    row[dest] = json.loads(raw) if raw else None
+                except (json.JSONDecodeError, TypeError):
+                    row[dest] = None
+            out.append(row)
+        return out
+
+    def log_uncertainty_output(
+        self,
+        snapshot_id: str,
+        model_group_version: str,
+        composite: float,
+        components: dict,
+        *,
+        reasons: Optional[list] = None,
+        diagnostics: Optional[dict] = None,
+        generated_at: Optional[str] = None,
+    ) -> int:
+        self.require_schema()
+        import datetime as _dt
+        generated_at = generated_at or _dt.datetime.now(
+            _dt.timezone.utc).isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO uncertainty_outputs "
+            "(snapshot_id, model_group_version, composite, components_json, "
+            "reasons_json, diagnostics_json, generated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (snapshot_id, model_group_version, float(composite),
+             _canonical_json(components),
+             _canonical_json(reasons or []),
+             _canonical_json(diagnostics or {}),
+             generated_at),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_uncertainty_outputs(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM uncertainty_outputs"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            for src, dest in (("components_json", "components"),
+                              ("reasons_json", "reasons"),
+                              ("diagnostics_json", "diagnostics")):
+                raw = row.pop(src, None)
+                try:
+                    row[dest] = json.loads(raw) if raw else None
+                except (json.JSONDecodeError, TypeError):
+                    row[dest] = None
             out.append(row)
         return out
 

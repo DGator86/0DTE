@@ -2,36 +2,36 @@
 prediction/models/barrier_touch.py
 ==================================
 Calibrated barrier-touch / first-passage models
-(docs/PREDICTION_ENGINE_V2_HANDOFF.md §11.5).
+(docs/PREDICTION_ENGINE_V2_HANDOFF.md §11.5; V3 Part 1 §5).
 
-Targets (separate binary models, one horizon — typically close):
-  * touch_call_wall
-  * touch_put_wall
-  * cross_gamma_flip
-  * call_wall_first
-  * put_wall_first
-  * stop_before_target
-
-Baseline estimator: elastic-net logistic regression with an embargoed inner
-calibration split (same pattern as DirectionModel). Optional path-simulation
-features from prediction.path_model.PathEventResult can be merged into the
-feature row so the supervised model can learn from bootstrap frequencies.
+Hyperparameters selected by inner OOF log loss; calibrator fitted on
+cross-fitted raw scores (independent of the HP objective slice).
 
 NOT financial advice.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 import numpy as np
 
-from prediction.calibration import (IdentityCalibrator, fit_calibrator,
-                                    select_calibrator)
-from prediction.models.base import (RANDOM_STATE, FeatureVectorizer,
-                                    brier_score, brier_skill,
-                                    clip_probability, log_loss_score)
+from prediction.calibration import (
+    IdentityCalibrator,
+    build_calibration_artifact,
+    fit_calibrator,
+    select_calibrator,
+    slice_calibration_report,
+)
+from prediction.crossfit import NestedCrossFitConfig, inner_folds_for_train
+from prediction.models.base import (
+    RANDOM_STATE,
+    FeatureVectorizer,
+    brier_score,
+    brier_skill,
+    clip_probability,
+    log_loss_score,
+)
 from prediction.models.direction import split_train_calibration
 
 BARRIER_TARGETS = (
@@ -54,6 +54,10 @@ class BarrierTouchConfig:
     calibration_frac: float = 0.25
     embargo_sessions: int = 1
     calibration: str = "auto"
+    inner_folds: int = 3
+    min_train_sessions: int = 8
+    min_validation_sessions: int = 3
+    random_state: int = RANDOM_STATE
 
 
 def _make_estimator(cfg: BarrierTouchConfig, params: dict):
@@ -88,6 +92,20 @@ def path_features(events) -> dict:
     return {f"path_{k}": d.get(k) for k in keep}
 
 
+def _adaptive_cfg(sessions, cfg: BarrierTouchConfig) -> NestedCrossFitConfig:
+    n = len(set(sessions))
+    min_train = min(cfg.min_train_sessions, max(3, n // 3))
+    min_val = min(cfg.min_validation_sessions, max(2, n // 6))
+    return NestedCrossFitConfig(
+        outer_folds=2, inner_folds=min(cfg.inner_folds, 3),
+        embargo_sessions=cfg.embargo_sessions,
+        min_train_sessions=min_train,
+        min_validation_sessions=min_val,
+        retain_fold_models=False,
+        random_state=cfg.random_state,
+    )
+
+
 @dataclass
 class BarrierTouchModel:
     """One calibrated binary barrier model for one target."""
@@ -98,6 +116,7 @@ class BarrierTouchModel:
     metadata: dict = field(default_factory=dict)
     fitted: bool = False
     _base_rate: float = 0.5
+    calibration_artifact: object = None
 
     def fit(self, rows: Sequence[dict], y: Sequence[int],
             sessions: Sequence[str]) -> "BarrierTouchModel":
@@ -105,58 +124,106 @@ class BarrierTouchModel:
             raise ValueError(f"unknown barrier target {self.config.target!r}")
         y = np.asarray(y, dtype=int)
         sessions = list(sessions)
-        fit_s, cal_s = split_train_calibration(
-            sessions, self.config.calibration_frac, self.config.embargo_sessions)
-        fit_mask = np.array([s in set(fit_s) for s in sessions])
-        cal_mask = np.array([s in set(cal_s) for s in sessions])
-
-        fit_rows = [r for r, m in zip(rows, fit_mask) if m]
-        X_fit = self.vectorizer.fit_transform(fit_rows)
-        y_fit = y[fit_mask]
-
+        rows = list(rows)
+        uniq = sorted(set(sessions))
+        xfit_cfg = _adaptive_cfg(sessions, self.config)
         grid = _param_grid(self.config)
-        best_params, best_est, best_loss = grid[0], None, math.inf
+        best_params = dict(grid[0])
         cal_metrics: dict = {"note": "no calibration slice; identity calibrator"}
+        fit_s, cal_s = uniq, []
+        inner_diag: dict = {}
 
-        if cal_mask.any() and len(np.unique(y_fit)) >= 2:
-            cal_rows = [r for r, m in zip(rows, cal_mask) if m]
-            X_cal = self.vectorizer.transform(cal_rows)
-            y_cal = y[cal_mask]
+        if len(uniq) >= 2 and len(np.unique(y)) >= 2:
+            inner = inner_folds_for_train(uniq, xfit_cfg)
+            scores = []
             for params in grid:
-                est = _make_estimator(self.config, params)
-                est.fit(X_fit, y_fit)
-                loss = log_loss_score(y_cal, est.predict_proba(X_cal)[:, 1])
-                if loss < best_loss:
-                    best_params, best_est, best_loss = params, est, loss
-            p_raw = clip_probability(best_est.predict_proba(X_cal)[:, 1])
-            if self.config.calibration == "auto":
-                self.calibrator, cal_diag = select_calibrator(
-                    p_raw, y_cal, n_sessions=len(cal_s))
-            else:
-                self.calibrator = fit_calibrator(
-                    p_raw, y_cal, self.config.calibration)
-                cal_diag = self.calibrator.to_dict()
-            p_cal = self.calibrator.transform(p_raw)
-            cal_metrics = {
-                "n": int(len(y_cal)),
-                "brier_raw": brier_score(y_cal, p_raw),
-                "brier_calibrated": brier_score(y_cal, p_cal),
-                "brier_skill": brier_skill(y_cal, p_cal),
-                "log_loss": log_loss_score(y_cal, p_cal),
-                "calibration_diag": cal_diag,
-            }
-        else:
-            X_fit = self.vectorizer.fit_transform(list(rows))
-            y_fit = y
-            best_est = _make_estimator(self.config, best_params)
-            if len(np.unique(y_fit)) < 2:
-                best_est = None
-            else:
-                best_est.fit(X_fit, y_fit)
-            self.calibrator = IdentityCalibrator()
-            fit_s, cal_s = sorted(set(sessions)), []
+                losses = []
+                for inf in inner:
+                    tr = [i for i, s in enumerate(sessions)
+                          if s in set(inf["train_sessions"])]
+                    va = [i for i, s in enumerate(sessions)
+                          if s in set(inf["test_sessions"])]
+                    if not tr or not va or len(np.unique(y[tr])) < 2:
+                        continue
+                    vec = FeatureVectorizer().fit([rows[i] for i in tr])
+                    est = _make_estimator(self.config, params)
+                    est.fit(vec.transform([rows[i] for i in tr]), y[tr])
+                    p = clip_probability(
+                        est.predict_proba(
+                            vec.transform([rows[i] for i in va]))[:, 1])
+                    losses.append(log_loss_score(y[va], p))
+                if losses:
+                    scores.append((float(np.mean(losses)), dict(params)))
+            if scores:
+                scores.sort(key=lambda t: (t[0], str(sorted(t[1].items()))))
+                best_params = scores[0][1]
+                inner_diag = {"selection_metric": "log_loss",
+                              "best_log_loss": scores[0][0]}
 
-        self.estimator = best_est
+            # OOF raw for calibrator
+            pred = np.full(len(rows), np.nan)
+            for inf in inner:
+                tr = [i for i, s in enumerate(sessions)
+                      if s in set(inf["train_sessions"])]
+                va = [i for i, s in enumerate(sessions)
+                      if s in set(inf["test_sessions"])]
+                if not tr or not va:
+                    continue
+                if len(np.unique(y[tr])) < 2:
+                    pred[va] = float(np.mean(y[tr]))
+                    continue
+                vec = FeatureVectorizer().fit([rows[i] for i in tr])
+                est = _make_estimator(self.config, best_params)
+                est.fit(vec.transform([rows[i] for i in tr]), y[tr])
+                pred[va] = clip_probability(
+                    est.predict_proba(
+                        vec.transform([rows[i] for i in va]))[:, 1])
+            covered = np.isfinite(pred)
+            if covered.sum() >= 5 and len(np.unique(y[covered])) >= 2:
+                p_oof, y_oof = pred[covered], y[covered]
+                sess_oof = [sessions[i] for i in np.flatnonzero(covered)]
+                cal_s = sorted(set(sess_oof))
+                fit_s = sorted({s for inf in inner
+                                for s in inf["train_sessions"]}) or uniq
+                if self.config.calibration == "auto":
+                    self.calibrator, cal_diag = select_calibrator(
+                        p_oof, y_oof, n_sessions=len(set(sess_oof)),
+                        sessions=sess_oof,
+                        embargo_sessions=self.config.embargo_sessions)
+                else:
+                    self.calibrator = fit_calibrator(
+                        p_oof, y_oof, self.config.calibration)
+                    cal_diag = self.calibrator.to_dict()
+                p_cal = self.calibrator.transform(p_oof)
+                art = build_calibration_artifact(
+                    self.calibrator, p_oof, y_oof,
+                    training_sessions=cal_s, diagnostics=cal_diag)
+                self.calibration_artifact = art
+                cal_metrics = {
+                    "n": int(len(y_oof)),
+                    "brier_raw": art.brier_before,
+                    "brier_calibrated": art.brier_after,
+                    "brier_skill": brier_skill(y_oof, p_cal),
+                    "log_loss": art.log_loss_after,
+                    "calibration_diag": cal_diag,
+                    "slice_report": slice_calibration_report(
+                        p_cal, y_oof, sessions=sess_oof),
+                    "calibration_artifact": art.to_dict(),
+                    "crossfit": True,
+                }
+            else:
+                self.calibrator = IdentityCalibrator()
+        else:
+            self.calibrator = IdentityCalibrator()
+
+        self.vectorizer = FeatureVectorizer()
+        X = self.vectorizer.fit_transform(rows)
+        if len(np.unique(y)) < 2:
+            self.estimator = None
+        else:
+            self.estimator = _make_estimator(self.config, best_params)
+            self.estimator.fit(X, y)
+
         self._base_rate = float(np.mean(y)) if len(y) else 0.5
         skill = (cal_metrics.get("brier_skill")
                  if isinstance(cal_metrics, dict) else None)
@@ -166,12 +233,13 @@ class BarrierTouchModel:
             "best_params": {k: (v if v is None or isinstance(v, (int, float))
                                 else str(v))
                             for k, v in best_params.items()},
-            "train_sessions": sorted(set(sessions)),
+            "train_sessions": uniq,
             "fit_sessions": sorted(set(fit_s)),
             "calibration_sessions": sorted(set(cal_s)),
             "n_train_rows": int(len(y)),
             "base_rate": self._base_rate,
             "calibration_metrics": cal_metrics,
+            "inner_selection": inner_diag,
             "uncertainty": float(np.clip(1.0 - max(skill or 0.0, 0.0), 0.0, 1.0)),
         }
         self.fitted = True
