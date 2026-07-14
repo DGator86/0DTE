@@ -25,7 +25,10 @@ from typing import Optional
 
 # Fields validated as probabilities / bounded quality scores (0..1 or None).
 _BOUNDED_PREFIXES = ("p_",)
-_BOUNDED_FIELDS = ("uncertainty", "data_quality", "feature_coverage")
+_BOUNDED_FIELDS = (
+    "uncertainty", "data_quality", "feature_coverage",
+    "ood_score", "ood_percentile", "calibration_support",
+)
 
 
 @dataclass(frozen=True)
@@ -83,7 +86,20 @@ class PredictionBundle:
     model_versions: dict = field(default_factory=dict)
     diagnostics: dict = field(default_factory=dict)
 
+    # V3 Part 1 observation-specific uncertainty (optional; safe defaults)
+    uncertainty_components: dict = field(default_factory=dict)
+    uncertainty_reasons: tuple = ()
+    ood_score: Optional[float] = None
+    ood_percentile: Optional[float] = None
+    calibration_support: Optional[float] = None
+    ensemble_size: Optional[int] = None
+
     def __post_init__(self):
+        # Normalize uncertainty_reasons to a tuple for frozen dataclass callers
+        # that may pass a list via from_dict.
+        if isinstance(self.uncertainty_reasons, list):
+            object.__setattr__(self, "uncertainty_reasons",
+                               tuple(self.uncertainty_reasons))
         for f in dataclasses.fields(self):
             if not (f.name.startswith(_BOUNDED_PREFIXES)
                     or f.name in _BOUNDED_FIELDS):
@@ -95,6 +111,14 @@ class PredictionBundle:
                 raise ValueError(
                     f"PredictionBundle.{f.name} must be in [0, 1] or None, "
                     f"got {v!r}")
+        # Component values that are present must also be in [0, 1]
+        for k, v in (self.uncertainty_components or {}).items():
+            if v is None:
+                continue
+            if not isinstance(v, (int, float)) or not (0.0 <= float(v) <= 1.0):
+                raise ValueError(
+                    f"PredictionBundle.uncertainty_components[{k!r}] must be "
+                    f"in [0, 1] or None, got {v!r}")
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
