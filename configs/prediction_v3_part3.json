@@ -1,0 +1,49 @@
+{
+  "candidate_utility": {
+    "lambda_shortfall": 0.5,
+    "lambda_tail": 0.25,
+    "lambda_fill": 0.25,
+    "lambda_model": 0.25,
+    "lambda_forecast": 0.2,
+    "lambda_ood": 0.2,
+    "lambda_capital": 0.1,
+    "minimum_utility": 0.0,
+    "portfolio_risk_budget": 1.0
+  },
+  "candidate_rank": {
+    "pair_epsilon_r": 0.01,
+    "absolute_weight": 0.6,
+    "pairwise_weight": 0.4
+  },
+  "fill": {
+    "minimum_sessions": 40,
+    "minimum_attempts": 200,
+    "minimum_fills": 100,
+    "prior_equivalent_support": 100,
+    "fill_horizons_seconds": [15, 30, 60]
+  },
+  "meta": {
+    "uncertainty_abstain_threshold": 0.75,
+    "ood_abstain_percentile": 0.95,
+    "minimum_data_quality": 0.6,
+    "minimum_candidate_utility": 0.0,
+    "minimum_expected_order_value": 0.0,
+    "minimum_trade_probability": 0.58
+  },
+  "dynamic_weights": {
+    "eta": 1.0,
+    "session_half_life": 20,
+    "minimum_weight": 0.05,
+    "maximum_weight": 0.6
+  },
+  "drift": {
+    "watch_threshold": 0.4,
+    "degraded_threshold": 0.6,
+    "freeze_threshold": 0.8
+  },
+  "candidate_value": {
+    "expanded_distribution": true,
+    "label_version": "v3.0.0",
+    "quantiles": [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+  }
+}
