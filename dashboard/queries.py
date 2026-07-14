@@ -446,7 +446,8 @@ def paper_summary(paper_db_path: str) -> dict:
             "exit_reason, equity_after FROM paper_trades ORDER BY closed_at DESC LIMIT 20"
         ).fetchall()
         all_rows = conn.execute(
-            "SELECT pnl_dollars, exit_reason, equity_after FROM paper_trades ORDER BY closed_at"
+            "SELECT pnl_dollars, exit_reason, equity_after, entry_ctx "
+            "FROM paper_trades ORDER BY closed_at"
         ).fetchall()
     except sqlite3.Error:
         return {"note": "paper_trades table not found"}
@@ -458,13 +459,36 @@ def paper_summary(paper_db_path: str) -> dict:
     losses = [p for p in pnls if p <= 0]
     gross_win = sum(wins)
     gross_loss = -sum(losses)
-    equity = all_rows[-1][2] if all_rows else None
+    # Legacy-track equity for backward-compat top-line metric
+    equity = None
+    for r in reversed(all_rows):
+        track = "legacy"
+        if r[3]:
+            try:
+                ctx = json.loads(r[3])
+                track = str(ctx.get("fill_track") or "legacy").lower()
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                track = "legacy"
+        if track == "legacy" and r[2] is not None:
+            equity = r[2]
+            break
+    if equity is None and all_rows and all_rows[-1][2] is not None:
+        equity = all_rows[-1][2]
 
     # Max drawdown over the full equity curve (all_rows is chronological by
     # closed_at): largest peak-to-trough drop, in dollars and as a fraction
-    # of the peak at that point.
+    # of the peak at that point. Computed on legacy-track equity_after only.
     max_dd_dollars, max_dd_frac, peak = 0.0, 0.0, None
     for r in all_rows:
+        track = "legacy"
+        if r[3]:
+            try:
+                ctx = json.loads(r[3])
+                track = str(ctx.get("fill_track") or "legacy").lower()
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                track = "legacy"
+        if track != "legacy":
+            continue
         e = r[2]
         if e is None:
             continue
@@ -477,9 +501,31 @@ def paper_summary(paper_db_path: str) -> dict:
             max_dd_frac = max(max_dd_frac, dd_frac)
 
     by_reason: dict[str, int] = {}
+    by_track: dict[str, dict] = {
+        t: {"trades": 0, "total_pnl": 0.0, "wins": 0, "open_positions": 0}
+        for t in ("legacy", "v2", "v3")
+    }
     for r in all_rows:
         reason = r[1] or "unknown"
         by_reason[reason] = by_reason.get(reason, 0) + 1
+        track = "legacy"
+        if r[3]:
+            try:
+                ctx = json.loads(r[3])
+                t = str(ctx.get("fill_track") or "legacy").lower()
+                if t in by_track:
+                    track = t
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                track = "legacy"
+        pnl = float(r[0] or 0.0)
+        by_track[track]["trades"] += 1
+        by_track[track]["total_pnl"] = round(by_track[track]["total_pnl"] + pnl, 2)
+        if pnl > 0:
+            by_track[track]["wins"] += 1
+    for t, bt in by_track.items():
+        n = bt["trades"]
+        bt["win_rate"] = (bt["wins"] / n) if n else 0.0
+        bt.pop("wins", None)
 
     return {
         "trades": len(all_rows),
@@ -490,6 +536,7 @@ def paper_summary(paper_db_path: str) -> dict:
         "max_drawdown": round(max_dd_dollars, 2),
         "max_drawdown_pct": round(max_dd_frac, 4),
         "by_exit_reason": by_reason,
+        "by_track": by_track,
         "recent_trades": [dict(r) for r in rows],
         "simulated": True,
     }

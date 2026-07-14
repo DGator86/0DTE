@@ -124,7 +124,8 @@ def test_daily_loss_limit_blocks_entry(tmp_path):
     b = _broker(tmp_path, daily_loss_limit_frac=0.05)       # very tight
     b.on_tick(T0, _result(_chain(742, 1.50, 0.50)))
     b.on_tick(T1, _result(_chain(736, 3.90, 0.50), trade=False))   # stop -> realized loss
-    assert b._day_realized[T1.astimezone(ET).date().isoformat()] < 0
+    day = T1.astimezone(ET).date().isoformat()
+    assert b._day_realized[f"{day}|legacy"] < 0
     # next TRADE on same day should be blocked by the daily loss limit
     b.on_tick(T1, _result(_chain(742, 1.50, 0.50)))
     assert len(b.open_positions) == 0

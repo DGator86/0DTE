@@ -98,6 +98,9 @@ class TickResult:
     sigma_cones: Optional[dict] = None
     # Part 3 shadow decision payload for live_state / dashboard assessment.
     part3: Optional[dict] = None
+    # Parallel paper fills: list of {track, candidate, size_mult, ...} for
+    # legacy / v2 / v3. PaperBroker opens each track independently.
+    paper_intents: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -491,6 +494,8 @@ class UnifiedOrchestrator:
                 store=self.prediction_store,
             )
             signals.update(ranking.signals())
+            self._tick_shadow_cands = list(shadow_cands)
+            self._tick_shadow_forecasts = dict(ranking.forecasts or {})
             # Part 3 shadow decision (observation-only) for dashboard assessment.
             try:
                 from prediction.part3_shadow import build_part3_live_payload
@@ -560,6 +565,201 @@ class UnifiedOrchestrator:
         except Exception as exc:
             log.warning("V2 candidate shadow ranking failed: %s", exc)
             return decision
+
+    def _pick_shadow_candidate(self, candidate_id: Optional[str] = None,
+                               family: Optional[str] = None,
+                               structure_code: Optional[str] = None):
+        """Pick a concrete SpreadCandidate from this tick's shadow set."""
+        cands = list(getattr(self, "_tick_shadow_cands", None) or [])
+        if not cands:
+            return None
+        if candidate_id:
+            for c in cands:
+                cid = getattr(c, "_v2_candidate_id", None) or getattr(
+                    c, "v2_candidate_id", None)
+                if cid == candidate_id:
+                    return c
+        if structure_code:
+            try:
+                from spread_selector import STRUCTURE_TO_FAMILIES
+                fams = set(STRUCTURE_TO_FAMILIES.get(structure_code) or ())
+            except Exception:
+                fams = set()
+            if fams:
+                for c in cands:
+                    if getattr(c, "family", None) in fams:
+                        return c
+        if family:
+            for c in cands:
+                if getattr(c, "family", None) == family:
+                    return c
+        # Prefer highest V2 utility when available
+        forecasts = getattr(self, "_tick_shadow_forecasts", None) or {}
+        best, best_u = None, None
+        for c in cands:
+            cid = getattr(c, "_v2_candidate_id", None)
+            fc = forecasts.get(cid) if cid else None
+            u = float(getattr(fc, "utility_score", None)
+                      or getattr(c, "v2_utility_score", None)
+                      or getattr(c, "score", None)
+                      or float("-inf"))
+            if best is None or u > best_u:
+                best, best_u = c, u
+        return best
+
+    def _resolve_structure_candidate(
+            self, snap, decide_pdf, cfg, *, structure: str, direction: str,
+            pin_active: bool, density_mode: str = "vrp",
+            density_moments: Optional[dict] = None):
+        """Run Track-A decide() for a specific structure → executable candidate."""
+        if snap is None or snap.chain is None:
+            return None
+        if not structure or structure in ("NT", "none", "NONE"):
+            return None
+        try:
+            from decision_engine import decide
+            dec = decide(
+                snap.market, snap.chain, cfg,
+                physical_pdf=decide_pdf,
+                target_structure=structure,
+                direction=direction or "both",
+                physical_density_mode=density_mode,
+                physical_moments=density_moments,
+                pin_active=pin_active)
+            if dec is None or dec.candidate is None:
+                return None
+            # Prediction-engine paper fills: require gate pass so we don't
+            # open garbage, but allow through when gate wasn't evaluated.
+            if getattr(dec, "gate_pass", True) is False:
+                return None
+            return dec
+        except Exception as exc:
+            log.warning("paper candidate resolve failed (%s/%s): %s",
+                        structure, direction, exc)
+            return None
+
+    def _build_paper_intents(
+            self, *, snap, signals: dict, intent, regime_state,
+            decision, decide_pdf, cfg, pin_active: bool,
+            density_mode: str, density_moments: Optional[dict],
+            final_size_mult: float,
+            matrix_stand_down: bool) -> list:
+        """
+        Build parallel paper intents for legacy / V2 / V3.
+
+        - legacy: matrix intent → Track A decide (independent of champion override)
+        - v2: PredictionPolicy TRADE → decide with V2 structure/direction
+        - v3: Part 3 TRADE → selected shadow candidate
+
+        Session warmup is enforced in PaperBroker. Regime stand-down blocks
+        legacy only — V2/V3 still fill when their engines say TRADE so the
+        tracks can be compared.
+        """
+        intents: list = []
+        if snap is None or snap.chain is None:
+            return intents
+
+        # ---- LEGACY (matrix) ----
+        raw_struct = getattr(getattr(intent, "decision", None), "structure", None)
+        raw_dir = getattr(getattr(intent, "decision", None), "direction", None) or "both"
+        legacy_ok = (
+            not matrix_stand_down
+            and raw_struct not in (None, "NT", "none", "NONE")
+        )
+        if legacy_ok:
+            # Prefer the live decision candidate when it already matches matrix
+            leg_cand = None
+            if (decision is not None and getattr(decision, "decision", None) == "TRADE"
+                    and getattr(decision, "gate_pass", False)
+                    and decision.candidate is not None
+                    and str(getattr(self, "policy_mode", "shadow")).lower() != "champion"):
+                leg_cand = decision.candidate
+                gate_kelly = getattr(decision, "gate_kelly", None)
+                gate_score = getattr(decision, "gate_score", None)
+            else:
+                leg_dec = self._resolve_structure_candidate(
+                    snap, decide_pdf, cfg,
+                    structure=str(raw_struct), direction=str(raw_dir),
+                    pin_active=pin_active, density_mode=density_mode,
+                    density_moments=density_moments)
+                leg_cand = getattr(leg_dec, "candidate", None) if leg_dec else None
+                gate_kelly = getattr(leg_dec, "gate_kelly", None) if leg_dec else None
+                gate_score = getattr(leg_dec, "gate_score", None) if leg_dec else None
+            if leg_cand is not None:
+                intents.append({
+                    "track": "legacy",
+                    "candidate": leg_cand,
+                    "size_mult": float(getattr(intent, "size_mult", 1.0) or 1.0),
+                    "gate_kelly": gate_kelly,
+                    "gate_score": gate_score,
+                    "structure": raw_struct,
+                    "direction": raw_dir,
+                    "reason": "matrix_intent",
+                })
+
+        # ---- V2 (PredictionPolicy) ----
+        v2_action = str(signals.get("v2_policy_action") or "").upper()
+        v2_struct = signals.get("v2_policy_structure")
+        v2_dir = signals.get("v2_policy_direction") or "both"
+        if v2_action == "TRADE" and v2_struct not in (None, "NT", "none", "NONE", ""):
+            v2_mode = density_mode
+            v2_moments = density_moments
+            # Prefer V2 physical density when available on signals
+            if signals.get("phys_density_mode") == "v2":
+                v2_mode = "v2"
+            v2_dec = self._resolve_structure_candidate(
+                snap, decide_pdf, cfg,
+                structure=str(v2_struct), direction=str(v2_dir),
+                pin_active=pin_active, density_mode=v2_mode,
+                density_moments=v2_moments)
+            v2_cand = getattr(v2_dec, "candidate", None) if v2_dec else None
+            if v2_cand is None:
+                v2_cand = self._pick_shadow_candidate(
+                    family=signals.get("v2_top_family"),
+                    structure_code=str(v2_struct),
+                    candidate_id=signals.get("v2_top_candidate_id"))
+            if v2_cand is not None:
+                size = float(signals.get("policy_size_cap")
+                             or signals.get("v2_policy_size_cap")
+                             or 1.0)
+                intents.append({
+                    "track": "v2",
+                    "candidate": v2_cand,
+                    "size_mult": size,
+                    "gate_kelly": getattr(v2_dec, "gate_kelly", None) if v2_dec else None,
+                    "gate_score": getattr(v2_dec, "gate_score", None) if v2_dec else None,
+                    "structure": v2_struct,
+                    "direction": v2_dir,
+                    "reason": "prediction_policy",
+                })
+
+        # ---- V3 (Part 3 TradeDecisionV3) ----
+        part3 = getattr(self, "_tick_part3", None) or {}
+        ds = part3.get("decision_summary") or {}
+        # Use statistical_action so regime stand-down overlay doesn't erase
+        # the prediction-engine decision we want to paper-trade.
+        v3_action = str(ds.get("statistical_action") or ds.get("action") or "").upper()
+        if v3_action == "TRADE":
+            cid = ds.get("selected_candidate_id")
+            v3_cand = self._pick_shadow_candidate(
+                candidate_id=cid,
+                family=ds.get("family") or (part3.get("ranking") or {}).get("top_family"),
+            )
+            if v3_cand is not None:
+                intents.append({
+                    "track": "v3",
+                    "candidate": v3_cand,
+                    "size_mult": float(final_size_mult or 1.0) or 1.0,
+                    "gate_kelly": None,
+                    "gate_score": None,
+                    "structure": ds.get("family"),
+                    "direction": ds.get("direction") or signals.get("v2_policy_direction"),
+                    "candidate_id": cid,
+                    "v3_action": v3_action,
+                    "reason": "part3_meta",
+                })
+
+        return intents
 
     def _resolve_prediction_bundle(self, snap, signals: dict, intent,
                                    regime_state) -> Optional[object]:
@@ -822,6 +1022,9 @@ class UnifiedOrchestrator:
 
         self._tick_prediction_bundle = None
         self._tick_part3 = None
+        self._tick_shadow_cands = []
+        self._tick_shadow_forecasts = {}
+        self._tick_paper_intents = []
         snapshot_id = self._next_snapshot_id(now)
         cfg = self.engine_cfg or EngineConfig()
 
@@ -1049,8 +1252,10 @@ class UnifiedOrchestrator:
         live_structure = intent.decision.structure
         live_direction = intent.decision.direction
         live_size_mult = float(intent.size_mult)
-        stand_down_now = bool(
+        # Matrix stand-down (independent of champion override) — drives legacy paper.
+        matrix_stand_down = bool(
             regime_state.stand_down or intent.decision.structure == "NT")
+        stand_down_now = bool(matrix_stand_down)
         if policy_route is not None:
             for k, v in policy_route.journal_signals().items():
                 if isinstance(v, (int, float)) and math.isfinite(float(v)):
@@ -1088,12 +1293,14 @@ class UnifiedOrchestrator:
 
         # ---- Stand-down: regime unstable or NT cell (or champion NO_TRADE) ----
         if stand_down_now:
+            decide_pdf = phys_pdf
+            density_moments_sd = None
             if snap.chain is not None:
-                decide_pdf = phys_pdf
                 if (v2_result is not None
                         and not self.use_legacy_directional_tilt
                         and self.physical_pdf is None):
                     decide_pdf = v2_result.as_callable()
+                    density_moments_sd = v2_result.moments
                     signals["phys_density_mode"] = "v2"
                 elif decide_pdf is not None:
                     signals["phys_density_mode"] = (
@@ -1128,6 +1335,17 @@ class UnifiedOrchestrator:
                 ]
                 p3["decision_summary"] = ds
                 self._tick_part3 = p3
+            density_mode_sd = str(signals.get("phys_density_mode") or "vrp")
+            paper_intents = self._build_paper_intents(
+                snap=snap, signals=signals, intent=intent,
+                regime_state=regime_state, decision=None,
+                decide_pdf=decide_pdf,
+                cfg=cfg, pin_active=bool(pin.is_pin),
+                density_mode=density_mode_sd,
+                density_moments=density_moments_sd,
+                final_size_mult=0.0,
+                matrix_stand_down=True,
+            )
             result = TickResult(
                 ts=now, regime=regime_state, intent=intent,
                 decision=None, final_size_mult=0.0,
@@ -1136,6 +1354,7 @@ class UnifiedOrchestrator:
                 signals=pub_signals,
                 sigma_cones=getattr(self, "_tick_sigma_cones", None),
                 part3=getattr(self, "_tick_part3", None),
+                paper_intents=paper_intents,
             )
             if self.journal:
                 row = _no_trade_row(snap.market, intent, regime_state,
@@ -1160,8 +1379,8 @@ class UnifiedOrchestrator:
         density_mode = "injected" if self.physical_pdf is not None else (
             "realized_vol" if phys_pdf is not None else "vrp")
         density_moments: Optional[dict] = None
+        decide_pdf = phys_pdf
         if snap.chain is not None:
-            decide_pdf = phys_pdf
             use_v2 = (v2_result is not None
                       and not self.use_legacy_directional_tilt
                       and self.physical_pdf is None)
@@ -1295,6 +1514,16 @@ class UnifiedOrchestrator:
 
         pub_signals = {k: v for k, v in signals.items()
                        if not str(k).startswith("_")}
+        paper_intents = self._build_paper_intents(
+            snap=snap, signals=signals, intent=intent,
+            regime_state=regime_state, decision=decision,
+            decide_pdf=decide_pdf,
+            cfg=cfg, pin_active=bool(pin.is_pin),
+            density_mode=density_mode,
+            density_moments=density_moments,
+            final_size_mult=final_size,
+            matrix_stand_down=matrix_stand_down,
+        )
         return TickResult(
             ts=now, regime=regime_state, intent=intent,
             decision=decision,
@@ -1304,6 +1533,7 @@ class UnifiedOrchestrator:
             signals=pub_signals,
             sigma_cones=getattr(self, "_tick_sigma_cones", None),
             part3=getattr(self, "_tick_part3", None),
+            paper_intents=paper_intents,
         )
 
     def run_replay(self, timestamps: Sequence[dt.datetime]) -> list[TickResult]:
