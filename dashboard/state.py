@@ -331,3 +331,34 @@ def read_live_state(path: str) -> Optional[dict]:
         return None
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def serialize_part3_decision(decision, *, generated_at: str | None = None) -> dict:
+    """
+    Dashboard panel payload for Part 3 (§40). Always includes timestamp,
+    model versions, and mode so shadow output is not mistaken for an order.
+    """
+    if decision is None:
+        return {"note": "part3 decision not available"}
+    d = decision.to_dict() if hasattr(decision, "to_dict") else dict(decision)
+    return {
+        "generated_at": generated_at or d.get("ts"),
+        "mode": d.get("mode", "shadow"),
+        "model_versions": dict(d.get("model_versions") or {}),
+        "decision_summary": {
+            "action": d.get("action"),
+            "statistical_action": d.get("statistical_action"),
+            "hard_vetoes": list(d.get("hard_vetoes") or ()),
+            "selected_candidate_id": d.get("selected_candidate_id"),
+            "family": d.get("family"),
+            "direction": d.get("direction"),
+            "expected_order_value": d.get("expected_order_value"),
+            "candidate_utility": d.get("candidate_utility"),
+            "p_positive_utility": d.get("p_positive_utility"),
+            "fill_probability": d.get("fill_probability"),
+            "uncertainty": d.get("uncertainty"),
+            "ood_score": d.get("ood_score"),
+            "reasons": list(d.get("reasons") or ()),
+        },
+        "shadow_label": "SHADOW — not an executed order",
+    }

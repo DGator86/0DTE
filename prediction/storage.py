@@ -264,6 +264,28 @@ CREATE TABLE IF NOT EXISTS drift_events (
 );
 CREATE INDEX IF NOT EXISTS ix_drift_model_session
 ON drift_events(model_id, as_of_session);
+
+CREATE TABLE IF NOT EXISTS promotion_reviews (
+    review_id TEXT PRIMARY KEY,
+    model_group_id TEXT NOT NULL,
+    current_status TEXT NOT NULL,
+    proposed_status TEXT NOT NULL,
+    review_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS deployment_history (
+    deployment_id TEXT PRIMARY KEY,
+    deployed_at TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    active_models_json TEXT NOT NULL,
+    prior_models_json TEXT,
+    configuration_hash TEXT NOT NULL,
+    rollback_target_json TEXT,
+    deployed_by TEXT,
+    note TEXT
+);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -935,6 +957,57 @@ class PredictionStore:
                 row["status"] = json.loads(row.pop("status_json") or "{}")
             except (json.JSONDecodeError, TypeError):
                 row["status"] = {}
+            out.append(row)
+        return out
+
+    def log_promotion_review(self, review_id, model_group_id, current_status,
+                             proposed_status, review, created_at,
+                             resolved_at=None) -> None:
+        self.require_schema()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO promotion_reviews "
+            "(review_id, model_group_id, current_status, proposed_status, "
+            "review_json, created_at, resolved_at) VALUES (?,?,?,?,?,?,?)",
+            (review_id, model_group_id, current_status, proposed_status,
+             _canonical_json(review), created_at, resolved_at),
+        )
+        self.conn.commit()
+
+    def log_deployment_history(self, deployment_id, deployed_at, mode,
+                               active_models, configuration_hash,
+                               prior_models=None, rollback_target=None,
+                               deployed_by=None, note=None) -> None:
+        self.require_schema()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO deployment_history "
+            "(deployment_id, deployed_at, mode, active_models_json, "
+            "prior_models_json, configuration_hash, rollback_target_json, "
+            "deployed_by, note) VALUES (?,?,?,?,?,?,?,?,?)",
+            (deployment_id, deployed_at, mode,
+             _canonical_json(active_models),
+             _canonical_json(prior_models) if prior_models is not None else None,
+             configuration_hash,
+             _canonical_json(rollback_target) if rollback_target is not None else None,
+             deployed_by, note),
+        )
+        self.conn.commit()
+
+    def fetch_deployment_history(self) -> list:
+        self.require_schema()
+        out = []
+        for r in self.conn.execute(
+            "SELECT * FROM deployment_history ORDER BY deployed_at"
+        ).fetchall():
+            row = dict(r)
+            for src, dest in (
+                ("active_models_json", "active_models"),
+                ("prior_models_json", "prior_models"),
+                ("rollback_target_json", "rollback_target"),
+            ):
+                try:
+                    row[dest] = json.loads(row.pop(src) or "null")
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    row[dest] = None
             out.append(row)
         return out
 

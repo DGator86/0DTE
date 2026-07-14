@@ -336,3 +336,32 @@ class ModelRegistry:
             if status is None or meta.get("status") == status:
                 out.append(meta)
         return out
+
+
+# Part 3 mode permissions (§30.3)
+PART3_MODEL_TYPES = (
+    "candidate_value_v3",
+    "candidate_pair_ranker",
+    "fill_probability",
+    "fill_concession",
+    "trade_meta",
+    "dynamic_weight_state",
+    "drift_monitor",
+)
+
+
+def allowed_modes_for_status(status: str) -> frozenset:
+    from prediction.deployment import MODE_PERMISSIONS
+    return MODE_PERMISSIONS.get(str(status).lower(), frozenset())
+
+
+def assert_load_mode_allowed(meta: dict, load_mode: str) -> None:
+    """Fail closed when artifact status cannot load into the requested mode."""
+    from prediction.deployment import DeploymentError, assert_mode_permission
+    status = str(meta.get("status", "research"))
+    try:
+        assert_mode_permission(status, load_mode)
+    except DeploymentError:
+        raise RegistryError(
+            f"artifact {meta.get('model_id')!r} status {status!r} "
+            f"cannot load as {load_mode!r}")

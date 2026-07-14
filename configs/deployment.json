@@ -1,0 +1,12 @@
+{
+  "mode": "shadow",
+  "prediction_model_group": null,
+  "candidate_value_model": null,
+  "candidate_rank_model": null,
+  "fill_probability_model": null,
+  "fill_concession_model": null,
+  "meta_model": null,
+  "previous_deployment_id": null,
+  "rollback_deployment_id": null,
+  "approved_review_id": null
+}
