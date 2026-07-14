@@ -24,17 +24,27 @@ from prediction.candidate_dataset import (
     legs_as_dicts,
 )
 from prediction.models.candidate_value import (
-    CANDIDATE_VALUE_VERSION, CandidateForecast, CandidateValueModel,
+    CANDIDATE_VALUE_VERSION, CandidateForecast, CandidateForecastV3,
+    CandidateValueModel,
 )
 
 
 @dataclass
 class UtilityConfig:
+    """Part 3 §7 distributional utility (extends V2 shortfall/fill/model/capital)."""
     lambda_shortfall: float = 0.50
+    lambda_tail: float = 0.25
     lambda_fill: float = 0.25
     lambda_model: float = 0.25
+    lambda_forecast: float = 0.20
+    lambda_ood: float = 0.20
     lambda_capital: float = 0.10
+    minimum_utility: float = 0.0
     portfolio_risk_budget: float = 1.0
+
+
+# Spec alias
+CandidateUtilityConfig = UtilityConfig
 
 
 @dataclass
@@ -100,24 +110,34 @@ class SnapshotRankingResult:
 
 
 def candidate_utility(
-    forecast: CandidateForecast,
+    forecast,
     *,
-    capital: float = 0.0,
+    capital: Optional[float] = None,
     cfg: Optional[UtilityConfig] = None,
 ) -> float:
     """
-    §14.2 utility. Monotonicity (PR 8 AC):
-      higher expected_shortfall / fill_uncertainty / model_uncertainty
+    Part 3 §7 / V2 §14.2 utility. Monotonicity:
+      higher expected_shortfall / tail / fill / model / forecast / OOD / capital
       → lower utility (holding other terms fixed).
+    Accepts CandidateForecast or CandidateForecastV3.
+    When capital is omitted, uses forecast.capital_required if present.
     """
     cfg = cfg or UtilityConfig()
     budget = max(cfg.portfolio_risk_budget, 1e-9)
+    if capital is None:
+        capital = float(getattr(forecast, "capital_required", 0.0) or 0.0)
     capital_penalty = float(capital) / budget
+    pnl_q05 = float(getattr(forecast, "pnl_q05", 0.0) or 0.0)
+    forecast_unc = float(getattr(forecast, "forecast_uncertainty", 0.0) or 0.0)
+    ood = float(getattr(forecast, "ood_score", 0.0) or 0.0)
     return (
         float(forecast.expected_net_pnl)
         - cfg.lambda_shortfall * float(forecast.expected_shortfall)
+        - cfg.lambda_tail * max(-pnl_q05, 0.0)
         - cfg.lambda_fill * float(forecast.fill_uncertainty)
         - cfg.lambda_model * float(forecast.model_uncertainty)
+        - cfg.lambda_forecast * forecast_unc
+        - cfg.lambda_ood * ood
         - cfg.lambda_capital * capital_penalty
     )
 
