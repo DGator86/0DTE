@@ -204,6 +204,17 @@ CREATE TABLE IF NOT EXISTS ensemble_outputs (
 );
 CREATE INDEX IF NOT EXISTS ix_ensemble_snapshot
 ON ensemble_outputs(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS candidate_rank_outputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    ranking_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_candidate_rank_snapshot
+ON candidate_rank_outputs(snapshot_id);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -693,6 +704,46 @@ class PredictionStore:
                 row["forecast"] = json.loads(row.pop("forecast_json") or "{}")
             except (json.JSONDecodeError, TypeError):
                 row["forecast"] = {}
+            out.append(row)
+        return out
+
+    # ---- candidate ranking (Part 3) -------------------------------------------
+    def log_candidate_ranking(
+        self,
+        snapshot_id: str,
+        model_version: str,
+        ranking: dict,
+        generated_at: str,
+        mode: str,
+    ) -> int:
+        self.require_schema()
+        cur = self.conn.execute(
+            "INSERT INTO candidate_rank_outputs "
+            "(snapshot_id, model_version, ranking_json, generated_at, mode) "
+            "VALUES (?,?,?,?,?)",
+            (snapshot_id, model_version, _canonical_json(ranking),
+             generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_candidate_rankings(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM candidate_rank_outputs"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["ranking"] = json.loads(row.pop("ranking_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["ranking"] = {}
             out.append(row)
         return out
 
