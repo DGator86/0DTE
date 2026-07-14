@@ -11,7 +11,7 @@ from prediction.candidate_dataset import (
     CandidateTrainingFrame, append_settled_candidate,
     assert_pairs_within_snapshot, assert_snapshots_not_split,
     build_pair_features, build_pairwise_frame, generate_snapshot_pairs,
-    grouped_snapshot_folds, pair_weight, pairwise_frame_from_training_frame,
+    pair_weight, pairwise_frame_from_training_frame,
     reverse_pair_features,
 )
 
@@ -142,10 +142,10 @@ class TestSnapshotGrouping:
         pw = pairwise_frame_from_training_frame(frame, utils)
         assert len(pw) > 0
         assert_pairs_within_snapshot(pw.pairs)
-        # Fold grouping still holds on the underlying candidate frame
-        folds = grouped_snapshot_folds(
-            frame.snapshot_ids, frame.session_dates,
-            n_folds=1, embargo_sessions=0, min_train_sessions=1)
-        # With one session, may get zero folds depending on min_train —
-        # just ensure assert helper still works on synthetic split
+        # All pairs stay on their originating snapshot
+        for p in pw.pairs:
+            assert p.snapshot_id in ("2026-07-01|t0", "2026-07-01|t1")
+            assert p.candidate_a_id.startswith(p.snapshot_id + "|")
+            assert p.candidate_b_id.startswith(p.snapshot_id + "|")
+        # Snapshot-fold invariant helper still catches deliberate leakage
         assert_snapshots_not_split(frame.snapshot_ids, [0, 1, 2], [3, 4])
