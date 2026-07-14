@@ -196,10 +196,11 @@ def train_direction_models(frame: TrainingFrame,
     Walk-forward evaluation + final fit for each direction horizon.
 
     Per fold: a fresh DirectionModel is fitted on the fold's TRAIN sessions
-    only (its inner calibration split also stays inside them) and produces
-    out-of-sample probabilities for the TEST sessions, which are scored
-    against the required baselines. The returned final models are trained on
-    ALL sessions and are intended for shadow inference only.
+    only (inner OOF hyperparameter selection + independent OOF calibrator;
+    V3 Part 1 §5) and produces out-of-sample probabilities for the TEST
+    sessions, which are scored against the required baselines. The returned
+    final models are trained on ALL sessions and are intended for shadow
+    inference only.
     """
     base_cfg = config or DirectionModelConfig()
     out = {"folds": grouped_session_folds(frame.sessions, n_folds,
