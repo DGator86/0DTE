@@ -740,7 +740,7 @@ html, body {
   background: rgba(74,168,255,0.08); border: 1px solid rgba(74,168,255,0.25);
 }
 
-/* ---- V2 policy / GEX / forecast panels ---- */
+/* ---- V3 policy / GEX / forecast panels ---- */
 .policy-compare {
   display: grid;
   grid-template-columns: 1fr 1fr;

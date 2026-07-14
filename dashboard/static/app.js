@@ -267,14 +267,14 @@
       metricCard("Breakeven", fmt(inp.straddle_breakeven, 2)),
       metricCard("Density mode", esc(s.phys_density_mode || "—"), "info"),
       metricCard("Live EV", money(liveEv, 0), num(liveEv) > 0 ? "pos" : num(liveEv) < 0 ? "neg" : ""),
-      metricCard("V2 shadow EV", money(shadowEv, 0), num(shadowEv) > 0 ? "pos" : num(shadowEv) < 0 ? "neg" : ""),
-      metricCard("V2 − live Δ", money(delta, 0), num(delta) > 0 ? "pos" : num(delta) < 0 ? "neg" : ""),
-      metricCard("V2 var ratio", fmt(s.phys_v2_var_ratio, 2)),
-      metricCard("V2 uncertainty", fmt(s.phys_v2_uncertainty, 2),
+      metricCard("V3 shadow EV", money(shadowEv, 0), num(shadowEv) > 0 ? "pos" : num(shadowEv) < 0 ? "neg" : ""),
+      metricCard("V3 − live Δ", money(delta, 0), num(delta) > 0 ? "pos" : num(delta) < 0 ? "neg" : ""),
+      metricCard("V3 var ratio", fmt(s.phys_v2_var_ratio, 2)),
+      metricCard("V3 uncertainty", fmt(s.phys_v2_uncertainty, 2),
         num(s.phys_v2_uncertainty) > 0.5 ? "warn" : ""),
     ];
     if (num(s.v2_utility_score) != null) {
-      cards.push(metricCard("V2 utility", fmt(s.v2_utility_score, 2),
+      cards.push(metricCard("V3 utility", fmt(s.v2_utility_score, 2),
         num(s.v2_rank_disagreement) ? "warn" : "pos"));
     }
     if (num(t.liquidity_score) != null) {
@@ -286,7 +286,7 @@
     $("playbook-metrics").innerHTML = cards.join("");
   }
 
-  /* ---------------- parallel Legacy vs V2 ---------------- */
+  /* ---------------- parallel Legacy vs V3 ---------------- */
   function renderParallel(live, latest) {
     const p = (live && live.parallel) || {};
     const leg = p.legacy || {};
@@ -304,7 +304,7 @@
         <div class="ps-meta">${esc(leg.decision || "—")}${leg.direction ? " · " + esc(leg.direction) : ""}</div>
       </div>
       <div class="policy-side${disagree ? " disagree" : ""}">
-        <div class="ps-label">V2 policy</div>
+        <div class="ps-label">V3 policy</div>
         <div class="ps-struct">${esc(v2.structure || s.v2_policy_structure || "—")}</div>
         <div class="ps-meta">${esc(v2.action || s.v2_policy_action || "—")}${(v2.direction || s.v2_policy_direction) ? " · " + esc(v2.direction || s.v2_policy_direction) : ""}</div>
       </div>`;
@@ -313,9 +313,9 @@
       metricCard("Legacy gate", leg.gate_pass == null ? "—" : (leg.gate_pass ? "PASS" : "FAIL"),
         leg.gate_pass ? "pos" : (leg.gate_pass === false ? "warn" : "")),
       metricCard("Legacy size", fmt(leg.size_mult, 2)),
-      metricCard("V2 size cap", fmt(v2.size_cap != null ? v2.size_cap : s.policy_size_cap, 2)),
-      metricCard("V2 conf.", fmt(v2.confidence != null ? v2.confidence : s.v2_policy_confidence, 2)),
-      metricCard("V2 unc.", fmt(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty, 2),
+      metricCard("V3 size cap", fmt(v2.size_cap != null ? v2.size_cap : s.policy_size_cap, 2)),
+      metricCard("V3 conf.", fmt(v2.confidence != null ? v2.confidence : s.v2_policy_confidence, 2)),
+      metricCard("V3 unc.", fmt(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty, 2),
         num(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty) > 0.5 ? "warn" : ""),
       metricCard("Source", esc(v2.source || s.policy_source || "—")),
     ].join("");
@@ -337,9 +337,9 @@
     $("phys-metrics").innerHTML = [
       metricCard("Mode", esc(s.phys_density_mode || "—")),
       metricCard("Live EV", fmt(s.phys_live_ev, 3)),
-      metricCard("V2 shadow EV", fmt(s.phys_v2_shadow_ev, 3)),
-      metricCard("V2 mean", fmt(s.phys_v2_mean, 4)),
-      metricCard("V2 std", fmt(s.phys_v2_std, 4)),
+      metricCard("V3 shadow EV", fmt(s.phys_v2_shadow_ev, 3)),
+      metricCard("V3 mean", fmt(s.phys_v2_mean, 4)),
+      metricCard("V3 std", fmt(s.phys_v2_std, 4)),
       metricCard("Var ratio", fmt(s.phys_v2_var_ratio, 3)),
       metricCard("Exp. return", fmt(s.phys_v2_expected_return, 5)),
       metricCard("Uncertainty", fmt(s.phys_v2_uncertainty, 2)),
@@ -358,10 +358,10 @@
       metricCard("Disagreement", s.v2_rank_disagreement == null ? "—"
         : (s.v2_rank_disagreement ? "yes" : "no"),
         s.v2_rank_disagreement ? "warn" : "pos"),
-      metricCard("V2 top", esc(String(s.v2_top_candidate_id || "—").slice(0, 12))),
+      metricCard("V3 top", esc(String(s.v2_top_candidate_id || "—").slice(0, 12))),
       metricCard("Legacy top", esc(String(s.legacy_top_candidate_id || "—").slice(0, 12))),
-      metricCard("V2 utility", fmt(s.v2_utility_score, 3)),
-      metricCard("V2 top family", esc(s.v2_top_family || "—")),
+      metricCard("V3 utility", fmt(s.v2_utility_score, 3)),
+      metricCard("V3 top family", esc(s.v2_top_family || "—")),
       metricCard("Legacy top fam.", esc(s.legacy_top_family || "—")),
     ].join("");
   }
@@ -371,7 +371,7 @@
     const t = latest || {};
     const cards = [];
     if (num(s.phys_v2_shadow_ev) != null) {
-      cards.push(metricCard("V2 shadow EV", fmt(s.phys_v2_shadow_ev, 3)));
+      cards.push(metricCard("V3 shadow EV", fmt(s.phys_v2_shadow_ev, 3)));
     }
     if (num(t.v2_utility_score) != null || num(s.v2_utility_score) != null) {
       cards.push(metricCard("Utility", fmt(t.v2_utility_score != null
@@ -386,10 +386,10 @@
     }
     $("v2-playbook-metrics").innerHTML = cards.length
       ? cards.join("")
-      : '<p class="empty">No V2 economics on latest tick</p>';
+      : '<p class="empty">No V3 economics on latest tick</p>';
   }
 
-  /* ---------------- V2 signal (policy shadow, mirrors Legacy signal panel) ---------------- */
+  /* ---------------- V3 signal (policy shadow, mirrors Legacy signal panel) ---------------- */
   function renderV2Signal(live, latest) {
     const p = (live && live.parallel) || {};
     const v2 = p.v2 || {};
@@ -414,7 +414,7 @@
       sub = (live.market && live.market.is_open) ? "pipeline idle — awaiting tick" : "market closed — awaiting session";
     } else if (fallback) {
       cls = "wait"; word = "FALLBACK";
-      sub = "V2 unavailable · using legacy";
+      sub = "V3 unavailable · using legacy";
     } else if (action === "TRADE" || (struct && struct !== "NT" && action !== "NO_TRADE" && action !== "STAND_DOWN")) {
       cls = "go"; word = "TRADE";
       sub = `policy ${mode}` + (disagree ? " · disagrees with legacy" : " · dual-run");
@@ -491,18 +491,18 @@
     const rationale = s.policy_rationale || "";
     let html = "";
     if (!live || !live.ts || (live.status && live.status !== "live")) {
-      html = "<b>Standing by.</b> No live V2 observation yet.";
+      html = "<b>Standing by.</b> No live V3 observation yet.";
     } else if (rationale) {
       html = `<b>Policy.</b> ${esc(String(rationale).replace(/_/g, " "))}.`;
     } else if (disagree) {
-      html = `<b>Disagreement.</b> Legacy ${esc(leg.structure || "NT")} vs V2 ${esc(v2.structure || s.v2_policy_structure || "—")}.`;
+      html = `<b>Disagreement.</b> Legacy ${esc(leg.structure || "NT")} vs V3 ${esc(v2.structure || s.v2_policy_structure || "—")}.`;
     } else {
-      html = `<b>Aligned.</b> V2 ${esc(v2.structure || s.v2_policy_structure || "NT")} · ${esc(v2.action || s.v2_policy_action || "—")}.`;
+      html = `<b>Aligned.</b> V3 ${esc(v2.structure || s.v2_policy_structure || "NT")} · ${esc(v2.action || s.v2_policy_action || "—")}.`;
     }
     $("v2-reason").innerHTML = html;
     $("v2-why-metrics").innerHTML = [
-      metricCard("V2 structure", esc(v2.structure || s.v2_policy_structure || "—")),
-      metricCard("V2 action", esc(v2.action || s.v2_policy_action || "—")),
+      metricCard("V3 structure", esc(v2.structure || s.v2_policy_structure || "—")),
+      metricCard("V3 action", esc(v2.action || s.v2_policy_action || "—")),
       metricCard("Source", esc(v2.source || s.policy_source || "—"),
         (v2.source || s.policy_source) === "fallback_legacy" ? "warn" : ""),
       metricCard("Legacy structure", esc(leg.structure || s.legacy_policy_structure || "—")),
@@ -564,7 +564,7 @@
           <div><span class="k">Entry credit</span><span class="v">${fmt(p.entry_credit, 2)}</span></div>
           <div><span class="k">Held</span><span class="v">${fmt(p.hold_min, 0)}m</span></div>
           <div><span class="k">% of max profit</span><span class="v ${pnlCls}">${pctMax}</span></div>
-          <div><span class="k">V2 wanted</span><span class="v sm">${esc(ctx.v2_policy_structure || "—")}</span></div>
+          <div><span class="k">V3 wanted</span><span class="v sm">${esc(ctx.v2_policy_structure || "—")}</span></div>
         </div>
       </div>`;
     }).join("");
@@ -612,7 +612,7 @@
       metricCard("Observations", n || "—"),
       metricCard("Disagreements", disagree, disagree ? "warn" : "pos"),
       metricCard("Fallbacks", fallback, fallback ? "warn" : ""),
-      metricCard("V2 TRADE ticks", v2Trade),
+      metricCard("V3 TRADE ticks", v2Trade),
     ].join("");
     $("v2-funnel-rows").innerHTML = rows.length
       ? `<div class="fn-grid" style="margin-top:10px">${rows.slice(0, 12).join("")}</div>`
@@ -628,7 +628,7 @@
         || s.pin_active != null;
     });
     if (!ticks.length) {
-      $("v2-timeline").innerHTML = '<p class="empty">No V2-annotated ticks yet</p>';
+      $("v2-timeline").innerHTML = '<p class="empty">No V3-annotated ticks yet</p>';
       return;
     }
     $("v2-timeline").innerHTML = ticks.map((t) => {
@@ -649,12 +649,12 @@
         <span class="t">${etTime(t.ts)}</span>
         <span class="m">${esc(v2Struct)} <small>${esc(v2Act)}</small>${extraHtml}
           <small>· ${fmt(t.spot, 2)}</small></span>
-        <span class="d ${trade ? "trade" : "no"}">${trade ? "V2" : "—"}</span>
+        <span class="d ${trade ? "trade" : "no"}">${trade ? "V3" : "—"}</span>
       </div>`;
     }).join("");
   }
 
-  /* ---------------- track helpers (Legacy vs V2) ---------------- */
+  /* ---------------- track helpers (Legacy vs V3) ---------------- */
   function fillTrack(ctx) {
     ctx = ctx || {};
     if (ctx.fill_track === "v2" || ctx.fill_track === "legacy") return ctx.fill_track;
@@ -670,7 +670,7 @@
     const chips = [`<span class="chip track-${track}">${track}</span>`];
     if (trackDisagree(ctx)) {
       const wanted = (ctx && ctx.v2_policy_structure) || "?";
-      chips.push(`<span class="chip track-disagree" title="V2 wanted ${esc(wanted)}">≠ V2 ${esc(wanted)}</span>`);
+      chips.push(`<span class="chip track-disagree" title="V3 wanted ${esc(wanted)}">≠ V3 ${esc(wanted)}</span>`);
     }
     return `<span class="chips">${chips.join("")}</span>`;
   }
@@ -702,7 +702,7 @@
         <div class="ps-meta">${esc(legAct)}${legDir ? " · " + esc(legDir) : ""}</div>
       </div>
       <div class="policy-side${disagree ? " disagree" : ""}">
-        <div class="ps-label">V2 prediction policy</div>
+        <div class="ps-label">V3 prediction policy</div>
         <div class="ps-struct">${esc(v2Struct || "—")}</div>
         <div class="ps-meta">${esc(v2Act)}${v2Dir ? " · " + esc(v2Dir) : ""}</div>
       </div>`;
@@ -716,7 +716,7 @@
         : s.v2_policy_uncertainty, 2),
         num(s.policy_uncertainty) > 0.5 ? "warn" : ""),
       metricCard("Size cap", fmt(s.policy_size_cap, 2)),
-      metricCard("V2 conf.", fmt(s.v2_policy_confidence, 2)),
+      metricCard("V3 conf.", fmt(s.v2_policy_confidence, 2)),
       metricCard("Version", esc(s.policy_version || s.v2_policy_version || "—")),
     ].join("");
 
@@ -813,7 +813,7 @@
       : '<p class="empty">No dynamics signals on latest tick</p>';
   }
 
-  /* ---------------- V2 forecast bundle ---------------- */
+  /* ---------------- V3 forecast bundle ---------------- */
   function forecastFromSignals(tick, live) {
     const s = mergeV2Signals(tick, live);
     const liveFc = (live && live.forecast) || {};
@@ -870,7 +870,7 @@
     $("forecast-metrics").innerHTML = cards.join("");
   }
 
-  /* ---------------- signal correlations (V2 keys from report) ---------------- */
+  /* ---------------- signal correlations (V3 keys from report) ---------------- */
   const SIGCORR_PREFIXES = ["sig:policy_", "sig:v2_", "sig:phys_", "sig:gex_",
     "sig:expected_move", "sig:flip_", "sig:wall_", "sig:chan_"];
   function renderSigCorr(report) {
@@ -882,7 +882,7 @@
       .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
       .slice(0, 14);
     if (!entries.length) {
-      $("sigcorr-rows").innerHTML = '<p class="empty">No V2 signal correlations yet</p>';
+      $("sigcorr-rows").innerHTML = '<p class="empty">No V3 signal correlations yet</p>';
       return;
     }
     $("sigcorr-rows").innerHTML = `<div class="val-corr">${entries.map(([k, r]) =>
@@ -2020,18 +2020,156 @@
     });
   }
 
+
+  /* ---------------- Part 3 decision / execution / model state ---------------- */
+  function renderPart3(live, latest) {
+    const p3 = (live && live.part3) || {};
+    const ds = p3.decision_summary || {};
+    const ranking = p3.ranking || {};
+    const execution = p3.execution || {};
+    const model = p3.model_state || {};
+    const mode = p3.mode || "shadow";
+    const genAt = p3.generated_at || (live && live.ts) || null;
+    const versions = p3.model_versions || {};
+
+    if ($("v3-decision-mode")) {
+      $("v3-decision-mode").textContent = mode + (genAt ? " · " + etTime(genAt) : "");
+    }
+    if ($("v3-shadow-banner")) {
+      $("v3-shadow-banner").textContent = p3.shadow_label
+        || "SHADOW — not an executed order";
+      $("v3-shadow-banner").classList.toggle("hidden", false);
+    }
+
+    const action = String(ds.action || "").toUpperCase();
+    let cls = "wait", word = "WAIT", sub = "awaiting Part 3 observation";
+    if (p3.note && !action) {
+      word = "STANDBY";
+      sub = String(p3.note).replace(/_/g, " ");
+    } else if (action === "HARD_VETO") {
+      cls = "stop"; word = "HARD VETO";
+      sub = (ds.hard_vetoes || []).join(", ") || "deterministic veto";
+    } else if (action === "ABSTAIN") {
+      cls = "wait"; word = "ABSTAIN";
+      sub = (ds.reasons || []).slice(0, 2).join(" · ").replace(/_/g, " ") || "uncertainty";
+    } else if (action === "NO_EDGE") {
+      cls = "wait"; word = "NO EDGE";
+      sub = (ds.reasons || []).slice(0, 2).join(" · ").replace(/_/g, " ") || "no executable edge";
+    } else if (action === "TRADE") {
+      cls = "go"; word = "TRADE";
+      sub = (ds.family || "candidate") + " · " + mode;
+    } else if (live && (live.status === "feed_not_ready" || live.status === "feed_error")) {
+      cls = "stop"; word = "NO FEED";
+      sub = "feed not ready — check data source";
+    }
+    const v = $("v3-decision-verdict");
+    if (v) {
+      v.className = "verdict " + cls;
+      $("v3-decision-word").textContent = word;
+      $("v3-decision-sub").textContent = sub;
+    }
+    if ($("v3-decision-metrics")) {
+      $("v3-decision-metrics").innerHTML = [
+        metricCard("Stat action", esc(ds.statistical_action || "—")),
+        metricCard("P(pos util)", fmt(ds.p_positive_utility, 2)),
+        metricCard("Order value", fmt(ds.expected_order_value, 3)),
+        metricCard("Utility", fmt(ds.candidate_utility, 3)),
+        metricCard("P(fill)", fmt(ds.fill_probability, 2)),
+        metricCard("Uncertainty", fmt(ds.uncertainty, 2)),
+        metricCard("OOD", fmt(ds.ood_score, 2)),
+        metricCard("Family", esc(ds.family || "—")),
+      ].join("");
+    }
+    if ($("v3-decision-chips")) {
+      const chips = [];
+      (ds.reasons || []).slice(0, 6).forEach((r) => {
+        chips.push(`<span class="chip">${esc(String(r))}</span>`);
+      });
+      (ds.hard_vetoes || []).forEach((r) => {
+        chips.push(`<span class="chip track-disagree">${esc(String(r))}</span>`);
+      });
+      if (genAt) chips.push(`<span class="chip mono">${esc(etTime(genAt))} ET</span>`);
+      Object.keys(versions).slice(0, 4).forEach((k) => {
+        chips.push(`<span class="chip mono">${esc(k)}:${esc(String(versions[k]))}</span>`);
+      });
+      $("v3-decision-chips").innerHTML = chips.join("") || "";
+    }
+
+    // Ranking — prefer part3 payload, fall back to existing ranker signals
+    const s = mergeV2Signals(latest, live);
+    if ($("v3-rank-metrics")) {
+      $("v3-rank-metrics").innerHTML = [
+        metricCard("V3 top", esc(String(
+          ranking.top_candidate_id || ds.selected_candidate_id || s.v2_top_candidate_id || "—"
+        ).slice(0, 14))),
+        metricCard("Legacy top", esc(String(
+          ranking.legacy_top_candidate_id || s.legacy_top_candidate_id || "—"
+        ).slice(0, 14))),
+        metricCard("Abs utility", fmt(
+          ranking.absolute_utility != null ? ranking.absolute_utility : s.v2_utility_score, 3)),
+        metricCard("Pairwise", fmt(ranking.pairwise_score, 3)),
+        metricCard("Combined", fmt(ranking.combined_score, 3)),
+        metricCard("Regret", fmt(ranking.expected_regret, 3)),
+        metricCard("Margin", fmt(ranking.top_score_margin, 3)),
+        metricCard("V3 family", esc(
+          ranking.top_family || ds.family || s.v2_top_family || "—")),
+      ].join("");
+    }
+
+    if ($("v3-exec-fallback")) {
+      $("v3-exec-fallback").textContent = execution.fallback_level || "—";
+    }
+    if ($("v3-exec-metrics")) {
+      $("v3-exec-metrics").innerHTML = [
+        metricCard("Mid", fmt(execution.mid_credit, 3)),
+        metricCard("Natural", fmt(execution.natural_credit, 3)),
+        metricCard("Expected fill", fmt(execution.expected_credit, 3)),
+        metricCard("Conservative", fmt(execution.conservative_credit, 3)),
+        metricCard("P(fill 15s)", fmt(execution.p_fill_15s, 2)),
+        metricCard("P(fill 30s)", fmt(execution.p_fill_30s, 2)),
+        metricCard("P(fill 60s)", fmt(execution.p_fill_60s != null
+          ? execution.p_fill_60s : execution.p_fill, 2)),
+        metricCard("Fees", fmt(execution.entry_fees, 4)),
+        metricCard("Exit cost", fmt(execution.expected_exit_slippage, 4)),
+        metricCard("Stop cost", fmt(execution.expected_stop_slippage, 4)),
+      ].join("");
+    }
+
+    const sev = String(model.drift_severity || p3.drift_severity || "—").toUpperCase();
+    if ($("v3-drift-sev")) $("v3-drift-sev").textContent = sev === "—" ? "—" : sev;
+    if ($("v3-model-metrics")) {
+      $("v3-model-metrics").innerHTML = [
+        metricCard("Mode", esc(mode)),
+        metricCard("Drift", esc(sev)),
+        metricCard("Data quality", fmt(
+          model.data_quality != null ? model.data_quality : (live.why || {}).data_quality, 2)),
+        metricCard("Load", esc(model.load_status || (p3.note ? "waiting" : "ok"))),
+      ].join("");
+    }
+    if ($("v3-model-chips")) {
+      const chips = [];
+      Object.entries(versions).forEach(([k, v]) => {
+        chips.push(`<span class="chip mono">${esc(k)} ${esc(String(v))}</span>`);
+      });
+      (model.registry_statuses || []).slice(0, 4).forEach((st) => {
+        chips.push(`<span class="chip">${esc(String(st))}</span>`);
+      });
+      $("v3-model-chips").innerHTML = chips.join("") || '<span class="chip">no model metadata yet</span>';
+    }
+  }
+
   let activeTab = "legacy";
 
   function switchTab(tab) {
     activeTab = tab;
     $("tab-legacy").classList.toggle("active", tab === "legacy");
-    $("tab-v2").classList.toggle("active", tab === "v2");
+    $("tab-v3").classList.toggle("active", tab === "v3");
     $("tab-prediction").classList.toggle("active", tab === "prediction");
     $("tab-journal").classList.toggle("active", tab === "journal");
     $("tab-validation").classList.toggle("active", tab === "validation");
     $("tab-learning").classList.toggle("active", tab === "learning");
     $("view-legacy").classList.toggle("hidden", tab !== "legacy");
-    $("view-v2").classList.toggle("hidden", tab !== "v2");
+    $("view-v3").classList.toggle("hidden", tab !== "v3");
     $("view-prediction").classList.toggle("hidden", tab !== "prediction");
     $("view-journal").classList.toggle("hidden", tab !== "journal");
     $("view-validation").classList.toggle("hidden", tab !== "validation");
@@ -2344,7 +2482,7 @@
         if (legacy.length || v2.length) {
           parts.push('<h3 class="val-h3">Feature contributions (r vs realized P&amp;L)</h3>'
             + `<div class="val-track-split">${col("Legacy engine", legacy, "No legacy correlations yet")}`
-            + `${col("V2 / policy / phys / GEX", v2, "No V2 correlations yet — need settled ticks with V2 signals")}</div>`);
+            + `${col("V3 / policy / phys / GEX", v2, "No V3 correlations yet — need settled ticks with V3 signals")}</div>`);
         }
       }
     }
@@ -2445,8 +2583,8 @@
     const mode = v2.mode || s.policy_mode || "—";
     $("lrn-v2-sub").textContent = mode;
     if (!live || (!live.ts && !Object.keys(s).length && !v2.mode)) {
-      el.innerHTML = '<p class="empty">No live V2 observation yet — Learning stays empty until '
-        + '<span class="mono">adaptive_learning.learner</span> runs; V2 status appears once the shadow pipeline ticks</p>';
+      el.innerHTML = '<p class="empty">No live V3 observation yet — Learning stays empty until '
+        + '<span class="mono">adaptive_learning.learner</span> runs; V3 status appears once the shadow pipeline ticks</p>';
       $("lrn-v2-chips").innerHTML = "";
       return;
     }
@@ -2454,8 +2592,8 @@
     const fallback = num(v2.fallback_used) === 1 || num(s.policy_fallback_used) === 1;
     el.innerHTML = [
       metricCard("Policy mode", esc(mode)),
-      metricCard("V2 structure", esc(v2.structure || s.v2_policy_structure || "—")),
-      metricCard("V2 action", esc(v2.action || s.v2_policy_action || "—")),
+      metricCard("V3 structure", esc(v2.structure || s.v2_policy_structure || "—")),
+      metricCard("V3 action", esc(v2.action || s.v2_policy_action || "—")),
       metricCard("Confidence", fmt(v2.confidence != null ? v2.confidence : s.v2_policy_confidence, 2)),
       metricCard("Source", esc(v2.source || s.policy_source || "—"),
         fallback ? "warn" : ""),
@@ -2917,7 +3055,7 @@
   function boot() {
     showApp();
     $("tab-legacy").addEventListener("click", () => switchTab("legacy"));
-    $("tab-v2").addEventListener("click", () => switchTab("v2"));
+    $("tab-v3").addEventListener("click", () => switchTab("v3"));
     $("tab-prediction").addEventListener("click", () => switchTab("prediction"));
     $("tab-journal").addEventListener("click", () => switchTab("journal"));
     $("tab-validation").addEventListener("click", () => switchTab("validation"));
