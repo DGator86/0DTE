@@ -152,6 +152,18 @@ CREATE TABLE IF NOT EXISTS structural_states (
     structural_version TEXT NOT NULL,
     state_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS regime_outputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    probabilities_json TEXT NOT NULL,
+    uncertainty REAL,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_regime_snapshot
+ON regime_outputs(snapshot_id);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -465,6 +477,52 @@ class PredictionStore:
                 row["state"] = json.loads(row.pop("state_json") or "{}")
             except (json.JSONDecodeError, TypeError):
                 row["state"] = {}
+            out.append(row)
+        return out
+
+    # ---- regime outputs (V3 Part 2 §35 / PR 9) ---------------------------------
+    def log_regime_output(
+        self,
+        snapshot_id: str,
+        model_version: str,
+        probabilities: dict,
+        *,
+        uncertainty: Optional[float] = None,
+        generated_at: Optional[str] = None,
+        mode: str = "shadow",
+    ) -> int:
+        self.require_schema()
+        import datetime as _dt
+        generated_at = generated_at or _dt.datetime.now(
+            _dt.timezone.utc).isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO regime_outputs "
+            "(snapshot_id, model_version, probabilities_json, uncertainty, "
+            "generated_at, mode) VALUES (?,?,?,?,?,?)",
+            (snapshot_id, model_version, _canonical_json(probabilities),
+             uncertainty, generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_regime_outputs(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM regime_outputs"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["probabilities"] = json.loads(
+                    row.pop("probabilities_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["probabilities"] = {}
             out.append(row)
         return out
 
