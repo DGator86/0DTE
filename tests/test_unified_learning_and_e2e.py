@@ -100,7 +100,14 @@ def test_joint_promotion_requires_human():
         current_status="candidate",
         proposed_status="champion",
         legacy_rule_config_id="rule1",
-        model_artifact_ids={"group": "g1"},
+        model_artifact_ids={
+            "group": "g1",
+            "candidate_value": "cv1",
+            "candidate_rank": "cr1",
+            "fill_probability": "fp1",
+            "fill_concession": "fc1",
+            "meta": "mm1",
+        },
         feature_version="v2.0.0",
         label_version="v2.0.0",
         configuration_hash="abc",
@@ -116,6 +123,7 @@ def test_joint_promotion_requires_human():
     approved = approve_promotion(
         pkt, reviewer="alice", approval_note="looks good")
     assert approved["approved"] is True
+    assert approved["review_id"]
 
 
 def test_shadow_cannot_skip_to_champion():

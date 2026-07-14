@@ -14,7 +14,9 @@ def test_midpoint_not_assumed_fill():
         n_legs=2,
     )
     assert float(est.p_fill) < 1.0
-    assert float(est.expected_credit) != float(est.mid_credit) or True
+    # Expected executable credit must concede toward natural — never mid.
+    assert float(est.expected_credit) < float(est.mid_credit)
+    assert float(est.expected_credit) >= float(est.natural_credit) - 1e-9
     assert est.fallback_level == "deterministic_prior"
 
 

@@ -103,6 +103,83 @@ class UnifiedDecisionStack:
             }
             forecast = None
 
+        if mode in ("candidate", "champion") and forecast is None:
+            # Fail closed — do not continue into candidate economics with
+            # invented uncertainty / probability defaults.
+            v3_result = {
+                "statistical_action": "UNAVAILABLE",
+                "final_action": "UNAVAILABLE",
+                "candidate_id": None,
+                "reasons": ("forecast_unavailable",),
+            }
+            # Still need legacy action for disagreement / fallback routing
+            legacy_action = "NO_EDGE"
+            legacy_cand = None
+            legacy_struct = None
+            legacy_dir = None
+            legacy_size = 1.0
+            if legacy_decision is not None:
+                if isinstance(legacy_decision, dict):
+                    legacy_action = str(
+                        legacy_decision.get("action")
+                        or legacy_decision.get("final_action")
+                        or "NO_EDGE")
+                    legacy_cand = legacy_decision.get("candidate_id")
+                    legacy_struct = legacy_decision.get("structure")
+                    legacy_dir = legacy_decision.get("direction")
+                    legacy_size = float(
+                        legacy_decision.get("size_mult") or 1.0)
+            hard = tuple(hard_vetoes or ())
+            auth = resolve_authority(
+                mode=mode,
+                legacy_decision={
+                    "action": legacy_action,
+                    "candidate_id": legacy_cand,
+                    "structure": legacy_struct,
+                    "direction": legacy_dir,
+                    "size_mult": legacy_size,
+                },
+                v3_decision=v3_result,
+                hard_vetoes=hard,
+                fallback_policy=fallback_policy,
+                legacy_size_mult=legacy_size,
+                v3_size_mult=0.0,
+            )
+            record = UnifiedDecisionRecord(
+                snapshot_id=str(snapshot_id),
+                ts=str(ts),
+                session_date=str(session_date),
+                symbol=str(symbol),
+                deployment_id=str(dep_id),
+                deployment_mode=str(mode),
+                authority_source=auth.authority_source,
+                legacy_action=legacy_action,
+                legacy_candidate_id=legacy_cand,
+                legacy_structure=legacy_struct,
+                legacy_direction=legacy_dir,
+                legacy_size_mult=legacy_size,
+                v3_statistical_action="UNAVAILABLE",
+                v3_final_action="UNAVAILABLE",
+                selected_candidate_id=auth.selected_candidate_id,
+                final_action=auth.final_action,
+                final_structure=auth.final_structure,
+                final_direction=auth.final_direction,
+                final_size_mult=auth.final_size_mult,
+                hard_vetoes=hard,
+                reasons=tuple(auth.reasons) + ("forecast_unavailable",),
+                fallback_used=auth.fallback_used,
+                fallback_reason=auth.fallback_reason or "forecast_unavailable",
+                forecast_summary={},
+                configuration_hash=str(cfg_hash),
+                diagnostics=diagnostics,
+            )
+            if self.persist_fn is not None:
+                try:
+                    self.persist_fn(record, snapshot=snapshot)
+                except Exception as exc:
+                    diagnostics["persist_error"] = str(exc)
+            return record
+
         # 5. Candidate universe once
         if self.candidate_universe_fn is not None:
             universe = self.candidate_universe_fn(snapshot, forecast=forecast)

@@ -19,7 +19,7 @@ import os
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 DEPLOYMENT_MODES = (
     "research", "shadow", "advisory", "candidate", "champion",
@@ -370,6 +370,13 @@ def validate_deployment_bundle(bundle: DeploymentBundle) -> None:
             raise DeploymentError(
                 f"mode {bundle.mode!r} requires trained artifacts; "
                 f"missing: {missing}")
+    if str(bundle.mode).lower() == "champion":
+        if not bundle.approved_review_id:
+            raise DeploymentError(
+                "champion mode requires approved_review_id")
+        if not bundle.rollback_deployment_id:
+            raise DeploymentError(
+                "champion mode requires rollback_deployment_id")
 
 
 def assert_mode_permission(artifact_status: str, load_mode: str) -> None:
@@ -466,11 +473,14 @@ def rollback_deployment(
     prior_pointer: dict,
     reason: str,
     trigger_source: str = "human",
+    registry: Any = None,
 ) -> dict:
     """
     Atomic pointer replacement to a prior deployment. Does not retrain.
     Validates the prior as a complete DeploymentBundle and verifies
     referenced model IDs are present in the pointer payload.
+    When ``registry`` is provided, also verifies each referenced artifact
+    still exists on disk.
     Returns audit record.
     """
     validate_deployment_pointer(prior_pointer)
@@ -483,9 +493,28 @@ def rollback_deployment(
             "candidate_rank_model_id", "fill_probability_model_id",
             "fill_concession_model_id", "meta_model_id",
         ):
-            if not getattr(prior_bundle, attr):
+            mid = getattr(prior_bundle, attr)
+            if not mid:
                 raise DeploymentError(
                     f"rollback target missing required {attr}")
+            if registry is not None:
+                exists = False
+                if hasattr(registry, "exists"):
+                    exists = bool(registry.exists(mid))
+                elif hasattr(registry, "get"):
+                    try:
+                        exists = registry.get(mid) is not None
+                    except Exception:
+                        exists = False
+                elif hasattr(registry, "load"):
+                    try:
+                        exists = registry.load(mid) is not None
+                    except Exception:
+                        exists = False
+                if not exists:
+                    raise DeploymentError(
+                        f"rollback target artifact missing from registry: "
+                        f"{attr}={mid!r}")
     previous = None
     if os.path.exists(path):
         try:

@@ -248,15 +248,40 @@ class ShadowRunner:
                 self.deployment_bundle = bundle
                 self.prediction_runtime = runtime
 
+                # One authority state machine: reject CLI policy_mode that
+                # disagrees with the deployment bundle mode.
+                dep_mode = str(bundle.mode or "shadow").lower()
+                pm = str(policy_mode or "shadow").lower()
+                if pm == "champion" and dep_mode != "champion":
+                    raise DeploymentError(
+                        f"policy_mode=champion inconsistent with "
+                        f"deployment mode={dep_mode!r}; refuse dual authority")
+                if dep_mode == "champion" and pm not in ("champion", "shadow"):
+                    raise DeploymentError(
+                        f"policy_mode={pm!r} inconsistent with "
+                        f"deployment mode=champion")
+                # When unified stack is active, V2 policy stays journal-only
+                # (shadow) so it cannot mutate the legacy baseline before the
+                # stack's authority router runs. Champion notifications use
+                # authoritative_decision from the stack.
+                if dep_mode in ("candidate", "champion", "advisory", "shadow"):
+                    policy_mode = "shadow"
+                self.policy_mode = policy_mode
+
                 def _persist(record, snapshot=None, universe=None,
                              forecast=None, v3_result=None):
                     from decision_stack.persistence import (
                         persist_unified_decision,
                     )
+                    evaluations = None
+                    if v3_result is not None:
+                        evaluations = getattr(v3_result, "evaluations", None)
+                        if evaluations is None and isinstance(v3_result, dict):
+                            evaluations = v3_result.get("evaluations")
                     persist_unified_decision(
                         self._prediction_store, record,
                         snapshot=snapshot, universe=universe,
-                        forecast=forecast,
+                        forecast=forecast, evaluations=evaluations,
                     )
 
                 self.decision_stack = UnifiedDecisionStack(
@@ -550,12 +575,25 @@ class ShadowRunner:
               and result.decision.gate_pass):
             notify_trade = True
         if notify_trade:
-            ticket = Ticket.from_tick_result(result, self.symbol)
+            # Prefer authoritative unified candidate; fall back to legacy.
+            ticket = Ticket.from_unified_decision(result, self.symbol)
+            if ticket is None:
+                ticket = Ticket.from_tick_result(result, self.symbol)
             self._notifier.send(ticket)
 
-        # Drive the reference paper broker (legacy / shadow authority).
+        # Reference paper account: legacy (+ v2) only when a separate
+        # candidate account exists — never duplicate V3 fills into both DBs.
         try:
-            for ev in self._paper.on_tick(now, result):
+            if self._candidate_paper is not None:
+                ref_intents = [
+                    i for i in (result.paper_intents or [])
+                    if str(i.get("track") or "").lower() != "v3"
+                ]
+                ref_result = dataclasses.replace(
+                    result, paper_intents=ref_intents)
+            else:
+                ref_result = result
+            for ev in self._paper.on_tick(now, ref_result):
                 log.info("  %s  (paper equity=$%.2f)", ev, self._paper.cash)
         except Exception as exc:
             log.warning("paper broker error: %s", exc)

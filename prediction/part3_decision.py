@@ -182,6 +182,31 @@ def build_v3_candidate_evaluations(
     utilities: dict[str, float] = {}
     evaluations: list[CandidateEvaluation] = []
     cand_by_id: dict[str, Any] = {}
+    adapted_by_id: dict[str, dict] = {}
+
+    # Batch typed candidate-value inference when a trained model is present.
+    if value_model is not None and hasattr(value_model, "predict_v3"):
+        try:
+            from prediction.adapters import (
+                AdapterError, adapt_candidate_forecast_v3, candidate_value_rows,
+            )
+            rows, ids = candidate_value_rows(candidates)
+            preds = value_model.predict_v3(rows, candidate_ids=ids)
+            for pred in preds:
+                adapted = adapt_candidate_forecast_v3(pred)
+                adapted_by_id[adapted["candidate_id"]] = adapted
+        except Exception as exc:
+            if mode in ("candidate", "champion"):
+                return tuple(
+                    CandidateEvaluation(
+                        candidate_id=str(
+                            _cand_field(c, "candidate_id")
+                            or _cand_field(c, "v2_candidate_id") or ""),
+                        vetoes=("candidate_value_unusable",),
+                        diagnostics={"error": f"{type(exc).__name__}: {exc}"},
+                    )
+                    for c in candidates
+                )
 
     for c in candidates:
         cid = str(
@@ -195,41 +220,18 @@ def build_v3_candidate_evaluations(
         expected_net = None
         p_pos = None
         util = None
+        pnl_quantiles: dict = {}
+        expected_shortfall = None
         model_versions: dict = {}
 
-        if value_model is not None:
-            try:
-                if hasattr(value_model, "predict_v3"):
-                    pred = value_model.predict_v3([_as_rank_dict(c)])
-                elif hasattr(value_model, "predict"):
-                    pred = value_model.predict([_as_rank_dict(c)])
-                else:
-                    pred = None
-                if pred is not None:
-                    first = pred[0] if isinstance(pred, (list, tuple)) else pred
-                    expected_net = float(
-                        getattr(first, "expected_net_pnl", None)
-                        or getattr(first, "expected_pnl", None)
-                        or 0)
-                    p_pos = float(
-                        getattr(first, "p_positive_pnl", None)
-                        or getattr(first, "p_positive", None)
-                        or 0.5)
-                    util = float(
-                        getattr(first, "utility", None)
-                        or getattr(first, "absolute_utility", None)
-                        or expected_net)
-                    model_versions["candidate_value"] = "trained"
-            except Exception as exc:
-                model_versions["candidate_value"] = f"failed:{type(exc).__name__}"
-                if mode in ("candidate", "champion"):
-                    evaluations.append(CandidateEvaluation(
-                        candidate_id=cid,
-                        vetoes=("candidate_value_unusable",),
-                        model_versions=model_versions,
-                        diagnostics={"error": str(exc)},
-                    ))
-                    continue
+        adapted = adapted_by_id.get(cid)
+        if adapted is not None:
+            expected_net = adapted["expected_net_pnl"]
+            p_pos = adapted["p_positive_pnl"]
+            util = adapted["absolute_utility"]
+            pnl_quantiles = dict(adapted["pnl_quantiles"])
+            expected_shortfall = adapted["expected_shortfall"]
+            model_versions.update(adapted["model_versions"])
 
         if util is None:
             # Labeled baseline from legacy EV — research/shadow only.
@@ -265,6 +267,8 @@ def build_v3_candidate_evaluations(
                 float(legacy_pop) if legacy_pop is not None else None),
             expected_net_pnl=expected_net,
             p_positive_pnl=p_pos,
+            pnl_quantiles=pnl_quantiles,
+            expected_shortfall=expected_shortfall,
             absolute_utility=float(util),
             model_versions=model_versions,
         ))
@@ -362,14 +366,25 @@ def build_v3_candidate_evaluations(
                     # Use loaded fill-probability model when fitted.
                     if fill_p_model is not None and getattr(
                             fill_p_model, "fitted", False):
-                        feats = {
-                            "family": fam,
-                            "n_legs": n_legs,
-                            "mid_credit": mid,
-                            "natural_credit": natural,
-                            "relative_spread": (
-                                abs(mid - natural) / max(abs(mid), 1e-9)),
-                        }
+                        from prediction.adapters import (
+                            fill_attempt_features_from_candidate,
+                        )
+                        feats = fill_attempt_features_from_candidate(
+                            candidate=c,
+                            mid_credit=mid,
+                            natural_credit=natural,
+                            family=fam,
+                            n_legs=n_legs,
+                            quote_age_seconds=(
+                                getattr(snapshot, "source_ages_seconds", {})
+                                or {}).get("chain"),
+                            minutes_to_close=(
+                                getattr(snapshot, "raw_features", {})
+                                or {}).get("minutes_to_close"),
+                            data_quality=float(
+                                getattr(forecast, "data_quality", None) or 0.0)
+                            if forecast is not None else None,
+                        )
                         fp = fill_p_model.predict(feats, family=fam)
                         p_fill_arg = float(fp.p_fill_60s)
                         fill_unc = float(fp.uncertainty)
@@ -383,12 +398,16 @@ def build_v3_candidate_evaluations(
                     # Use loaded fill-concession model when fitted.
                     if fill_c_model is not None and getattr(
                             fill_c_model, "fitted", False):
-                        feats = {
-                            "family": fam,
-                            "n_legs": n_legs,
-                            "mid_credit": mid,
-                            "natural_credit": natural,
-                        }
+                        from prediction.adapters import (
+                            fill_attempt_features_from_candidate,
+                        )
+                        feats = fill_attempt_features_from_candidate(
+                            candidate=c,
+                            mid_credit=mid,
+                            natural_credit=natural,
+                            family=fam,
+                            n_legs=n_legs,
+                        )
                         fc = fill_c_model.predict(
                             feats, family=fam, n_legs=n_legs)
                         exp_frac = float(fc.expected_fill_fraction)
@@ -495,6 +514,22 @@ def build_v3_decision(
     Full Part 3 path: value → utility → rank → fill → EOV → meta → hard veto.
     """
     errors: dict = {}
+    if mode in ("candidate", "champion") and forecast is None:
+        return V3DecisionResult(
+            statistical_action="UNAVAILABLE",
+            final_action="UNAVAILABLE",
+            reasons=("forecast_unavailable",),
+            component_errors={"forecast": "None"},
+        )
+    if mode in ("candidate", "champion"):
+        # Do not invent default uncertainty/OOD when forecast fields missing.
+        if getattr(forecast, "uncertainty", None) is None:
+            return V3DecisionResult(
+                statistical_action="UNAVAILABLE",
+                final_action="UNAVAILABLE",
+                reasons=("forecast_uncertainty_unavailable",),
+            )
+
     missing = _required_part3_missing(runtime)
     if mode in ("candidate", "champion") and missing:
         return V3DecisionResult(

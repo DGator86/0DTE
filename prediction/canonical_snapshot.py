@@ -146,6 +146,130 @@ def _reject_future_sources(
                 f"future-dated source {name!r}: {src_ts!r} > {prediction_ts!r}")
 
 
+def compute_source_ages_seconds(
+    prediction_ts: str,
+    source_timestamps: Mapping[str, Any],
+) -> dict:
+    """Age of each source relative to prediction_ts (seconds). Missing → omit."""
+    import datetime as _dt
+    pred = _parse_ts(prediction_ts)
+    if pred is None:
+        return {}
+    ages: dict = {}
+    for name, src_ts in (source_timestamps or {}).items():
+        if src_ts is None or src_ts == "":
+            continue
+        try:
+            src = _parse_ts(src_ts)
+        except CanonicalSnapshotError:
+            continue
+        if src is None:
+            continue
+        ages[str(name)] = max(0.0, (pred - src).total_seconds())
+    return ages
+
+
+def extract_source_timestamps(
+    *,
+    now_iso: str,
+    bars: Any = None,
+    chain: Any = None,
+    market: Any = None,
+    signals: Optional[Mapping[str, Any]] = None,
+) -> dict:
+    """
+    Best-effort real source timestamps (never invent now for bars/chain).
+
+    Missing sources are omitted so ages stay honest rather than zero-age fakes.
+    """
+    import datetime as _dt
+    out: dict = {}
+    # Last completed bar
+    if bars is not None and getattr(bars, "ts", None) is not None:
+        try:
+            import numpy as np
+            arr = np.asarray(bars.ts)
+            if len(arr):
+                last = arr[-1]
+                if isinstance(last, _dt.datetime):
+                    py = last
+                elif hasattr(last, "isoformat") and not isinstance(
+                        last, (np.datetime64, np.generic)):
+                    ts_s = last.isoformat()
+                    py = None
+                    try:
+                        _parse_ts(ts_s)
+                        out["bars"] = ts_s
+                    except CanonicalSnapshotError:
+                        py = None
+                else:
+                    # numpy datetime64 → python datetime
+                    try:
+                        converted = np.asarray(last).astype(
+                            "datetime64[us]").astype(object)
+                        py = converted.item() if hasattr(
+                            converted, "item") else converted
+                    except Exception:
+                        py = None
+                    if not isinstance(py, _dt.datetime):
+                        py = None
+                if isinstance(py, _dt.datetime):
+                    if py.tzinfo is None:
+                        try:
+                            from zoneinfo import ZoneInfo
+                            py = py.replace(tzinfo=ZoneInfo("America/New_York"))
+                        except Exception:
+                            py = py.replace(tzinfo=_dt.timezone.utc)
+                    try:
+                        s = py.isoformat()
+                        _parse_ts(s)
+                        out["bars"] = s
+                    except CanonicalSnapshotError:
+                        pass
+        except Exception:
+            pass
+
+    # Chain quote timestamp if the feed attached one
+    for attr in ("as_of", "quote_ts", "fetched_at", "ts", "timestamp"):
+        val = getattr(chain, attr, None) if chain is not None else None
+        if val is None and isinstance(chain, dict):
+            val = chain.get(attr)
+        if val is None:
+            continue
+        try:
+            if hasattr(val, "isoformat"):
+                s = val.isoformat()
+            else:
+                s = str(val)
+            _parse_ts(s)
+            out["chain"] = s
+            break
+        except Exception:
+            continue
+
+    # GEX / structural ages from market or signals when present
+    for key, dest in (
+        ("gex_as_of", "gex"),
+        ("gex_ts", "gex"),
+        ("feed_as_of", "feed"),
+    ):
+        val = None
+        if market is not None:
+            val = getattr(market, key, None)
+        if val is None and signals:
+            val = signals.get(key)
+        if val is None:
+            continue
+        try:
+            s = val.isoformat() if hasattr(val, "isoformat") else str(val)
+            _parse_ts(s)
+            out[dest] = s
+        except Exception:
+            continue
+
+    return out
+
+
 def build_canonical_snapshot(
     *,
     symbol: str,
@@ -180,6 +304,9 @@ def build_canonical_snapshot(
 
     src_ts = dict(source_timestamps or {})
     _reject_future_sources(ts, src_ts)
+    ages = dict(source_ages_seconds or {})
+    if not ages and src_ts:
+        ages = compute_source_ages_seconds(ts, src_ts)
 
     miss = dict(missingness or {})
     # Derive missingness for raw features when not provided.
@@ -213,7 +340,7 @@ def build_canonical_snapshot(
         standardized_features=std,
         missingness=miss,
         source_timestamps=src_ts,
-        source_ages_seconds=dict(source_ages_seconds or {}),
+        source_ages_seconds=ages,
         quality=dict(quality or {}),
         structural_sources=dict(structural_sources or {}),
         structural_state=structural_state,

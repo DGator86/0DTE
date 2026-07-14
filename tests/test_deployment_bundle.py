@@ -63,8 +63,16 @@ def test_champion_requires_trained_artifacts():
     b = _bundle(mode="champion", prediction_model_group_id=None,
                 candidate_value_model_id=None, candidate_rank_model_id=None,
                 fill_probability_model_id=None, fill_concession_model_id=None,
-                meta_model_id=None)
+                meta_model_id=None, approved_review_id="rev-1",
+                rollback_deployment_id="prior")
     with pytest.raises(DeploymentError, match="requires trained"):
+        validate_deployment_bundle(b)
+
+
+def test_champion_requires_approved_review_id():
+    b = _bundle(mode="champion", approved_review_id=None,
+                rollback_deployment_id="prior")
+    with pytest.raises(DeploymentError, match="approved_review_id"):
         validate_deployment_bundle(b)
 
 

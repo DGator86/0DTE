@@ -746,30 +746,55 @@ class UnifiedOrchestrator:
                     "reason": "prediction_policy",
                 })
 
-        # ---- V3 (Part 3 TradeDecisionV3) ----
+        # ---- V3 (unified stack / Part 3 TradeDecisionV3) ----
+        # Prefer the post-stack unified V3 decision so paper intents are built
+        # AFTER authority resolution — never from a stale pre-stack summary.
+        v3 = getattr(self, "_tick_unified_v3", None) or {}
         part3 = getattr(self, "_tick_part3", None) or {}
         ds = part3.get("decision_summary") or {}
-        # Use statistical_action so regime stand-down overlay doesn't erase
-        # the prediction-engine decision we want to paper-trade.
-        v3_action = str(ds.get("statistical_action") or ds.get("action") or "").upper()
+        v3_action = str(
+            v3.get("final_action")
+            or part3.get("final_action")
+            or ds.get("statistical_action")
+            or ds.get("action")
+            or ""
+        ).upper()
         if v3_action == "TRADE":
-            cid = ds.get("selected_candidate_id")
+            cid = (
+                v3.get("candidate_id")
+                or part3.get("selected_candidate_id")
+                or ds.get("selected_candidate_id")
+            )
             v3_cand = self._pick_shadow_candidate(
                 candidate_id=cid,
-                family=ds.get("family") or (part3.get("ranking") or {}).get("top_family"),
+                family=(
+                    v3.get("structure")
+                    or ds.get("family")
+                    or (part3.get("ranking") or {}).get("top_family")
+                ),
             )
             if v3_cand is not None:
+                auth = getattr(self, "_tick_authoritative", None) or {}
+                size = float(
+                    auth.get("size_mult")
+                    if auth.get("size_mult") is not None
+                    else (final_size_mult or 1.0)
+                ) or 1.0
                 intents.append({
                     "track": "v3",
                     "candidate": v3_cand,
-                    "size_mult": float(final_size_mult or 1.0) or 1.0,
+                    "size_mult": size,
                     "gate_kelly": None,
                     "gate_score": None,
-                    "structure": ds.get("family"),
-                    "direction": ds.get("direction") or signals.get("v2_policy_direction"),
+                    "structure": (
+                        v3.get("structure") or ds.get("family")),
+                    "direction": (
+                        v3.get("direction")
+                        or ds.get("direction")
+                        or signals.get("v2_policy_direction")),
                     "candidate_id": cid,
                     "v3_action": v3_action,
-                    "reason": "part3_meta",
+                    "reason": "unified_v3",
                 })
 
         return intents
@@ -1080,6 +1105,86 @@ class UnifiedOrchestrator:
             "size_mult": float(final_size_mult or 0.0),
         }
 
+    def _deployment_mode(self) -> str:
+        dep = getattr(self, "deployment_bundle", None)
+        if dep is not None:
+            return str(getattr(dep, "mode", "shadow") or "shadow").lower()
+        return str(getattr(self, "policy_mode", "shadow") or "shadow").lower()
+
+    def _unified_unavailable_fields(
+            self, *, reason: str, decision=None, intent=None,
+            final_size_mult: float = 0.0, snapshot_id: str = "",
+            exc: Optional[BaseException] = None) -> dict:
+        """Fail-closed TickResult unified fields for candidate/champion."""
+        mode = self._deployment_mode()
+        dep = getattr(self, "deployment_bundle", None)
+        dep_id = getattr(dep, "deployment_id", None) if dep else None
+        legacy = self._legacy_decision_dict(
+            decision, intent, snapshot_id, final_size_mult)
+        reasons = [reason]
+        if exc is not None:
+            reasons.append(f"{type(exc).__name__}:{exc}")
+        # Apply deployment fallback for authoritative action.
+        fallback = str(
+            getattr(dep, "fallback_policy", "abstain") if dep else "abstain"
+        ).lower()
+        if fallback == "legacy":
+            auth_action = legacy.get("action") or "NO_EDGE"
+            auth_cid = legacy.get("candidate_id")
+            auth_struct = legacy.get("structure")
+            auth_dir = legacy.get("direction")
+            auth_size = float(legacy.get("size_mult") or 0.0)
+            fallback_used = True
+            authority = "legacy_fallback"
+        else:
+            auth_action = "UNAVAILABLE"
+            auth_cid = None
+            auth_struct = None
+            auth_dir = None
+            auth_size = 0.0
+            fallback_used = False
+            authority = "v3_unavailable"
+        v3 = {
+            "statistical_action": "UNAVAILABLE",
+            "final_action": "UNAVAILABLE",
+            "candidate_id": None,
+            "structure": None,
+            "direction": None,
+            "reasons": tuple(reasons),
+        }
+        part3_payload = {
+            **(getattr(self, "_tick_part3", None) or {}),
+            "statistical_action": "UNAVAILABLE",
+            "final_action": "UNAVAILABLE",
+            "selected_candidate_id": None,
+            "authority_source": authority,
+            "deployment_id": dep_id,
+            "deployment_mode": mode,
+            "fallback_used": fallback_used,
+            "reasons": reasons,
+            "mode": mode,
+            "shadow_label": f"{mode.upper()} — UNAVAILABLE ({reason})",
+        }
+        self._tick_part3 = part3_payload
+        self._tick_unified_v3 = v3
+        self._tick_authoritative = {
+            "final_action": auth_action,
+            "selected_candidate_id": auth_cid,
+            "structure": auth_struct,
+            "direction": auth_dir,
+            "size_mult": auth_size,
+        }
+        return {
+            "legacy_decision": legacy,
+            "v3_decision": v3,
+            "authoritative_decision": self._tick_authoritative,
+            "authority_source": authority,
+            "deployment_id": dep_id,
+            "fallback_used": fallback_used,
+            "candidate_universe_summary": None,
+            "part3": part3_payload,
+        }
+
     def _evaluate_unified_stack(
             self, *, snap, now, snapshot_id: str, signals: dict,
             intent, regime_state, decision, final_size_mult: float,
@@ -1087,28 +1192,52 @@ class UnifiedOrchestrator:
         """
         Run UnifiedDecisionStack when configured. Builds one CanonicalSnapshot
         and one CandidateUniverse from the shared select_spreads enumeration.
-        Returns a dict of TickResult unified-field kwargs (empty if no stack).
+
+        Returns TickResult unified-field kwargs. In candidate/champion mode,
+        failures never return {} — they return UNAVAILABLE (or legacy fallback
+        when fallback_policy=legacy).
         """
         stack = getattr(self, "decision_stack", None)
         if stack is None:
             return {}
+        mode = self._deployment_mode()
+        strict = mode in ("candidate", "champion")
+
         try:
-            from prediction.canonical_snapshot import build_canonical_snapshot
+            from prediction.canonical_snapshot import (
+                build_canonical_snapshot,
+                compute_source_ages_seconds,
+                extract_source_timestamps,
+            )
             from prediction.candidate_universe import build_candidate_universe
             from prediction.inference import live_feature_row
         except Exception as exc:
             log.warning("unified stack imports failed: %s", exc)
+            if strict:
+                return self._unified_unavailable_fields(
+                    reason="unified_import_failed", decision=decision,
+                    intent=intent, final_size_mult=final_size_mult,
+                    snapshot_id=snapshot_id, exc=exc)
             return {}
 
         try:
             row = live_feature_row(snap, signals)
             ts_iso = now.astimezone(ET).isoformat()
             session_date = now.astimezone(ET).date().isoformat()
+            src_ts = extract_source_timestamps(
+                now_iso=ts_iso,
+                bars=getattr(snap, "bars", None),
+                chain=getattr(snap, "chain", None),
+                market=getattr(snap, "market", None),
+                signals=signals,
+            )
+            ages = compute_source_ages_seconds(ts_iso, src_ts)
             canon = build_canonical_snapshot(
                 symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
                 ts=ts_iso,
                 session_date=session_date,
                 market=snap.market,
+                bars=getattr(snap, "bars", None),
                 chain=getattr(snap, "chain", None),
                 raw_features=row,
                 snapshot_id=snapshot_id,
@@ -1116,10 +1245,8 @@ class UnifiedOrchestrator:
                     "data_quality": float(signals.get("data_quality") or 0.85),
                     "feature_coverage": min(1.0, len(row) / 40.0),
                 },
-                source_timestamps={
-                    "bars": ts_iso,
-                    "chain": ts_iso if getattr(snap, "chain", None) else None,
-                },
+                source_timestamps=src_ts,
+                source_ages_seconds=ages,
             )
 
             # Shared candidate universe — prefer tick shadow cands, else full enum.
@@ -1157,8 +1284,6 @@ class UnifiedOrchestrator:
             legacy = self._legacy_decision_dict(
                 decision, intent, snapshot_id, final_size_mult)
             hard = tuple(getattr(regime_state, "vetoes", None) or ())
-            # Operational hard vetoes already reflected in legacy NO_EDGE /
-            # risk gates — also pass explicit names when present on signals.
             for key in ("hard_veto", "op_risk_vetoes"):
                 extra = signals.get(key)
                 if isinstance(extra, (list, tuple)):
@@ -1170,7 +1295,6 @@ class UnifiedOrchestrator:
                 hard_vetoes=hard,
             )
 
-            # Prefer unified Part 3 payload for dashboard when available.
             part3_payload = getattr(self, "_tick_part3", None)
             if record is not None:
                 part3_payload = {
@@ -1189,25 +1313,39 @@ class UnifiedOrchestrator:
                         f"{record.deployment_mode.upper()} — "
                         f"authority={record.authority_source}"),
                     "mode": record.deployment_mode,
+                    # Keep decision_summary in sync for paper intents / dashboards
+                    "decision_summary": {
+                        **((part3_payload or {}).get("decision_summary") or {}),
+                        "action": record.v3_final_action,
+                        "statistical_action": record.v3_statistical_action,
+                        "selected_candidate_id": record.v3_candidate_id,
+                        "family": record.v3_structure,
+                        "direction": record.v3_direction,
+                        "reasons": list(record.reasons),
+                    },
                 }
                 self._tick_part3 = part3_payload
 
+            v3 = {
+                "statistical_action": record.v3_statistical_action,
+                "final_action": record.v3_final_action,
+                "candidate_id": record.v3_candidate_id,
+                "structure": record.v3_structure,
+                "direction": record.v3_direction,
+            }
+            auth = {
+                "final_action": record.final_action,
+                "selected_candidate_id": record.selected_candidate_id,
+                "structure": record.final_structure,
+                "direction": record.final_direction,
+                "size_mult": record.final_size_mult,
+            }
+            self._tick_unified_v3 = v3
+            self._tick_authoritative = auth
             return {
                 "legacy_decision": legacy,
-                "v3_decision": {
-                    "statistical_action": record.v3_statistical_action,
-                    "final_action": record.v3_final_action,
-                    "candidate_id": record.v3_candidate_id,
-                    "structure": record.v3_structure,
-                    "direction": record.v3_direction,
-                },
-                "authoritative_decision": {
-                    "final_action": record.final_action,
-                    "selected_candidate_id": record.selected_candidate_id,
-                    "structure": record.final_structure,
-                    "direction": record.final_direction,
-                    "size_mult": record.final_size_mult,
-                },
+                "v3_decision": v3,
+                "authoritative_decision": auth,
                 "authority_source": record.authority_source,
                 "deployment_id": record.deployment_id,
                 "fallback_used": record.fallback_used,
@@ -1216,6 +1354,11 @@ class UnifiedOrchestrator:
             }
         except Exception as exc:
             log.warning("unified decision stack failed: %s", exc)
+            if strict:
+                return self._unified_unavailable_fields(
+                    reason="unified_stack_exception", decision=decision,
+                    intent=intent, final_size_mult=final_size_mult,
+                    snapshot_id=snapshot_id, exc=exc)
             return {}
 
     def tick(self, now: dt.datetime,
@@ -1230,6 +1373,8 @@ class UnifiedOrchestrator:
         self._tick_shadow_cands = []
         self._tick_shadow_forecasts = {}
         self._tick_paper_intents = []
+        self._tick_unified_v3 = None
+        self._tick_authoritative = None
         snapshot_id = self._next_snapshot_id(now)
         cfg = self.engine_cfg or EngineConfig()
 
@@ -1471,7 +1616,13 @@ class UnifiedOrchestrator:
                     signals[k] = v
             # Refresh signals_json so policy provenance lands on the journal.
             signals, signals_json = self._signals_with_ras(signals, ras_results)
-            if str(getattr(policy_route, "mode", "")).lower() == "champion":
+            # Single authority: when UnifiedDecisionStack is wired, V2 champion
+            # must not mutate live structure / stand-down — the stack owns that.
+            apply_v2_champion = (
+                str(getattr(policy_route, "mode", "")).lower() == "champion"
+                and getattr(self, "decision_stack", None) is None
+            )
+            if apply_v2_champion:
                 auth = policy_route.authoritative
                 if auth.action == "NO_TRADE":
                     stand_down_now = True
@@ -1541,6 +1692,12 @@ class UnifiedOrchestrator:
                 p3["decision_summary"] = ds
                 self._tick_part3 = p3
             density_mode_sd = str(signals.get("phys_density_mode") or "vrp")
+            # Unified first — paper intents must read post-stack V3 outputs.
+            unified_fields = self._evaluate_unified_stack(
+                snap=snap, now=now, snapshot_id=snapshot_id, signals=signals,
+                intent=intent, regime_state=regime_state, decision=None,
+                final_size_mult=0.0, decide_pdf=decide_pdf, cfg=cfg,
+            )
             paper_intents = self._build_paper_intents(
                 snap=snap, signals=signals, intent=intent,
                 regime_state=regime_state, decision=None,
@@ -1550,11 +1707,6 @@ class UnifiedOrchestrator:
                 density_moments=density_moments_sd,
                 final_size_mult=0.0,
                 matrix_stand_down=True,
-            )
-            unified_fields = self._evaluate_unified_stack(
-                snap=snap, now=now, snapshot_id=snapshot_id, signals=signals,
-                intent=intent, regime_state=regime_state, decision=None,
-                final_size_mult=0.0, decide_pdf=decide_pdf, cfg=cfg,
             )
             result = TickResult(
                 ts=now, regime=regime_state, intent=intent,
@@ -1734,6 +1886,13 @@ class UnifiedOrchestrator:
 
         pub_signals = {k: v for k, v in signals.items()
                        if not str(k).startswith("_")}
+        # Unified evaluation before paper intents so V3 track uses the
+        # post-stack decision, not a stale Part 3 summary.
+        unified_fields = self._evaluate_unified_stack(
+            snap=snap, now=now, snapshot_id=snapshot_id, signals=signals,
+            intent=intent, regime_state=regime_state, decision=decision,
+            final_size_mult=final_size, decide_pdf=decide_pdf, cfg=cfg,
+        )
         paper_intents = self._build_paper_intents(
             snap=snap, signals=signals, intent=intent,
             regime_state=regime_state, decision=decision,
@@ -1743,11 +1902,6 @@ class UnifiedOrchestrator:
             density_moments=density_moments,
             final_size_mult=final_size,
             matrix_stand_down=matrix_stand_down,
-        )
-        unified_fields = self._evaluate_unified_stack(
-            snap=snap, now=now, snapshot_id=snapshot_id, signals=signals,
-            intent=intent, regime_state=regime_state, decision=decision,
-            final_size_mult=final_size, decide_pdf=decide_pdf, cfg=cfg,
         )
         return TickResult(
             ts=now, regime=regime_state, intent=intent,

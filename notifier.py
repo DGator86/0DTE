@@ -116,6 +116,122 @@ class Ticket:
             contracts_per_1k=contracts,
         )
 
+    @classmethod
+    def from_unified_decision(
+            cls, result, symbol: str,
+            candidate_lookup=None) -> Optional["Ticket"]:
+        """
+        Build a ticket from the authoritative unified decision.
+
+        Uses authoritative_decision + the selected candidate (looked up from
+        paper_intents / candidate_lookup), not the legacy TradeDecision.
+        """
+        auth = getattr(result, "authoritative_decision", None)
+        if not isinstance(auth, dict):
+            return None
+        if str(auth.get("final_action") or "").upper() != "TRADE":
+            return None
+
+        cid = auth.get("selected_candidate_id")
+        cand = None
+        if candidate_lookup is not None and cid is not None:
+            if callable(candidate_lookup):
+                cand = candidate_lookup(cid)
+            elif isinstance(candidate_lookup, dict):
+                cand = candidate_lookup.get(cid)
+        if cand is None:
+            # Prefer the V3 paper intent candidate when present
+            for intent in (getattr(result, "paper_intents", None) or []):
+                if str(intent.get("track") or "").lower() != "v3":
+                    continue
+                if cid is None or str(intent.get("candidate_id") or "") == str(cid):
+                    cand = intent.get("candidate")
+                    if cand is not None:
+                        break
+        if cand is None and getattr(result, "decision", None) is not None:
+            # Last resort: only if legacy candidate id matches authoritative
+            legacy_c = getattr(result.decision, "candidate", None)
+            legacy_id = (
+                getattr(legacy_c, "candidate_id", None)
+                or getattr(legacy_c, "v2_candidate_id", None)
+            ) if legacy_c is not None else None
+            if legacy_c is not None and (
+                    cid is None or str(legacy_id or "") == str(cid)):
+                # Only use legacy cand when authority selected it
+                if str(getattr(result, "authority_source", "") or "") in (
+                        "legacy", "legacy_fallback"):
+                    cand = legacy_c
+        if cand is None:
+            return None
+
+        legs = getattr(cand, "legs", None) or ()
+        short_calls, long_calls, short_puts, long_puts = [], [], [], []
+        for leg in legs:
+            kind = getattr(leg, "kind", None) or (
+                leg.get("kind") if isinstance(leg, dict) else None)
+            qty = getattr(leg, "qty", None)
+            if qty is None and isinstance(leg, dict):
+                qty = leg.get("qty")
+            strike = getattr(leg, "strike", None)
+            if strike is None and isinstance(leg, dict):
+                strike = leg.get("strike")
+            if kind in ("C", "call"):
+                (short_calls if (qty or 0) < 0 else long_calls).append(float(strike))
+            else:
+                (short_puts if (qty or 0) < 0 else long_puts).append(float(strike))
+
+        ml = float(getattr(cand, "max_loss", 0) or 0)
+        contracts = max(1, int(math.floor(1000.0 / (ml * 100)))) if ml > 0 else 1
+        intent = result.intent
+        regime = result.regime
+        size = float(auth.get("size_mult")
+                     if auth.get("size_mult") is not None
+                     else getattr(result, "final_size_mult", 1.0) or 1.0)
+        family = (
+            auth.get("structure")
+            or getattr(cand, "family", None)
+            or "unknown"
+        )
+        direction = (
+            auth.get("direction")
+            or getattr(getattr(intent, "decision", None), "direction", None)
+            or "both"
+        )
+        session_date = ""
+        if hasattr(result, "ts") and result.ts is not None:
+            try:
+                session_date = result.ts.date().isoformat()
+            except Exception:
+                session_date = str(getattr(result.ts, "isoformat", lambda: "")())
+        dec = getattr(result, "decision", None)
+        if dec is not None and getattr(dec, "session_date", None):
+            session_date = str(dec.session_date)
+
+        return cls(
+            ts=result.ts.isoformat(),
+            session_date=session_date,
+            symbol=symbol,
+            dominant_regime=getattr(regime, "dominant_regime", "") or "",
+            exec_regime=getattr(intent, "exec_regime", "") or "",
+            context_regime=getattr(intent, "context_regime", "") or "",
+            direction_bias=getattr(intent, "direction_bias", "") or "",
+            size_mult=size,
+            family=str(family),
+            direction=str(direction),
+            short_calls=sorted(short_calls),
+            long_calls=sorted(long_calls),
+            short_puts=sorted(short_puts),
+            long_puts=sorted(long_puts),
+            credit=round(float(getattr(cand, "credit", 0) or 0), 4),
+            max_loss=round(ml, 4),
+            ev=round(float(getattr(cand, "ev", 0) or 0), 4),
+            ev_per_risk=round(float(getattr(cand, "ev_per_risk", 0) or 0), 4),
+            prob_profit=round(float(getattr(cand, "prob_profit", 0) or 0), 4),
+            gate_score=0.0,
+            theta_per_day=round(float(getattr(cand, "theta", 0) or 0), 4),
+            contracts_per_1k=contracts,
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Formatter                                                                     #

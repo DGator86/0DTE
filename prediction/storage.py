@@ -347,6 +347,62 @@ CREATE TABLE IF NOT EXISTS unified_decisions (
     decision_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS candidate_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    final_rank INTEGER,
+    absolute_utility REAL,
+    expected_net_pnl REAL,
+    p_positive_pnl REAL,
+    expected_shortfall REAL,
+    fill_probability REAL,
+    expected_order_value REAL,
+    vetoes_json TEXT,
+    pnl_quantiles_json TEXT,
+    model_versions_json TEXT,
+    evaluation_json TEXT NOT NULL,
+    UNIQUE(snapshot_id, candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS candidate_execution_estimates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    mid_credit REAL,
+    natural_credit REAL,
+    expected_credit REAL,
+    p_fill REAL,
+    estimate_json TEXT NOT NULL,
+    UNIQUE(snapshot_id, candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS candidate_ranks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    final_rank INTEGER NOT NULL,
+    ranking_uncertainty REAL,
+    UNIQUE(snapshot_id, candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS fill_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    candidate_id TEXT,
+    attempt_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meta_decision_rows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    features_json TEXT,
+    action TEXT,
+    row_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -1270,6 +1326,228 @@ class PredictionStore:
             ),
         )
         self.conn.commit()
+
+    def persist_decision_graph(
+        self,
+        *,
+        snapshot=None,
+        forecast=None,
+        universe=None,
+        evaluations=None,
+        decision=None,
+        fill_attempts=None,
+        meta_row=None,
+    ) -> None:
+        """
+        Atomically persist the learning graph for one tick.
+
+        One transaction covers snapshot, forecast, universe, per-candidate
+        evaluations / ranks / execution estimates, fill attempts, meta row,
+        and the unified decision. A crash mid-write rolls back entirely.
+        """
+        self.require_schema()
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+        def _as_dict(obj):
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj
+            if hasattr(obj, "to_dict"):
+                return obj.to_dict()
+            return dict(obj)
+
+        snap_d = _as_dict(snapshot)
+        fc_d = _as_dict(forecast)
+        uni_d = _as_dict(universe)
+        dec_d = _as_dict(decision)
+        snapshot_id = None
+        for src in (dec_d, snap_d, uni_d, fc_d):
+            if src and src.get("snapshot_id"):
+                snapshot_id = src["snapshot_id"]
+                break
+
+        try:
+            if snap_d is not None:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO canonical_snapshots "
+                    "(snapshot_id, symbol, ts, session_date, feature_version, "
+                    "snapshot_schema_version, raw_features_json, "
+                    "standardized_features_json, missingness_json, "
+                    "source_timestamps_json, source_ages_json, quality_json, "
+                    "snapshot_hash, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        snap_d.get("snapshot_id"), snap_d.get("symbol"),
+                        snap_d.get("ts"), snap_d.get("session_date"),
+                        snap_d.get("feature_version"),
+                        snap_d.get("snapshot_schema_version"),
+                        _canonical_json(snap_d.get("raw_features") or {}),
+                        _canonical_json(
+                            snap_d.get("standardized_features") or {}),
+                        _canonical_json(snap_d.get("missingness") or {}),
+                        _canonical_json(snap_d.get("source_timestamps") or {}),
+                        _canonical_json(
+                            snap_d.get("source_ages_seconds") or {}),
+                        _canonical_json(snap_d.get("quality") or {}),
+                        snap_d.get("snapshot_hash"),
+                        now,
+                    ),
+                )
+            if fc_d is not None:
+                self.conn.execute(
+                    "INSERT INTO forecast_bundles "
+                    "(snapshot_id, deployment_id, model_group_id, "
+                    "forecast_json, uncertainty, ood_score, data_quality, "
+                    "generated_at, mode) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        fc_d.get("snapshot_id") or snapshot_id,
+                        fc_d.get("deployment_id"),
+                        fc_d.get("model_group_id") or (
+                            (fc_d.get("model_versions") or {}).get("group")),
+                        _canonical_json(fc_d),
+                        fc_d.get("uncertainty"),
+                        fc_d.get("ood_score"),
+                        fc_d.get("data_quality"),
+                        now,
+                        fc_d.get("mode"),
+                    ),
+                )
+            if uni_d is not None:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO candidate_universes "
+                    "(snapshot_id, generator_version, configuration_hash, "
+                    "candidate_count, excluded_count, generated_at, "
+                    "diagnostics_json) VALUES (?,?,?,?,?,?,?)",
+                    (
+                        uni_d.get("snapshot_id") or snapshot_id,
+                        uni_d.get("generator_version"),
+                        uni_d.get("generator_configuration_hash")
+                        or uni_d.get("configuration_hash"),
+                        int(uni_d.get("candidate_count") or 0),
+                        int(uni_d.get("excluded_count") or 0),
+                        uni_d.get("generated_at") or now,
+                        _canonical_json(uni_d.get("diagnostics") or {}),
+                    ),
+                )
+            for ev in (evaluations or ()):
+                ed = _as_dict(ev) or {}
+                cid = ed.get("candidate_id")
+                sid = ed.get("snapshot_id") or snapshot_id
+                if not cid or not sid:
+                    continue
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO candidate_evaluations "
+                    "(snapshot_id, candidate_id, final_rank, absolute_utility, "
+                    "expected_net_pnl, p_positive_pnl, expected_shortfall, "
+                    "fill_probability, expected_order_value, vetoes_json, "
+                    "pnl_quantiles_json, model_versions_json, evaluation_json) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        sid, cid, ed.get("final_rank"),
+                        ed.get("absolute_utility"),
+                        ed.get("expected_net_pnl"),
+                        ed.get("p_positive_pnl"),
+                        ed.get("expected_shortfall"),
+                        ed.get("fill_probability"),
+                        ed.get("expected_order_value"),
+                        _canonical_json(ed.get("vetoes") or []),
+                        _canonical_json(ed.get("pnl_quantiles") or {}),
+                        _canonical_json(ed.get("model_versions") or {}),
+                        _canonical_json(ed),
+                    ),
+                )
+                if ed.get("final_rank") is not None:
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO candidate_ranks "
+                        "(snapshot_id, candidate_id, final_rank, "
+                        "ranking_uncertainty) VALUES (?,?,?,?)",
+                        (
+                            sid, cid, int(ed["final_rank"]),
+                            ed.get("ranking_uncertainty"),
+                        ),
+                    )
+                # Execution estimate fields when present on the evaluation
+                if any(ed.get(k) is not None for k in (
+                        "fill_probability", "expected_credit", "mid_credit")):
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO candidate_execution_estimates "
+                        "(snapshot_id, candidate_id, mid_credit, "
+                        "natural_credit, expected_credit, p_fill, "
+                        "estimate_json) VALUES (?,?,?,?,?,?,?)",
+                        (
+                            sid, cid,
+                            ed.get("mid_credit"),
+                            ed.get("natural_credit"),
+                            ed.get("expected_credit") or ed.get(
+                                "expected_fill_credit"),
+                            ed.get("fill_probability"),
+                            _canonical_json(ed.get("diagnostics") or ed),
+                        ),
+                    )
+            for attempt in (fill_attempts or ()):
+                ad = _as_dict(attempt) or {}
+                self.conn.execute(
+                    "INSERT INTO fill_attempts "
+                    "(snapshot_id, candidate_id, attempt_json, created_at) "
+                    "VALUES (?,?,?,?)",
+                    (
+                        ad.get("snapshot_id") or snapshot_id,
+                        ad.get("candidate_id"),
+                        _canonical_json(ad),
+                        now,
+                    ),
+                )
+            if meta_row is not None:
+                md = _as_dict(meta_row) or {}
+                self.conn.execute(
+                    "INSERT INTO meta_decision_rows "
+                    "(snapshot_id, features_json, action, row_json, "
+                    "created_at) VALUES (?,?,?,?,?)",
+                    (
+                        md.get("snapshot_id") or snapshot_id,
+                        _canonical_json(md.get("features") or {}),
+                        md.get("action"),
+                        _canonical_json(md),
+                        now,
+                    ),
+                )
+            if dec_d is not None:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO unified_decisions "
+                    "(snapshot_id, deployment_id, deployment_mode, "
+                    "authority_source, legacy_action, legacy_candidate_id, "
+                    "v3_statistical_action, v3_final_action, v3_candidate_id, "
+                    "final_action, selected_candidate_id, hard_vetoes_json, "
+                    "reasons_json, fallback_used, fallback_reason, "
+                    "configuration_hash, decision_json, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        dec_d.get("snapshot_id") or snapshot_id,
+                        dec_d.get("deployment_id"),
+                        dec_d.get("deployment_mode"),
+                        dec_d.get("authority_source"),
+                        dec_d.get("legacy_action"),
+                        dec_d.get("legacy_candidate_id"),
+                        dec_d.get("v3_statistical_action"),
+                        dec_d.get("v3_final_action"),
+                        dec_d.get("v3_candidate_id"),
+                        dec_d.get("final_action"),
+                        dec_d.get("selected_candidate_id"),
+                        _canonical_json(dec_d.get("hard_vetoes") or []),
+                        _canonical_json(dec_d.get("reasons") or []),
+                        1 if dec_d.get("fallback_used") else 0,
+                        dec_d.get("fallback_reason"),
+                        dec_d.get("configuration_hash"),
+                        _canonical_json(dec_d),
+                        now,
+                    ),
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def settle_sigma_cones(self, now_iso: str, realized_spot: float,
                            *, realized_ts: Optional[str] = None) -> int:
