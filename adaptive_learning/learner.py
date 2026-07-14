@@ -68,6 +68,7 @@ from adaptive_learning.stability import feature_stability, parameter_stability
 @dataclass
 class LearnerConfig:
     db_path: str = "shadow.db"
+    paper_db: str = "paper.sqlite"
     record_dir: str = ""                      # shadow recordings (RecordedFeed)
     configs_dir: str = "configs"
     reports_dir: str = os.path.join("reports", "promotion")
@@ -213,6 +214,13 @@ def run_learning_cycle(cfg: Optional[LearnerConfig] = None,
         log_drift_report(jrn, drift, report_date=report_date)
         diagnoses = diagnose(jrn, include_drift=False) + drift_diagnoses(drift)
         summary["diagnoses"] = [d.to_dict() for d in diagnoses]
+        # Multi-track paper comparison — learning sees legacy/v2/v3 outcomes
+        # even though the optimizer still searches legacy EngineConfig.
+        try:
+            from prediction.track_parity import paper_track_summary
+            summary["paper_tracks"] = paper_track_summary(cfg.paper_db or "")
+        except Exception as exc:
+            summary["paper_tracks"] = {"note": f"unavailable: {exc}"}
 
         # -- 2. hypothesize ---------------------------------------------------
         hypotheses = generate(diagnoses)
@@ -416,6 +424,8 @@ def main() -> None:
     ap.add_argument("--mode", choices=["daily", "evening", "weekly", "manual"],
                     default="manual")
     ap.add_argument("--db", default="shadow.db")
+    ap.add_argument("--paper-db", default="paper.sqlite",
+                    help="paper.sqlite for legacy/v2/v3 track comparison")
     ap.add_argument("--record-dir", default="")
     ap.add_argument("--configs-dir", default="configs")
     ap.add_argument("--reports-dir", default="")
@@ -427,7 +437,8 @@ def main() -> None:
     args = ap.parse_args()
 
     reports_dir = args.reports_dir or os.path.join("reports", "promotion")
-    cfg = LearnerConfig(db_path=args.db, record_dir=args.record_dir,
+    cfg = LearnerConfig(db_path=args.db, paper_db=args.paper_db,
+                        record_dir=args.record_dir,
                         configs_dir=args.configs_dir, reports_dir=reports_dir,
                         search=args.search,
                         n_trials=args.trials, holdout_frac=args.holdout,

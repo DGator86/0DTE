@@ -342,6 +342,13 @@ class PaperBroker:
             self._last_exit_at[track] = now
             self._last_exit_reason[track] = "ras_invalidate"
             self._record(pos, now, credit_now, net_ps, pnl_dollars, "ras_invalidate")
+            on_close = getattr(self, "on_track_close", None)
+            if callable(on_close):
+                try:
+                    on_close(pos, track=track, pnl_dollars=pnl_dollars,
+                             exit_reason="ras_invalidate", closed_at=now)
+                except Exception:
+                    log.exception("on_track_close hook failed")
             self._notify("PAPER EXIT",
                          f"[{track}] {pos.family} {pos.strikes_str()} ras_invalidate "
                          f"(no chain) pnl=${pnl_dollars:+.2f}")
@@ -528,7 +535,10 @@ class PaperBroker:
                 (getattr(result, "part3", None) or {})
                 .get("decision_summary", {}) or {}).get("action"),
             "v3_selected_candidate_id": meta.get("candidate_id"),
+            "candidate_id": meta.get("candidate_id"),
+            "snapshot_id": meta.get("snapshot_id") or sig.get("_snapshot_id"),
             "intent_reason": meta.get("reason"),
+            "symbol": getattr(self, "symbol", "SPY"),
         }
 
         pos = PaperPosition(
@@ -540,6 +550,13 @@ class PaperBroker:
         self.open_positions.append(pos)
         self.position_monitor.register(pos.id, entry_ctx)
         self._day_entries[key] = self._day_entries.get(key, 0) + 1
+        # Optional learning hook (shadow_runner attaches prediction_store settle)
+        on_open = getattr(self, "on_track_open", None)
+        if callable(on_open):
+            try:
+                on_open(pos, track=track)
+            except Exception:
+                log.exception("on_track_open hook failed")
         self._notify("PAPER ENTRY",
                      f"[{track}] {pos.family} {pos.strikes_str()} x{contracts} "
                      f"entry={entry_credit:+.2f} maxP={mp:.2f} maxL={ml:.2f}")
@@ -616,6 +633,13 @@ class PaperBroker:
         self._last_exit_at[track] = now
         self._last_exit_reason[track] = reason
         self._record(pos, now, credit_now, net_ps, pnl_dollars, reason)
+        on_close = getattr(self, "on_track_close", None)
+        if callable(on_close):
+            try:
+                on_close(pos, track=track, pnl_dollars=pnl_dollars,
+                         exit_reason=reason, closed_at=now)
+            except Exception:
+                log.exception("on_track_close hook failed")
         eq = self.ledgers[track]
         self._notify("PAPER EXIT",
                      f"[{track}] {pos.family} {pos.strikes_str()} {reason} "
