@@ -94,6 +94,17 @@ class PredictionBundle:
     calibration_support: Optional[float] = None
     ensemble_size: Optional[int] = None
 
+    # V3 Part 2 forecast extensions (optional; safe defaults — §34)
+    regime_probabilities: dict = field(default_factory=dict)
+    regime_uncertainty: Optional[float] = None
+    dominant_regime: Optional[str] = None
+    return_distributions: dict = field(default_factory=dict)
+    competing_risk_forecasts: dict = field(default_factory=dict)
+    path_forecasts: dict = field(default_factory=dict)
+    ensemble_forecasts: dict = field(default_factory=dict)
+    structural_state_version: Optional[str] = None
+    forecast_model_group_version: Optional[str] = None
+
     def __post_init__(self):
         # Normalize uncertainty_reasons to a tuple for frozen dataclass callers
         # that may pass a list via from_dict.
@@ -119,6 +130,20 @@ class PredictionBundle:
                 raise ValueError(
                     f"PredictionBundle.uncertainty_components[{k!r}] must be "
                     f"in [0, 1] or None, got {v!r}")
+        # Regime uncertainty is also [0,1] when present
+        if self.regime_uncertainty is not None:
+            ru = float(self.regime_uncertainty)
+            if not (0.0 <= ru <= 1.0):
+                raise ValueError(
+                    f"regime_uncertainty must be in [0,1] or None, got {ru!r}")
+        # Regime probabilities when present must be bounded (not forced to sum
+        # here — calibrator guarantees that at production time)
+        for k, v in (self.regime_probabilities or {}).items():
+            if v is None:
+                continue
+            if not isinstance(v, (int, float)) or not (0.0 <= float(v) <= 1.0):
+                raise ValueError(
+                    f"regime_probabilities[{k!r}] must be in [0,1], got {v!r}")
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)

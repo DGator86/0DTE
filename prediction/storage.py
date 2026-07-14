@@ -164,6 +164,46 @@ CREATE TABLE IF NOT EXISTS regime_outputs (
 );
 CREATE INDEX IF NOT EXISTS ix_regime_snapshot
 ON regime_outputs(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS competing_risk_outputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    forecast_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_competing_snapshot
+ON competing_risk_outputs(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS path_forecasts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    event_probabilities_json TEXT NOT NULL,
+    distribution_json TEXT,
+    diagnostics_json TEXT,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_path_snapshot
+ON path_forecasts(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS ensemble_outputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    forecast_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    mode TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_ensemble_snapshot
+ON ensemble_outputs(snapshot_id);
 """
 
 _OUTCOME_COLS = ("settled", "settlement_price", "pnl_mid", "pnl_expected_fill",
@@ -523,6 +563,136 @@ class PredictionStore:
                     row.pop("probabilities_json") or "{}")
             except (json.JSONDecodeError, TypeError):
                 row["probabilities"] = {}
+            out.append(row)
+        return out
+
+    # ---- competing risk / path / ensemble (V3 Part 2 §35 / PR 16) --------------
+    def log_competing_risk_output(
+        self, snapshot_id: str, target_name: str, horizon: str,
+        model_version: str, forecast: dict, *,
+        generated_at: Optional[str] = None, mode: str = "shadow",
+    ) -> int:
+        self.require_schema()
+        import datetime as _dt
+        generated_at = generated_at or _dt.datetime.now(
+            _dt.timezone.utc).isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO competing_risk_outputs "
+            "(snapshot_id, target_name, horizon, model_version, forecast_json, "
+            "generated_at, mode) VALUES (?,?,?,?,?,?,?)",
+            (snapshot_id, target_name, horizon, model_version,
+             _canonical_json(forecast), generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_competing_risk_outputs(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM competing_risk_outputs"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["forecast"] = json.loads(row.pop("forecast_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["forecast"] = {}
+            out.append(row)
+        return out
+
+    def log_path_forecast(
+        self, snapshot_id: str, model_version: str, horizon: str,
+        event_probabilities: dict, *,
+        distribution: Optional[dict] = None,
+        diagnostics: Optional[dict] = None,
+        generated_at: Optional[str] = None, mode: str = "shadow",
+    ) -> int:
+        self.require_schema()
+        import datetime as _dt
+        generated_at = generated_at or _dt.datetime.now(
+            _dt.timezone.utc).isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO path_forecasts "
+            "(snapshot_id, model_version, horizon, event_probabilities_json, "
+            "distribution_json, diagnostics_json, generated_at, mode) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (snapshot_id, model_version, horizon,
+             _canonical_json(event_probabilities),
+             _canonical_json(distribution or {}),
+             _canonical_json(diagnostics or {}),
+             generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_path_forecasts(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM path_forecasts"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            for src, dest in (
+                ("event_probabilities_json", "event_probabilities"),
+                ("distribution_json", "distribution"),
+                ("diagnostics_json", "diagnostics"),
+            ):
+                raw = row.pop(src, None)
+                try:
+                    row[dest] = json.loads(raw) if raw else {}
+                except (json.JSONDecodeError, TypeError):
+                    row[dest] = {}
+            out.append(row)
+        return out
+
+    def log_ensemble_output(
+        self, snapshot_id: str, target_name: str, horizon: str,
+        model_version: str, forecast: dict, *,
+        generated_at: Optional[str] = None, mode: str = "shadow",
+    ) -> int:
+        self.require_schema()
+        import datetime as _dt
+        generated_at = generated_at or _dt.datetime.now(
+            _dt.timezone.utc).isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO ensemble_outputs "
+            "(snapshot_id, target_name, horizon, model_version, forecast_json, "
+            "generated_at, mode) VALUES (?,?,?,?,?,?,?)",
+            (snapshot_id, target_name, horizon, model_version,
+             _canonical_json(forecast), generated_at, mode),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def fetch_ensemble_outputs(
+        self, snapshot_id: Optional[str] = None,
+    ) -> list[dict]:
+        self.require_schema()
+        sql = "SELECT * FROM ensemble_outputs"
+        args: list = []
+        if snapshot_id:
+            sql += " WHERE snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY id"
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            row = dict(r)
+            try:
+                row["forecast"] = json.loads(row.pop("forecast_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                row["forecast"] = {}
             out.append(row)
         return out
 
