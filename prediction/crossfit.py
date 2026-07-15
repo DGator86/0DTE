@@ -363,6 +363,7 @@ def crossfit_classifier(
     estimator_factory: Callable[[dict], Any],
     predict_raw: Callable[[Any, np.ndarray], np.ndarray],
     cfg: NestedCrossFitConfig,
+    group_ids: Optional[Sequence[str]] = None,
 ) -> CrossFitResult:
     """
     Nested cross-fit for binary classifiers.
@@ -373,6 +374,9 @@ def crossfit_classifier(
     sessions from FoldDefinition are excluded from HP selection and from
     the returned OOF stream used for outer evaluation — callers should fit
     calibrators on a separate OOF pass over train+cal eligible rows.
+
+    When group_ids (e.g. snapshot_id) are provided, every member of a group
+    stays on the same side of any train/validation split.
     """
     y_arr = np.asarray(y, dtype=int)
     sessions_l = list(sessions)
@@ -380,8 +384,19 @@ def crossfit_classifier(
     n = len(rows_l)
     if not (len(y_arr) == n == len(sessions_l)):
         raise ValueError("rows, y, sessions length mismatch")
+    if group_ids is not None and len(group_ids) != n:
+        raise ValueError("group_ids length mismatch")
     if not param_grid:
         raise ValueError("param_grid must be non-empty")
+
+    if group_ids is not None:
+        g_to_s: dict[str, set] = {}
+        for g, s in zip(group_ids, sessions_l):
+            g_to_s.setdefault(str(g), set()).add(s)
+        multi = {g: ss for g, ss in g_to_s.items() if len(ss) > 1}
+        if multi:
+            raise ValueError(
+                f"group_ids span multiple sessions: {list(multi)[:3]}")
 
     outer_folds = build_nested_session_folds(sessions_l, cfg)
     # --- Stage A: select params on inner OOF over the union of outer-train ---
@@ -403,7 +418,7 @@ def crossfit_classifier(
 
     selected_params, inner_diag = _select_classifier_params(
         rows_l, y_arr, sessions_l, hp_sessions, param_grid,
-        estimator_factory, predict_raw, cfg,
+        estimator_factory, predict_raw, cfg, group_ids,
     )
 
     # --- Stage B: OOF raw predictions on outer validation sessions ---
@@ -418,6 +433,7 @@ def crossfit_classifier(
         val_mask = _session_mask(sessions_l, fd.validation_sessions)
         train_idx = _indices_for(train_mask)
         val_idx = _indices_for(val_mask)
+        _assert_groups_intact(group_ids, train_idx, val_idx)
         if len(train_idx) == 0 or len(val_idx) == 0:
             continue
         y_tr = y_arr[train_idx]
@@ -480,13 +496,14 @@ def crossfit_classifier(
             "n_rows": n,
             "n_oof": int(covered.sum()),
             "random_state": cfg.random_state,
+            "group_ids_used": group_ids is not None,
         },
     )
 
 
 def _select_classifier_params(
     rows, y_arr, sessions_l, hp_sessions, param_grid,
-    estimator_factory, predict_raw, cfg,
+    estimator_factory, predict_raw, cfg, group_ids=None,
 ) -> tuple[dict, dict]:
     inner = inner_folds_for_train(hp_sessions, cfg)
     if not inner:
@@ -507,6 +524,7 @@ def _select_classifier_params(
             va_mask = va_mask & np.array([s in hp_set for s in sessions_l])
             tr_idx = _indices_for(tr_mask)
             va_idx = _indices_for(va_mask)
+            _assert_groups_intact(group_ids, tr_idx, va_idx)
             if len(tr_idx) == 0 or len(va_idx) == 0:
                 continue
             y_tr = y_arr[tr_idx]

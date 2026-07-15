@@ -589,6 +589,11 @@ def run_shadow_predictions(store, group: PredictionModelGroup,
     mode="shadow". Optionally journals uncertainty_outputs when the store
     schema supports it. Nothing in the live decision path reads these rows —
     the legacy engine remains authoritative (§23.2).
+
+    Observation-specific uncertainty (§7 / PR4+PR6): OOD detector and a
+    session-bootstrap ensemble are fit once from the training frame, then
+    composed with calibration / data-quality / model-age. Conformal may
+    remain missing (reweighted) until a later Part lands.
     """
     if hasattr(store, "require_schema"):
         try:
@@ -607,26 +612,106 @@ def run_shadow_predictions(store, group: PredictionModelGroup,
                                 require_labels=False)
     n = 0
     generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    from prediction.ood import OODDetector
+    from prediction.uncertainty import (
+        SessionBootstrapEnsemble,
+        compose_uncertainty,
+        data_quality_uncertainty,
+        ensemble_uncertainty_classification,
+        model_age_uncertainty,
+    )
+
+    # Fit OOD once on the feature distribution of the frame (deterministic).
+    ood = OODDetector().fit(frame.rows)
+
+    # Session-bootstrap ensemble on the primary direction head when labels exist.
+    ensemble: Optional[SessionBootstrapEnsemble] = None
+    ensemble_size: Optional[int] = None
+    primary_horizon = None
+    for h in ("30m", "15m", "5m", "60m", "close"):
+        if h in group.direction:
+            primary_horizon = h
+            break
+    if primary_horizon is not None:
+        label_key = f"up_{primary_horizon}"
+        y_fit: list[int] = []
+        rows_fit: list[dict] = []
+        sess_fit: list[str] = []
+        for i, lb in enumerate(frame.labels):
+            v = lb.get(label_key) if isinstance(lb, dict) else None
+            if v is None:
+                continue
+            try:
+                y_fit.append(int(v))
+            except (TypeError, ValueError):
+                continue
+            rows_fit.append(frame.rows[i])
+            sess_fit.append(frame.sessions[i])
+        if len(y_fit) >= 20 and len(set(sess_fit)) >= 3 and len(set(y_fit)) >= 2:
+            def _factory():
+                from sklearn.linear_model import LogisticRegression
+                from sklearn.pipeline import Pipeline
+                from sklearn.preprocessing import StandardScaler
+                return Pipeline([
+                    ("scaler", StandardScaler()),
+                    ("clf", LogisticRegression(
+                        solver="lbfgs", max_iter=500, random_state=42)),
+                ])
+
+            ensemble = SessionBootstrapEnsemble(
+                n_estimators=7, seed=42,
+            ).fit(rows_fit, y_fit, sess_fit, _factory, task="classification")
+            ensemble_size = len(ensemble.estimators) if ensemble.fitted else None
+
+    # Model-age proxy from direction metadata when present.
+    age_u = None
+    age_reasons: tuple[str, ...] = ()
+    age_days = None
+    for m in group.direction.values():
+        meta = getattr(m, "metadata", None) or {}
+        if meta.get("artifact_age_days") is not None:
+            age_days = float(meta["artifact_age_days"])
+            break
+        if meta.get("trained_at") is not None:
+            try:
+                trained = dt.datetime.fromisoformat(
+                    str(meta["trained_at"]).replace("Z", "+00:00"))
+                age_days = (dt.datetime.now(dt.timezone.utc) - trained).days
+            except (TypeError, ValueError):
+                pass
+            break
+    if age_days is not None:
+        age_u, age_reasons = model_age_uncertainty(artifact_age_days=age_days)
+
     for i in range(len(frame)):
         if session_date and frame.sessions[i] != session_date:
             continue
         q = frame.quality[i] if frame.quality else {}
-        # Deterministic DQ uncertainty from quality fields (inspectable).
-        from prediction.uncertainty import (
-            compose_uncertainty, data_quality_uncertainty,
-        )
         dq_u, dq_reasons = data_quality_uncertainty(
             feature_coverage=q.get("feature_coverage"),
             required_field_coverage=q.get("required_field_coverage"),
             max_source_age_sec=q.get("max_source_age_sec"),
             missingness_count=int(q.get("missingness_count") or 0),
         )
-        # Scalar model uncertainty from the group as the calibration proxy.
         cal_u = group.uncertainty()
+
+        ood_res = ood.score_one(frame.rows[i])
+        ens_u = None
+        if ensemble is not None and ensemble.fitted and ensemble.estimators:
+            members = ensemble.predict_proba_members([frame.rows[i]])
+            if members.shape[0] >= 2:
+                ens_u = float(ensemble_uncertainty_classification(members))
+
+        extra = tuple(dq_reasons) + tuple(ood_res.reasons) + tuple(age_reasons)
         unc = compose_uncertainty(
+            ensemble=ens_u,
+            conformal=None,  # Part 1: conformal module optional / later
+            out_of_distribution=float(ood_res.score),
             calibration=cal_u,
             data_quality=dq_u,
-            extra_reasons=dq_reasons,
+            model_age=age_u,
+            extra_reasons=extra,
         )
         comps = {
             "ensemble": unc.ensemble,
@@ -643,8 +728,11 @@ def run_shadow_predictions(store, group: PredictionModelGroup,
             session_date=frame.sessions[i], quality=q,
             uncertainty_components=comps,
             uncertainty_reasons=unc.reasons,
+            ood_score=float(ood_res.score),
+            ood_percentile=float(ood_res.percentile),
             calibration_support=(
                 None if cal_u is None else float(1.0 - float(cal_u))),
+            ensemble_size=ensemble_size,
         )
         store.log_prediction(
             snapshot_id=bundle.snapshot_id,
@@ -669,7 +757,12 @@ def run_shadow_predictions(store, group: PredictionModelGroup,
                         "model_age": unc.model_age,
                     },
                     reasons=list(unc.reasons),
-                    diagnostics=unc.diagnostics,
+                    diagnostics={
+                        **dict(unc.diagnostics),
+                        "ood_state_bucket": ood_res.state_bucket,
+                        "ood_percentile": ood_res.percentile,
+                        "ensemble_size": ensemble_size,
+                    },
                     generated_at=generated_at,
                 )
             except (RuntimeError, sqlite3.Error) as exc:
