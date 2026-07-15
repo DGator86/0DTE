@@ -3,6 +3,10 @@ dashboard/state.py
 ==================
 Serialize TickResult into live_state.json for the observability dashboard.
 Read-only snapshot — no decision logic.
+
+PR C: payloads use schema_version=live.v1 with explicit sections (feeds,
+legacy, forecast, v3, …). Flat top-level aliases remain temporarily for the
+pre-migration dashboard (system.compat_flat_keys=True); PR D removes them.
 """
 from __future__ import annotations
 
@@ -11,9 +15,15 @@ import json
 import math
 import os
 import tempfile
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
+from dashboard.live_schema import (
+    LIVE_SCHEMA_VERSION,
+    feeds_payload_from_statuses,
+    synthesize_feed_statuses,
+)
 from gate_scorer import MarketSnapshot
+from prediction.feed_status import FeedStatus, build_feed_status
 
 
 def _market_inputs(market: MarketSnapshot) -> dict:
@@ -53,8 +63,10 @@ def serialize_tick_result(
     paper_summary: Optional[dict] = None,
     market_status: Optional[dict] = None,
     part3: Optional[dict] = None,
+    feed_statuses: Optional[Mapping[str, FeedStatus]] = None,
+    feed_ages_seconds: Optional[Mapping[str, Optional[float]]] = None,
 ) -> dict:
-    """Build live_state payload from a UnifiedOrchestrator tick."""
+    """Build live_state payload from a UnifiedOrchestrator tick (live.v1)."""
     regime = result.regime
     intent = result.intent
     dec = result.decision
@@ -177,7 +189,7 @@ def serialize_tick_result(
     }
 
     # Flat forecast summary for the V2 tab when prediction_store is offline.
-    forecast = {
+    forecast_summary = {
         k[len("v2_fc_"):]: v for k, v in raw_signals.items()
         if k.startswith("v2_fc_")
     }
@@ -242,28 +254,117 @@ def serialize_tick_result(
     part3_payload = part3
     if part3_payload is None:
         part3_payload = getattr(result, "part3", None)
-    payload = {
-        "ts": result.ts.isoformat(),
+    if part3_payload is None:
+        part3_payload = {
+            "note": "part3 decision not available",
+            "shadow_label": "SHADOW — not an executed order",
+            "mode": "shadow",
+        }
+
+    statuses = synthesize_feed_statuses(
+        feed_source=feed_source,
+        chain_available=chain_available,
+        ages_seconds=feed_ages_seconds,
+        feed_statuses=feed_statuses,
+    )
+    feeds = feeds_payload_from_statuses(statuses)
+
+    snapshot_id = None
+    if isinstance(raw_signals, dict):
+        snapshot_id = raw_signals.get("_snapshot_id") or raw_signals.get("snapshot_id")
+    ts_iso = result.ts.isoformat()
+    market_session = market_status or {}
+
+    # live.v1 market: session fields at top level for pre-PR-D compat
+    # (app.js reads live.market.is_open), plus nested session/inputs.
+    market_section = {
+        **dict(market_session),
+        "session": dict(market_session),
+        "inputs": inputs,
+    }
+
+    # live.v1 forecast: flat summary keys at top for app.js spread-merge,
+    # plus explicit source labeling (never source_version=v3).
+    forecast_section: dict[str, Any] = {
+        "source_version": "v2",
+        "source_type": (
+            "unavailable" if not forecast_summary and not v2_signals
+            else "shadow_observation"
+        ),
+        "summary": forecast_summary or None,
+        "v2_signals": v2_signals,
+        "sigma_cones": sigma_cones,
+        "parallel": parallel.get("v2"),
+    }
+    if forecast_summary:
+        forecast_section.update(forecast_summary)
+
+    paper_section = paper_summary or {}
+
+    envelope: dict[str, Any] = {
+        "schema_version": LIVE_SCHEMA_VERSION,
+        "generated_at": ts_iso,
+        "snapshot": {
+            "snapshot_id": snapshot_id,
+            "ts": ts_iso,
+            "chain_available": chain_available,
+            "feed_source": feed_source,
+        },
+        "feeds": feeds,
+        "market": market_section,
+        "legacy": {
+            "source_version": "v1",
+            "doing": doing,
+            "why": why,
+            "parallel": parallel.get("legacy"),
+        },
+        "forecast": forecast_section,
+        "v3": {
+            "source_version": "v3",
+            "source_type": "shadow",
+            "mode": (part3_payload or {}).get("mode", "shadow"),
+            "shadow_label": (part3_payload or {}).get(
+                "shadow_label", "SHADOW — not an executed order"),
+            "decision": part3_payload,
+        },
+        "accounts": {
+            "reference": {
+                "track": "legacy",
+                "authority": "v1",
+                "paper": paper_section,
+            },
+            "candidate": None,
+            "champion": None,
+        },
+        "risk": {
+            "vetoes": risk_vetoes,
+            "scope": "global_single_risk_manager",
+        },
+        "paper": paper_section,
+        "system": {
+            "status": "live",
+            "note": None,
+            "compat_flat_keys": True,
+            "schema_version": LIVE_SCHEMA_VERSION,
+        },
+    }
+    # Temporary non-colliding flat aliases for pre-PR-D dashboard / tests.
+    # Do NOT overwrite live.v1 sections (market/forecast/paper already set).
+    envelope.update({
+        "ts": ts_iso,
         "status": "live",
         "note": None,
-        "market": market_status or {},
         "feed_source": feed_source,
         "chain_available": chain_available,
         "doing": doing,
         "inputs": inputs,
         "why": why,
-        "paper": paper_summary or {},
         "v2_signals": v2_signals,
-        "forecast": forecast or None,
         "parallel": parallel,
         "sigma_cones": sigma_cones,
-        "part3": part3_payload if part3_payload is not None else {
-            "note": "part3 decision not available",
-            "shadow_label": "SHADOW — not an executed order",
-            "mode": "shadow",
-        },
-    }
-    return payload
+        "part3": part3_payload,
+    })
+    return envelope
 
 
 def heartbeat_state(
@@ -274,6 +375,7 @@ def heartbeat_state(
     feed_source: Optional[str] = None,
     paper_summary: Optional[dict] = None,
     market_status: Optional[dict] = None,
+    feed_statuses: Optional[Mapping[str, FeedStatus]] = None,
 ) -> dict:
     """Build a live_state payload for a loop iteration that produced no tick.
 
@@ -281,18 +383,85 @@ def heartbeat_state(
     status/note) apart from "pipeline crashed" (stale/absent file). Carries no
     decision or market inputs — only liveness and the reason there is no data.
     """
-    return {
-        "ts": now.isoformat(),
-        "status": status,          # "market_closed" | "feed_not_ready" | "feed_error"
+    ts_iso = now.isoformat()
+    statuses = synthesize_feed_statuses(
+        feed_source=feed_source,
+        chain_available=False,
+        feed_statuses=feed_statuses,
+    )
+    # Heartbeat with no tick: do not claim overall LIVE.
+    if status in ("market_closed", "feed_not_ready", "feed_error"):
+        if statuses["spot"].status == "LIVE":
+            statuses = dict(statuses)
+            statuses["spot"] = build_feed_status(
+                source="spot",
+                freshness_limit_seconds=statuses["spot"].freshness_limit_seconds,
+                provider=feed_source,
+                present=False,
+                required=True,
+                error_code=status,
+            )
+    feeds = feeds_payload_from_statuses(statuses)
+    market_session = market_status or {}
+    market_section = {
+        **dict(market_session),
+        "session": dict(market_session),
+        "inputs": {},
+    }
+    paper_section = paper_summary or {}
+    envelope: dict[str, Any] = {
+        "schema_version": LIVE_SCHEMA_VERSION,
+        "generated_at": ts_iso,
+        "snapshot": {
+            "snapshot_id": None,
+            "ts": ts_iso,
+            "chain_available": False,
+            "feed_source": feed_source,
+        },
+        "feeds": feeds,
+        "market": market_section,
+        "legacy": {"source_version": "v1", "doing": {}, "why": {}, "parallel": None},
+        "forecast": {
+            "source_version": "v2",
+            "source_type": "unavailable",
+            "summary": None,
+            "v2_signals": {},
+            "sigma_cones": None,
+            "parallel": None,
+        },
+        "v3": {
+            "source_version": "v3",
+            "source_type": "unavailable",
+            "mode": "shadow",
+            "shadow_label": "SHADOW — not an executed order",
+            "decision": None,
+        },
+        "accounts": {
+            "reference": {"track": "legacy", "authority": "v1",
+                          "paper": paper_section},
+            "candidate": None,
+            "champion": None,
+        },
+        "risk": {"vetoes": [], "scope": "global_single_risk_manager"},
+        "paper": paper_section,
+        "system": {
+            "status": status,
+            "note": note,
+            "compat_flat_keys": True,
+            "schema_version": LIVE_SCHEMA_VERSION,
+        },
+    }
+    envelope.update({
+        "ts": ts_iso,
+        "status": status,
         "note": note,
-        "market": market_status or {},
         "feed_source": feed_source,
         "chain_available": False,
         "doing": {},
         "inputs": {},
         "why": {},
-        "paper": paper_summary or {},
-    }
+    })
+    return envelope
 
 
 def _sanitize_non_finite(obj: Any) -> Any:

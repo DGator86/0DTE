@@ -1,15 +1,216 @@
 {
-  "_comment": "Baseline /api/live payload shape lock (post-PR119). Regenerate only when a PR intentionally changes the serializer: python -c \"import json,sys; sys.path[:0]=['.','tests']; from test_baseline_contracts import baseline_live_payload; ...\" \u2014 see tests/test_baseline_contracts.py. Values are synthetic; only the recursive key/type structure is asserted.",
-  "baseline_tree": "4e2fe756788231a41fc5130dcd173c87521c14be",
-  "rollback_merge": "dc80273d22bcbde800d9bf5b12e381f3302160cb",
+  "_comment": "live.v1 /api/live payload shape lock (PR C). Regenerate when serializer changes intentionally. Values synthetic; only recursive key/type structure is asserted.",
+  "schema_version": "live.v1",
+  "baseline_tree": "430d665 (post PR #121 / PR B)",
   "payload": {
+    "schema_version": "live.v1",
+    "generated_at": "2026-06-30T10:00:00-04:00",
+    "snapshot": {
+      "snapshot_id": null,
+      "ts": "2026-06-30T10:00:00-04:00",
+      "chain_available": false,
+      "feed_source": "Tradier"
+    },
+    "feeds": {
+      "overall_status": "MISSING",
+      "spot": {
+        "source": "spot",
+        "provider": "Tradier",
+        "observed_at": null,
+        "received_at": null,
+        "age_seconds": null,
+        "freshness_limit_seconds": 5.0,
+        "status": "DELAYED",
+        "required": true,
+        "error_code": null,
+        "diagnostics": {
+          "note": "age_unknown_synthesized"
+        }
+      },
+      "bars": {
+        "source": "bars",
+        "provider": "Tradier",
+        "observed_at": null,
+        "received_at": null,
+        "age_seconds": null,
+        "freshness_limit_seconds": 90.0,
+        "status": "DELAYED",
+        "required": true,
+        "error_code": null,
+        "diagnostics": {
+          "note": "age_unknown_synthesized"
+        }
+      },
+      "option_chain": {
+        "source": "option_chain",
+        "provider": "Tradier",
+        "observed_at": null,
+        "received_at": null,
+        "age_seconds": null,
+        "freshness_limit_seconds": 15.0,
+        "status": "MISSING",
+        "required": true,
+        "error_code": "chain_unavailable",
+        "diagnostics": {}
+      },
+      "settlement": {
+        "source": "settlement",
+        "provider": "Tradier",
+        "observed_at": null,
+        "received_at": null,
+        "age_seconds": null,
+        "freshness_limit_seconds": 86400.0,
+        "status": "DELAYED",
+        "required": true,
+        "error_code": null,
+        "diagnostics": {
+          "note": "age_unknown_synthesized"
+        }
+      }
+    },
+    "market": {
+      "is_open": true,
+      "session_type": "regular",
+      "session": {
+        "is_open": true,
+        "session_type": "regular"
+      },
+      "inputs": {
+        "spot": 600.0,
+        "net_gex": 4000000000.0,
+        "gamma_flip": 595.0,
+        "zero_gamma_dist": 5.0,
+        "zero_gamma_dist_pct": 0.008333333333333333,
+        "gex_pct_rank": 0.85,
+        "call_wall": 605.0,
+        "put_wall": 595.0,
+        "vix9d": 12.0,
+        "vix": 13.0,
+        "vix3m": 15.0,
+        "vvix": 92.0,
+        "vvix_baseline": 95.0,
+        "straddle_breakeven": 4.0,
+        "expected_range": 3.2,
+        "adx": 14.0,
+        "rsi": 50.0,
+        "bb_width": 1.4,
+        "bb_width_baseline": 2.0,
+        "vwap": 600.0,
+        "vwap_reversion_count": 2,
+        "tick_abs_mean": 400.0,
+        "cvd_slope": 0.01,
+        "has_catalyst": false
+      }
+    },
+    "legacy": {
+      "source_version": "v1",
+      "doing": {
+        "dominant_regime": "compression",
+        "permitted_engine": "premium_selling",
+        "stand_down": false,
+        "structure": "IC",
+        "direction": "both",
+        "conviction": "HIGH",
+        "size_mult": 1.0,
+        "final_size_mult": 1.0,
+        "direction_bias": "neutral",
+        "bias_value": 0.0,
+        "bias_fast": null,
+        "bias_slow": null,
+        "gate_pass": false,
+        "gate_score": 0.0,
+        "decision": "NO_TRADE"
+      },
+      "why": {
+        "regime_confidences": {
+          "compression": 72,
+          "trend": 18
+        },
+        "global_information_gain": 12.0,
+        "stand_down_reason": null,
+        "dealer_vetoes": [],
+        "matrix_cell": [
+          "compression",
+          "compression",
+          "neutral"
+        ],
+        "intent_note": "",
+        "capture": "theta",
+        "strike_rule": "shorts inside walls",
+        "gate_failed": [],
+        "selector_vetoes": [],
+        "no_trade_reason": "",
+        "risk_vetoes": [],
+        "intent_vetoes": []
+      },
+      "parallel": {
+        "structure": "IC",
+        "direction": "both",
+        "size_mult": 1.0,
+        "gate_pass": false,
+        "gate_score": 0.0,
+        "decision": "NO_TRADE"
+      }
+    },
+    "forecast": {
+      "source_version": "v2",
+      "source_type": "unavailable",
+      "summary": null,
+      "v2_signals": {},
+      "sigma_cones": null,
+      "parallel": {
+        "structure": null,
+        "direction": null,
+        "action": null,
+        "confidence": null,
+        "uncertainty": null,
+        "size_cap": null,
+        "source": null,
+        "mode": null,
+        "disagreement": null,
+        "fallback_used": null
+      }
+    },
+    "v3": {
+      "source_version": "v3",
+      "source_type": "shadow",
+      "mode": "shadow",
+      "shadow_label": "SHADOW \u2014 not an executed order",
+      "decision": {
+        "note": "part3 decision not available",
+        "shadow_label": "SHADOW \u2014 not an executed order",
+        "mode": "shadow"
+      }
+    },
+    "accounts": {
+      "reference": {
+        "track": "legacy",
+        "authority": "v1",
+        "paper": {
+          "trades": 0,
+          "equity": 1000.0
+        }
+      },
+      "candidate": null,
+      "champion": null
+    },
+    "risk": {
+      "vetoes": [],
+      "scope": "global_single_risk_manager"
+    },
+    "paper": {
+      "trades": 0,
+      "equity": 1000.0
+    },
+    "system": {
+      "status": "live",
+      "note": null,
+      "compat_flat_keys": true,
+      "schema_version": "live.v1"
+    },
     "ts": "2026-06-30T10:00:00-04:00",
     "status": "live",
     "note": null,
-    "market": {
-      "is_open": true,
-      "session_type": "regular"
-    },
     "feed_source": "Tradier",
     "chain_available": false,
     "doing": {
@@ -77,12 +278,7 @@
       "risk_vetoes": [],
       "intent_vetoes": []
     },
-    "paper": {
-      "trades": 0,
-      "equity": 1000.0
-    },
     "v2_signals": {},
-    "forecast": null,
     "parallel": {
       "legacy": {
         "structure": "IC",

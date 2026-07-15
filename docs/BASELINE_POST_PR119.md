@@ -59,22 +59,30 @@ Authority notes locked by tests:
 
 ## API serializer
 
-`dashboard/state.py::serialize_tick_result()` builds the entire live payload;
-`write_live_state()` sanitizes non-finite floats and writes atomically;
-`GET /api/live` returns the file content **unmodified** — there is no schema
-version, no envelope, and no validation on read.
+`dashboard/state.py::serialize_tick_result()` builds a **live.v1** payload
+(`schema_version: "live.v1"`) with explicit sections: `snapshot`, `feeds`,
+`market`, `legacy`, `forecast`, `v3`, `accounts`, `risk`, `paper`, `system`.
+Per-source feed status lives under `feeds` (overall LIVE only when every
+required source is fresh). Flat aliases (`doing`, `why`, `part3`, …) remain
+temporarily for the pre-migration dashboard (`system.compat_flat_keys=true`);
+PR D removes them.
 
-Top-level keys today (locked by fixture
+`write_live_state()` sanitizes non-finite floats and writes atomically;
+`GET /api/live` returns the file content unmodified.
+
+Top-level live.v1 keys (locked by fixture
 `tests/fixtures/live_state_baseline.json`):
 
 ```
-ts, status, note, market, feed_source, chain_available,
-doing, inputs, why, paper, v2_signals, forecast, parallel,
-sigma_cones, part3
+schema_version, generated_at, snapshot, feeds, market, legacy, forecast,
+v3, accounts, risk, paper, system
+(+ temporary flat aliases: ts, status, note, feed_source, chain_available,
+ doing, inputs, why, v2_signals, parallel, sigma_cones, part3)
 ```
 
-`heartbeat_state()` is the no-tick variant; its `status` values are
-`market_closed | feed_not_ready | feed_error` (plus `live` on real ticks).
+`heartbeat_state()` is the no-tick variant; its `system.status` /
+flat `status` values are `market_closed | feed_not_ready | feed_error`
+(plus `live` on real ticks). Overall feed status is never LIVE on heartbeat.
 
 ## Dashboard API endpoints (dashboard/server.py)
 
@@ -109,15 +117,19 @@ served.
 
 ## Feed status logic
 
-There is no per-source feed status. Today's full inventory:
+Per-source feed status is serialized under `feeds` (PR C / live.v1):
 
-- Backend: `feed_source` (string name of the CompositeFeed member that
-  answered, e.g. "Tradier"), `chain_available` (bool), `status`/`note`
-  (heartbeat), `ts` (payload write time). No provider timestamps, ages, or
-  freshness limits are serialized.
-- Frontend: `meta-feed` shows `live.feed_source || "—"`; `meta-chain` shows
-  `chain_available ? "live" : "n/a"`; `staleNote()` warns when `ts` is older
-  than 180 s or a heartbeat note is present.
+- Required sources: `spot`, `bars`, `option_chain`, `settlement`
+- Each carries `status` ∈ {LIVE, DELAYED, STALE, MISSING, INVALID, FALLBACK},
+  provider, ages, and freshness limits (`dashboard/live_schema.py`,
+  `prediction/feed_status.py`).
+- `feeds.overall_status` is LIVE only when every required source is LIVE.
+  A truthy `feed_source` alone is **not** sufficient (age-unknown ⇒ DELAYED).
+- Callers may pass explicit `feed_statuses` / `feed_ages_seconds` into
+  `serialize_tick_result`; otherwise statuses are synthesized honestly from
+  `feed_source` + `chain_available`.
+
+Flat `feed_source` / `chain_available` remain as temporary aliases.
 
 ## Paper accounts
 
