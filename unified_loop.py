@@ -766,7 +766,9 @@ class UnifiedOrchestrator:
 
         from decision_stack.authority import coerce_size_mult
 
-        fair = bool(vars(self).get("paper_fair_comparison", False))
+        fair = (bool(self.paper_fair_comparison)
+                if "paper_fair_comparison" in vars(self)
+                else False)
         snap_id = str(signals.get("_snapshot_id") or "")
         blocked = bool(matrix_stand_down) if fair else False
 
