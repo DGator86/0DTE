@@ -166,7 +166,7 @@ def serialize_tick_result(
     # V2 / policy / GEX observation signals for the dashboard V2 tab.
     raw_signals = getattr(result, "signals", None) or {}
     v2_keys = (
-        "policy_", "v2_", "phys_", "gex_", "legacy_policy_", "pin_", "cf_",
+        "policy_", "v2_", "v3_", "phys_", "gex_", "legacy_policy_", "pin_", "cf_",
         "cone_",
     )
     v2_signals = {

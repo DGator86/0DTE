@@ -105,3 +105,39 @@ def test_determinism_compose():
     a = compose_uncertainty(ensemble=0.3, conformal=0.4, out_of_distribution=0.5)
     b = compose_uncertainty(ensemble=0.3, conformal=0.4, out_of_distribution=0.5)
     assert a.to_dict() == b.to_dict()
+
+
+def test_session_bootstrap_ensemble_clamps_to_5_9():
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    from prediction.uncertainty import SessionBootstrapEnsemble
+
+    rng = np.random.default_rng(0)
+    rows, y, sessions = [], [], []
+    for s in range(6):
+        date = f"2026-09-{s + 1:02d}"
+        for j in range(5):
+            x = float(rng.standard_normal())
+            rows.append({"x": x})
+            y.append(int(x > 0))
+            sessions.append(date)
+
+    def factory():
+        return Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(solver="lbfgs", max_iter=200,
+                                       random_state=0)),
+        ])
+
+    low = SessionBootstrapEnsemble(n_estimators=2, seed=1).fit(
+        rows, y, sessions, factory)
+    mid = SessionBootstrapEnsemble(n_estimators=7, seed=1).fit(
+        rows, y, sessions, factory)
+    high = SessionBootstrapEnsemble(n_estimators=20, seed=1).fit(
+        rows, y, sessions, factory)
+    assert 5 <= len(low.estimators) <= 9
+    assert len(mid.estimators) == 7
+    assert 5 <= len(high.estimators) <= 9
+    assert len(high.estimators) == 9

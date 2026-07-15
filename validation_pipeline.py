@@ -331,6 +331,21 @@ def _recommendations(metrics: dict, flags: list[dict]) -> list[str]:
 
     if not recs:
         recs.append("No concerning trends detected; keep accumulating history.")
+
+    paper = metrics.get("paper_tracks") or {}
+    by = paper.get("by_track") or {}
+    active = [t for t, bt in by.items() if (bt or {}).get("trades")]
+    if len(active) >= 2:
+        pnls = {t: (by[t] or {}).get("total_pnl", 0.0) for t in active}
+        best = max(pnls, key=pnls.get)
+        worst = min(pnls, key=pnls.get)
+        if pnls[best] != pnls[worst]:
+            recs.append(
+                f"Paper track spread: {best} P&L {pnls[best]:+.2f} vs "
+                f"{worst} {pnls[worst]:+.2f} — compare gates/sizing before promoting.")
+    elif paper.get("total_trades") == 0:
+        recs.append("No multi-track paper fills yet — wait for legacy/v2/v3 "
+                    "parallel paper to accumulate before track comparison.")
     return recs
 
 
@@ -361,13 +376,23 @@ def _summarize(report_type: str, metrics: dict, flags: list[dict]) -> str:
                      + ", ".join(f["flag"] for f in alerts))
     else:
         parts.append("no degradation alerts")
+    paper = metrics.get("paper_tracks") or {}
+    by = paper.get("by_track") or {}
+    track_bits = []
+    for t in ("legacy", "v2", "v3"):
+        bt = by.get(t) or {}
+        if bt.get("trades"):
+            track_bits.append(f"{t}:{bt['trades']}t/{bt.get('total_pnl', 0):+.0f}")
+    if track_bits:
+        parts.append("paper " + " ".join(track_bits))
     return f"{report_type.capitalize()} validation — " + "; ".join(parts)
 
 
 def run_daily_validation(db_path: str, record_dir: str = "",
                          lookback_days: int = 20, n_folds: int = 4,
                          report_date: Optional[str] = None,
-                         log_to_journal: bool = True) -> dict:
+                         log_to_journal: bool = True,
+                         paper_db: str = "") -> dict:
     """
     Lightweight daily health check. Returns the report dict:
       {report_date, report_type, metrics, summary, flags}
@@ -376,10 +401,12 @@ def run_daily_validation(db_path: str, record_dir: str = "",
     report_date = report_date or dt.datetime.now(ET).date().isoformat()
     jrn = Journal(db_path)
     try:
+        from prediction.track_parity import paper_track_summary
         metrics: dict = {
             "journal": journal_health_metrics(jrn),
             "walk_forward": _recorded_walk_forward(record_dir, n_folds,
                                                    lookback_sessions=lookback_days),
+            "paper_tracks": paper_track_summary(paper_db or ""),
         }
         prior = jrn.fetch_validation_reports(report_type="daily", limit=10)
         metrics["deltas"] = _deltas_vs_previous(metrics, prior)
@@ -398,7 +425,8 @@ def run_daily_validation(db_path: str, record_dir: str = "",
 def run_weekly_validation(db_path: str, record_dir: str = "",
                           n_folds: int = 6,
                           report_date: Optional[str] = None,
-                          log_to_journal: bool = True) -> dict:
+                          log_to_journal: bool = True,
+                          paper_db: str = "") -> dict:
     """
     Deeper weekly review: full-window walk-forward plus regime-level and
     feature-level analysis, trend across prior reports, and recommendations.
@@ -406,11 +434,13 @@ def run_weekly_validation(db_path: str, record_dir: str = "",
     report_date = report_date or dt.datetime.now(ET).date().isoformat()
     jrn = Journal(db_path)
     try:
+        from prediction.track_parity import paper_track_summary
         metrics: dict = {
             "journal": journal_health_metrics(jrn),
             "walk_forward": _recorded_walk_forward(record_dir, n_folds),
             "per_regime": per_regime_breakdown(jrn),
             "feature_contributions": jrn.component_correlations(),
+            "paper_tracks": paper_track_summary(paper_db or ""),
         }
 
         # Aggregate the past week's daily reports so the weekly is the roll-up.
@@ -480,6 +510,8 @@ def main() -> None:
     ap.add_argument("--folds", type=int, default=0,
                     help="walk-forward folds (default: 4 daily, 6 weekly)")
     ap.add_argument("--date", default=None, help="report date override (YYYY-MM-DD)")
+    ap.add_argument("--paper-db", default="",
+                    help="paper.sqlite path for legacy/v2/v3 track comparison")
     ap.add_argument("--notify", action="store_true",
                     help="send an alert via notifier.py when alert flags fire")
     ap.add_argument("--json", action="store_true", help="print the full report JSON")
@@ -489,11 +521,13 @@ def main() -> None:
         report = run_daily_validation(
             args.db, args.record_dir,
             lookback_days=args.lookback_days,
-            n_folds=args.folds or 4, report_date=args.date)
+            n_folds=args.folds or 4, report_date=args.date,
+            paper_db=args.paper_db)
     else:
         report = run_weekly_validation(
             args.db, args.record_dir,
-            n_folds=args.folds or 6, report_date=args.date)
+            n_folds=args.folds or 6, report_date=args.date,
+            paper_db=args.paper_db)
 
     print(f"\n{report['summary']}")
     for f in report["flags"]:

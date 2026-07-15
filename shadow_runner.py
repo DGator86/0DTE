@@ -413,6 +413,9 @@ class ShadowRunner:
             self._orch.candidate_risk_manager = self._candidate_risk
             log.info("Candidate paper account: %s (separate risk ledger)",
                      candidate_paper_db)
+        # Link paper fills into the prediction store so learning/validation
+        # can join features → decisions → outcomes per track.
+        self._wire_paper_parity_hooks()
 
         log.info("Initialized. DB=%s symbol=%s interval=%ds", db_path, symbol, interval_s)
         log.info("Paper account: $%.0f start (simulated fills, no real orders).",
@@ -427,6 +430,32 @@ class ShadowRunner:
                 cfg.daily_loss_limit, cfg.max_open_positions, cfg.max_portfolio_gamma,
             )
         log.info("No orders will be placed — shadow mode only.")
+
+    def _wire_paper_parity_hooks(self) -> None:
+        """Attach open/close hooks that write fill_records + candidate_outcomes."""
+        store = self._prediction_store
+        mode = str(getattr(self._orch, "policy_mode", "shadow") or "shadow")
+
+        def _on_open(pos, *, track: str):
+            from prediction.track_parity import record_paper_fill
+            ctx = pos.entry_ctx or {}
+            record_paper_fill(
+                store, pos=pos,
+                snapshot_id=str(ctx.get("snapshot_id") or ""),
+                track=track, mode=mode)
+
+        def _on_close(pos, *, track: str, pnl_dollars: float,
+                      exit_reason: str, closed_at):
+            from prediction.track_parity import settle_paper_outcome
+            settle_paper_outcome(
+                store, pos=pos, pnl_dollars=pnl_dollars,
+                exit_reason=exit_reason, closed_at=closed_at)
+
+        for broker in (self._paper, self._candidate_paper):
+            if broker is None:
+                continue
+            broker.on_track_open = _on_open
+            broker.on_track_close = _on_close
 
     # -- public API ----------------------------------------------------------
 

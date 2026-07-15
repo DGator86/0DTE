@@ -117,6 +117,21 @@ def test_snapshot_groups_never_divided():
         assert not (tr_g & va_g)
 
 
+def test_classifier_snapshot_groups_never_divided():
+    rows, y, sessions, groups = _make_clf_data()
+    grid = [{"C": 1.0}, {"C": 10.0}]
+    result = crossfit_classifier(
+        rows, y, sessions, grid, _clf_factory, _predict_raw, CFG,
+        group_ids=groups)
+    assert result.diagnostics["group_ids_used"] is True
+    for fd_meta in result.diagnostics["fold_definitions"]:
+        tr_set = set(fd_meta["train_sessions"])
+        va_set = set(fd_meta["validation_sessions"])
+        tr_g = {groups[i] for i, s in enumerate(sessions) if s in tr_set}
+        va_g = {groups[i] for i, s in enumerate(sessions) if s in va_set}
+        assert not (tr_g & va_g)
+
+
 def test_mutating_test_labels_cannot_change_selected_hyperparameters():
     rows, y, sessions, _ = _make_clf_data(seed=1)
     grid = [{"C": 0.1}, {"C": 1.0}, {"C": 10.0}]
