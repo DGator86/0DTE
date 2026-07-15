@@ -323,6 +323,116 @@ def load_champion(configs_dir: str = "configs") -> Optional[ChampionConfig]:
 
 
 # --------------------------------------------------------------------------- #
+# Registry-compatible rule-config artifacts (UNIFIED handoff §11.7)           #
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class RuleConfigArtifact:
+    """Versioned V1 rule configuration referenced by DeploymentBundle."""
+
+    rule_config_id: str
+    overrides: dict
+    regime_overrides: dict
+    configuration_hash: str
+    parent_id: Optional[str] = None
+    status: str = "candidate"
+    metrics: dict = field(default_factory=dict)
+    label: str = ""
+    author: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "rule_config_id": self.rule_config_id,
+            "overrides": dict(self.overrides),
+            "regime_overrides": dict(self.regime_overrides),
+            "configuration_hash": self.configuration_hash,
+            "parent_id": self.parent_id,
+            "status": self.status,
+            "metrics": dict(self.metrics),
+            "label": self.label,
+            "author": self.author,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RuleConfigArtifact":
+        return cls(
+            rule_config_id=str(d["rule_config_id"]),
+            overrides=dict(d.get("overrides") or {}),
+            regime_overrides=dict(d.get("regime_overrides") or {}),
+            configuration_hash=str(d.get("configuration_hash") or ""),
+            parent_id=d.get("parent_id"),
+            status=str(d.get("status") or "candidate"),
+            metrics=dict(d.get("metrics") or {}),
+            label=str(d.get("label") or ""),
+            author=str(d.get("author") or ""),
+        )
+
+    def to_config_record(self) -> ConfigRecord:
+        return ConfigRecord(
+            config_id=self.rule_config_id,
+            parent_id=self.parent_id,
+            label=self.label,
+            overrides=dict(self.overrides),
+            regime_overrides=dict(self.regime_overrides),
+            metrics=dict(self.metrics),
+            author=self.author,
+            status=self.status if self.status in CONFIG_STATUSES else "candidate",
+        )
+
+
+def _rule_config_hash(overrides: dict, regime_overrides: dict) -> str:
+    import hashlib
+    import json as _json
+    payload = {"overrides": overrides, "regime_overrides": regime_overrides}
+    return hashlib.sha256(
+        _json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                    default=str).encode("utf-8")).hexdigest()
+
+
+def new_rule_config_artifact(
+    *,
+    overrides: dict,
+    regime_overrides: Optional[dict] = None,
+    parent_id: Optional[str] = None,
+    metrics: Optional[dict] = None,
+    author: str = "learner",
+    status: str = "candidate",
+    label: str = "",
+    rule_config_id: Optional[str] = None,
+) -> RuleConfigArtifact:
+    """Produce a versioned rule-config candidate (never auto-promotes)."""
+    validate_overrides(overrides)
+    validate_regime_overrides(regime_overrides or {})
+    rid = rule_config_id or uuid.uuid4().hex
+    ch = _rule_config_hash(overrides, regime_overrides or {})
+    return RuleConfigArtifact(
+        rule_config_id=rid,
+        overrides=dict(overrides),
+        regime_overrides=dict(regime_overrides or {}),
+        configuration_hash=ch,
+        parent_id=parent_id,
+        status=status,
+        metrics=dict(metrics or {}),
+        label=label,
+        author=author,
+    )
+
+
+def export_champion_compatibility(
+    artifact: RuleConfigArtifact,
+    configs_dir: str = "configs",
+) -> str:
+    """
+    Write configs/champion.json as a compatibility export.
+    Primary deployment truth remains the DeploymentBundle pointer.
+    """
+    rec = artifact.to_config_record()
+    rec.status = "promoted"
+    path = champion_path(configs_dir)
+    return save_config(rec, path)
+
+
+# --------------------------------------------------------------------------- #
 # Demo                                                                          #
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":

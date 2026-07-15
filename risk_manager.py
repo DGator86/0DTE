@@ -14,8 +14,11 @@ Design
 ------
 * check() is read-only: it returns a RiskCheck without mutating state.
 * record_trade() commits a trade: call it only after check() returned approved.
+  Returns a stable position_id for later release_trade().
+* release_trade(position_id) drops an open position from count/gamma on exit;
+  the session daily-loss commitment is retained.
 * State is session-scoped: counters reset automatically when session_date changes.
-* close_positions() clears intraday state explicitly (call at EOD / settlement).
+* close_positions() clears intraday open-position tracking (call at EOD / settlement).
 
 Integration: pass a RiskManager instance to UnifiedOrchestrator.risk_manager.
 The orchestrator calls check() → if approved, record_trade() → then journals
@@ -51,6 +54,7 @@ class RiskCheck:
 
 @dataclass
 class _Pos:
+    id: str
     max_loss: float
     gamma: float
     family: str
@@ -102,14 +106,33 @@ class RiskManager:
 
         return RiskCheck(approved=not vetoes, vetoes=vetoes)
 
-    def record_trade(self, candidate, session_date: str) -> None:
-        """Commit a trade. Call only after check() returned approved=True."""
+    def record_trade(
+        self, candidate, session_date: str, *, position_id: Optional[str] = None,
+    ) -> str:
+        """Commit a trade. Call only after check() returned approved=True.
+
+        Returns the stable risk-position id (for later ``release_trade``).
+        Daily-loss commitment remains session-scoped even after release.
+        """
+        import uuid
         self._maybe_reset(session_date)
+        pid = str(position_id or uuid.uuid4().hex[:12])
         ml = candidate.max_loss or 0.0
         self._positions.append(
-            _Pos(max_loss=ml, gamma=abs(candidate.gamma or 0.0), family=candidate.family)
+            _Pos(id=pid, max_loss=ml,
+                 gamma=abs(candidate.gamma or 0.0), family=candidate.family)
         )
         self._daily_loss += ml
+        return pid
+
+    def release_trade(self, position_id: str) -> bool:
+        """Drop an open position from count/gamma on intraday exit.
+
+        Does **not** unwind the session daily-loss commitment.
+        """
+        before = len(self._positions)
+        self._positions = [p for p in self._positions if p.id != str(position_id)]
+        return len(self._positions) < before
 
     def close_positions(self) -> None:
         """Clear open position tracking. Call at EOD / after settlement."""

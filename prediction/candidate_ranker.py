@@ -19,7 +19,7 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 
 from prediction.candidate_dataset import (
-    build_candidate_feature_row, candidate_id_for,
+    build_candidate_feature_row,
     fill_uncertainty_from_execution, legacy_metrics_from_candidate,
     legs_as_dicts,
 )
@@ -170,13 +170,17 @@ def rank_candidates(
     for c in candidates:
         cid = None
         # Prefer matching via forecast keys already assigned
-        for k, fc in forecasts.items():
-            # identity by object attribute if present
-            if getattr(c, "_v2_candidate_id", None) == k:
+        aliases = (
+            getattr(c, "candidate_id", None),
+            getattr(c, "v2_candidate_id", None),
+            getattr(c, "_v2_candidate_id", None),
+        )
+        for k in forecasts:
+            if any(a is not None and str(a) == str(k) for a in aliases):
                 cid = k
                 break
         if cid is None:
-            # fall through: caller should have set _v2_candidate_id
+            # fall through: caller should have stamped candidate_id
             continue
         if require_veto_pass and not getattr(c, "passes_vetoes", True):
             continue
@@ -217,9 +221,10 @@ def run_shadow_ranking(
     caps = []
     legacy_scores = []
     feasible = []
+    from prediction.candidate_universe import stamp_candidate_id
+
     for c in candidates:
-        cid = candidate_id_for(snapshot_id, c)
-        setattr(c, "_v2_candidate_id", cid)
+        cid = stamp_candidate_id(c, snapshot_id)
         ids.append(cid)
         rows.append(build_candidate_feature_row(
             c, snapshot_id=snapshot_id, spot=spot,
@@ -245,8 +250,12 @@ def run_shadow_ranking(
     legacy_pool = feasible or list(candidates)
     legacy_top = (max(legacy_pool, key=lambda c: float(c.score or 0.0))
                   if legacy_pool else None)
-    legacy_top_id = (getattr(legacy_top, "_v2_candidate_id", None)
-                     if legacy_top is not None else None)
+    legacy_top_id = (
+        (getattr(legacy_top, "candidate_id", None)
+         or getattr(legacy_top, "v2_candidate_id", None)
+         or getattr(legacy_top, "_v2_candidate_id", None))
+        if legacy_top is not None else None
+    )
 
     # V2 top among veto-passing (hard constraints before ranking)
     v2_ranked = rank_candidates(
@@ -255,8 +264,12 @@ def run_shadow_ranking(
         v2_ranked = rank_candidates(
             candidates, forecasts, cfg=util_cfg, require_veto_pass=False)
     v2_top = v2_ranked[0][0] if v2_ranked else None
-    v2_top_id = (getattr(v2_top, "_v2_candidate_id", None)
-                 if v2_top is not None else None)
+    v2_top_id = (
+        (getattr(v2_top, "candidate_id", None)
+         or getattr(v2_top, "v2_candidate_id", None)
+         or getattr(v2_top, "_v2_candidate_id", None))
+        if v2_top is not None else None
+    )
 
     # Diagnostics (§14.5)
     spearman = None
@@ -303,7 +316,11 @@ def run_shadow_ranking(
         if legacy_top_id:
             keep_ids.add(legacy_top_id)
         for c in candidates:
-            cid = getattr(c, "_v2_candidate_id", None)
+            cid = (
+                getattr(c, "candidate_id", None)
+                or getattr(c, "v2_candidate_id", None)
+                or getattr(c, "_v2_candidate_id", None)
+            )
             if cid not in keep_ids:
                 continue
             fc = forecasts.get(cid)

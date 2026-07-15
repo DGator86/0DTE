@@ -109,11 +109,21 @@ class ShadowRunner:
         prediction_db: Optional[str] = None,  # None = <state_dir>/prediction_store.sqlite
         use_legacy_directional_tilt: bool = True,
         enable_v2_parallel: bool = True,      # heuristic bundle + ranker always on
+        deployment_path: Optional[str] = None,
+        models_dir: str = "models",
+        deployment_mode: Optional[str] = None,
+        fallback_policy: Optional[str] = None,
+        strict_artifacts: bool = False,
+        reference_paper_db: Optional[str] = None,
+        candidate_paper_db: Optional[str] = None,
     ) -> None:
         self.symbol = symbol
         self.interval_s = interval_s
         self.live_state_path = live_state_path
         self.policy_mode = policy_mode
+        self.deployment_bundle = None
+        self.prediction_runtime = None
+        self.decision_stack = None
 
         self._jrn = Journal(db_path)
         # Adaptive state (GEX percentile window, scale books) lives next to the
@@ -132,6 +142,9 @@ class ShadowRunner:
             gex_history_path=os.path.join(state_dir, "gex_history.json"),
         )
         self._risk = RiskManager(risk_cfg) if risk_cfg else None
+        # Separate candidate-account risk ledger when dual-paper is enabled.
+        # Created later once we know candidate_paper_db; placeholder for now.
+        self._candidate_risk = None
         # One RASConfig shared by the orchestrator (scores + actions), the
         # position monitor (action suppression), and the paper broker (whether
         # an "exit" action actually closes) — a single flag, never three that
@@ -182,6 +195,170 @@ class ShadowRunner:
                      "legacy_tilt=%s",
                      policy_mode, pred_db, use_legacy_directional_tilt)
 
+        # Unified deployment bundle + PredictionRuntime (UNIFIED handoff PR1+).
+        # Default shadow deployment allows labeled heuristic baseline.
+        # Candidate/champion refuse heuristic substitution.
+        if deployment_path is None:
+            deployment_path = os.path.join("configs", "deployment.json")
+        requested_mode = str(
+            deployment_mode or policy_mode or "shadow").lower()
+        strict_required = (
+            bool(strict_artifacts)
+            or requested_mode in ("candidate", "champion")
+            or str(policy_mode or "").lower() in ("candidate", "champion")
+        )
+        if deployment_path and not os.path.isfile(deployment_path):
+            if strict_required:
+                from prediction.deployment import DeploymentError
+                raise DeploymentError(
+                    f"deployment file required for mode={requested_mode!r} "
+                    f"but not found: {deployment_path}")
+            log.warning("Deployment file missing (shadow-safe): %s",
+                        deployment_path)
+        if deployment_path and os.path.isfile(deployment_path):
+            from prediction.deployment import (
+                DeploymentBundle, load_deployment_bundle, DeploymentError,
+            )
+            from prediction.registry import ModelRegistry
+            from prediction.runtime import (
+                PredictionRuntime, PredictionRuntimeError,
+            )
+            from decision_stack.stack import UnifiedDecisionStack
+            try:
+                bundle = load_deployment_bundle(deployment_path)
+                from dataclasses import replace as _dc_replace
+                from prediction.deployment import (
+                    configuration_hash as _cfg_hash,
+                    validate_deployment_bundle as _val_bundle,
+                )
+                overridden = False
+                if deployment_mode:
+                    bundle = _dc_replace(bundle, mode=str(deployment_mode))
+                    overridden = True
+                if fallback_policy:
+                    bundle = _dc_replace(
+                        bundle, fallback_policy=str(fallback_policy))
+                    overridden = True
+                if overridden:
+                    # CLI overrides must revalidate and rehash — never report
+                    # a hash that describes a different mode/fallback.
+                    import uuid as _uuid
+                    bundle = _dc_replace(
+                        bundle,
+                        deployment_id=(
+                            f"{bundle.deployment_id}-ovr-"
+                            f"{_uuid.uuid4().hex[:8]}"),
+                        configuration_hash="",
+                    )
+                    _val_bundle(bundle)
+                    bundle = _dc_replace(
+                        bundle,
+                        configuration_hash=_cfg_hash(bundle.to_dict()),
+                    )
+                registry = ModelRegistry(models_dir)
+                # strict=True forces fail-closed; None lets candidate/champion
+                # auto-strict. Never pass False — that would disable
+                # fail-closed for candidate/champion modes.
+                runtime = PredictionRuntime.from_deployment_bundle(
+                    bundle, registry,
+                    strict=True if strict_artifacts else None,
+                )
+                self.deployment_bundle = bundle
+                self.prediction_runtime = runtime
+
+                # One authority state machine: reject CLI policy_mode that
+                # disagrees with the deployment bundle mode.
+                dep_mode = str(bundle.mode or "shadow").lower()
+                pm = str(policy_mode or "shadow").lower()
+                if pm == "champion" and dep_mode != "champion":
+                    raise DeploymentError(
+                        f"policy_mode=champion inconsistent with "
+                        f"deployment mode={dep_mode!r}; refuse dual authority")
+                if dep_mode == "champion" and pm not in ("champion", "shadow"):
+                    raise DeploymentError(
+                        f"policy_mode={pm!r} inconsistent with "
+                        f"deployment mode=champion")
+                # When unified stack is active, V2 policy stays journal-only
+                # (shadow) so it cannot mutate the legacy baseline before the
+                # stack's authority router runs. Champion notifications use
+                # authoritative_decision from the stack.
+                if dep_mode in ("candidate", "champion", "advisory", "shadow"):
+                    policy_mode = "shadow"
+                self.policy_mode = policy_mode
+
+                def _persist(record, snapshot=None, universe=None,
+                             forecast=None, v3_result=None):
+                    from decision_stack.persistence import (
+                        persist_unified_decision,
+                    )
+                    evaluations = None
+                    meta_row = None
+                    fill_attempts = None
+                    if v3_result is not None:
+                        evaluations = getattr(v3_result, "evaluations", None)
+                        if evaluations is None and isinstance(v3_result, dict):
+                            evaluations = v3_result.get("evaluations")
+                        meta_row = getattr(v3_result, "meta", None)
+                        if meta_row is None and isinstance(v3_result, dict):
+                            meta_row = v3_result.get("meta") or v3_result.get(
+                                "meta_decision")
+                        if meta_row is None and hasattr(v3_result, "to_dict"):
+                            d = v3_result.to_dict()
+                            meta_row = d.get("meta") or d.get("meta_decision")
+                        fill_attempts = getattr(v3_result, "fill_attempts", None)
+                        if fill_attempts is None and isinstance(v3_result, dict):
+                            fill_attempts = v3_result.get("fill_attempts")
+                    persist_unified_decision(
+                        self._prediction_store, record,
+                        snapshot=snapshot, universe=universe,
+                        forecast=forecast, evaluations=evaluations,
+                        fill_attempts=fill_attempts, meta_row=meta_row,
+                    )
+
+                self.decision_stack = UnifiedDecisionStack(
+                    deployment=bundle,
+                    prediction_runtime=runtime,
+                    legacy_config=self.champion,
+                    stores={"prediction": self._prediction_store},
+                    persist_fn=_persist,
+                )
+                ids = runtime.component_ids()
+                log.info(
+                    "Deployment loaded: id=%s mode=%s fallback=%s "
+                    "hash=%s heuristic=%s feature=%s label=%s "
+                    "strict=%s components=%s",
+                    ids.get("deployment_id"), ids.get("mode"),
+                    ids.get("fallback_policy"),
+                    (bundle.configuration_hash or "")[:12],
+                    ids.get("heuristic"),
+                    ids.get("feature_version"), ids.get("label_version"),
+                    runtime.strict,
+                    {k: v for k, v in ids.items()
+                     if k.endswith("_id") and v},
+                )
+                if runtime.artifacts.model_group is not None:
+                    from prediction.inference import (
+                        make_bundle_provider as _mk_bp,
+                        make_physical_forecast_provider as _mk_pf,
+                    )
+                    bundle_provider = _mk_bp(
+                        symbol=symbol,
+                        group=runtime.artifacts.model_group,
+                        store=self._prediction_store,
+                    )
+                    physical_provider = _mk_pf(bundle_provider)
+                    if runtime.artifacts.candidate_value is not None:
+                        candidate_model = runtime.artifacts.candidate_value
+            except (DeploymentError, PredictionRuntimeError) as exc:
+                mode_now = deployment_mode
+                try:
+                    mode_now = bundle.mode  # noqa: F821 — set if load got that far
+                except Exception:
+                    pass
+                if strict_artifacts or mode_now in ("candidate", "champion"):
+                    raise
+                log.warning("Deployment load degraded (shadow-safe): %s", exc)
+
         self._orch = UnifiedOrchestrator(
             feed=self._feed, journal=self._jrn, risk_manager=self._risk,
             engine_cfg=engine_cfg, classifier_cfg=classifier_cfg,
@@ -195,6 +372,8 @@ class ShadowRunner:
             physical_forecast_provider=physical_provider,
             candidate_value_model=candidate_model,
             use_legacy_directional_tilt=use_legacy_directional_tilt,
+            decision_stack=self.decision_stack,
+            deployment_bundle=self.deployment_bundle,
         )
         # Record every tick (market + chain + incremental bars) so a REAL-data
         # walk-forward becomes possible. ~1 MB/session gzipped; you cannot
@@ -210,11 +389,30 @@ class ShadowRunner:
         # exits. No real orders are ever placed.
         paper_cfg = dataclasses.replace(paper_cfg or PaperConfig(),
                                         ras_exit_enabled=ras_exit)
+        primary_paper_db = (
+            reference_paper_db or paper_db or "paper.sqlite")
         self._paper = PaperBroker(
-            db_path=paper_db or "paper.sqlite",
+            db_path=primary_paper_db,
             cfg=paper_cfg, notifier=self._notifier, symbol=symbol,
             position_monitor=PositionMonitor(PositionRiskConfig(ras=self._ras_cfg)),
+            risk_manager=self._risk,
         )
+        self._candidate_paper = None
+        if candidate_paper_db:
+            # Independent risk state for the V3 candidate account.
+            self._candidate_risk = (
+                RiskManager(risk_cfg) if risk_cfg else RiskManager()
+            )
+            self._candidate_paper = PaperBroker(
+                db_path=candidate_paper_db,
+                cfg=paper_cfg, notifier=None, symbol=symbol,
+                position_monitor=PositionMonitor(
+                    PositionRiskConfig(ras=self._ras_cfg)),
+                risk_manager=self._candidate_risk,
+            )
+            self._orch.candidate_risk_manager = self._candidate_risk
+            log.info("Candidate paper account: %s (separate risk ledger)",
+                     candidate_paper_db)
         # Link paper fills into the prediction store so learning/validation
         # can join features → decisions → outcomes per track.
         self._wire_paper_parity_hooks()
@@ -253,8 +451,11 @@ class ShadowRunner:
                 store, pos=pos, pnl_dollars=pnl_dollars,
                 exit_reason=exit_reason, closed_at=closed_at)
 
-        self._paper.on_track_open = _on_open
-        self._paper.on_track_close = _on_close
+        for broker in (self._paper, self._candidate_paper):
+            if broker is None:
+                continue
+            broker.on_track_open = _on_open
+            broker.on_track_close = _on_close
 
     # -- public API ----------------------------------------------------------
 
@@ -427,28 +628,75 @@ class ShadowRunner:
             mult,
         )
 
-        if (result.decision is not None
-                and result.decision.decision == "TRADE"
-                and result.decision.gate_pass):
-            ticket = Ticket.from_tick_result(result, self.symbol)
+        # Authoritative TRADE for notifications: prefer unified record when
+        # present (champion / fallback-aware); otherwise legacy decision.
+        auth = getattr(result, "authoritative_decision", None)
+        auth_action = None
+        if isinstance(auth, dict):
+            auth_action = auth.get("final_action")
+        notify_trade = False
+        if auth_action == "TRADE":
+            notify_trade = True
+        elif (auth_action is None
+              and result.decision is not None
+              and result.decision.decision == "TRADE"
+              and result.decision.gate_pass):
+            notify_trade = True
+        if notify_trade:
+            # Prefer authoritative unified candidate; fall back to legacy.
+            ticket = Ticket.from_unified_decision(result, self.symbol)
+            if ticket is None:
+                ticket = Ticket.from_tick_result(result, self.symbol)
             self._notifier.send(ticket)
 
-        # Drive the paper broker: mark open positions and auto-execute exits/
-        # entries on simulated fills. Never raises into the tick loop.
+        # Reference paper account: legacy (+ v2) only when a separate
+        # candidate account exists — never duplicate V3 fills into both DBs.
         try:
-            for ev in self._paper.on_tick(now, result):
+            if self._candidate_paper is not None:
+                ref_intents = [
+                    i for i in (result.paper_intents or [])
+                    if str(i.get("track") or "").lower() != "v3"
+                ]
+                ref_result = dataclasses.replace(
+                    result, paper_intents=ref_intents)
+            else:
+                ref_result = result
+            for ev in self._paper.on_tick(now, ref_result):
                 log.info("  %s  (paper equity=$%.2f)", ev, self._paper.cash)
         except Exception as exc:
             log.warning("paper broker error: %s", exc)
 
+        # Candidate dual-paper account: V3 track intents only.
+        if self._candidate_paper is not None:
+            try:
+                v3_intents = [
+                    i for i in (result.paper_intents or [])
+                    if i.get("track") == "v3"
+                ]
+                if v3_intents:
+                    cand_result = dataclasses.replace(
+                        result, paper_intents=v3_intents)
+                    for ev in self._candidate_paper.on_tick(now, cand_result):
+                        log.info("  [candidate] %s  (equity=$%.2f)",
+                                 ev, self._candidate_paper.cash)
+            except Exception as exc:
+                log.warning("candidate paper broker error: %s", exc)
+
         try:
+            paper_summary = self._paper.report(now)
+            if self._candidate_paper is not None:
+                paper_summary = {
+                    **paper_summary,
+                    "candidate_account": self._candidate_paper.report(now),
+                }
             write_live_state(
                 self.live_state_path,
                 serialize_tick_result(
                     result,
                     feed_source=getattr(self._feed, "last_source", None),
-                    paper_summary=self._paper.report(now),
+                    paper_summary=paper_summary,
                     market_status=market_status(now),
+                    part3=getattr(result, "part3", None),
                 ),
             )
         except Exception as exc:
@@ -468,6 +716,8 @@ class ShadowRunner:
                 self._recorder.record_settlement(session_date, price)
         if self._risk:
             self._risk.close_positions()
+        if getattr(self, "_candidate_risk", None) is not None:
+            self._candidate_risk.close_positions()
         if n > 0:
             log.info("Settled %s: %d rows updated with EOD price.", session_date, n)
         else:
@@ -533,6 +783,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-v2-parallel", dest="enable_v2_parallel",
                    action="store_false",
                    help="Disable V2 heuristic bundle / ranker / prediction store")
+    p.add_argument("--deployment", dest="deployment_path", default=None,
+                   help="Deployment bundle JSON "
+                        "(default: configs/deployment.json when present)")
+    p.add_argument("--models-dir", dest="models_dir", default="models",
+                   help="Model registry directory")
+    p.add_argument("--mode", dest="deployment_mode", default=None,
+                   choices=["research", "shadow", "advisory", "candidate",
+                            "champion"],
+                   help="Override deployment mode (default: from bundle)")
+    p.add_argument("--fallback-policy", dest="fallback_policy", default=None,
+                   choices=["abstain", "legacy", "no_trade"],
+                   help="Override fallback policy for champion failures")
+    p.add_argument("--strict-artifacts", dest="strict_artifacts",
+                   action="store_true",
+                   help="Fail closed on missing deployment artifacts")
+    p.add_argument("--reference-paper-db", dest="reference_paper_db",
+                   default=None,
+                   help="Reference (legacy) paper account sqlite path")
+    p.add_argument("--candidate-paper-db", dest="candidate_paper_db",
+                   default=None,
+                   help="Candidate (V3) paper account sqlite path")
     return p
 
 
@@ -568,6 +839,13 @@ if __name__ == "__main__":
         prediction_db=args.prediction_db,
         use_legacy_directional_tilt=args.use_legacy_directional_tilt,
         enable_v2_parallel=args.enable_v2_parallel,
+        deployment_path=args.deployment_path,
+        models_dir=args.models_dir,
+        deployment_mode=args.deployment_mode,
+        fallback_policy=args.fallback_policy,
+        strict_artifacts=args.strict_artifacts,
+        reference_paper_db=args.reference_paper_db,
+        candidate_paper_db=args.candidate_paper_db,
     )
 
     if args.report:

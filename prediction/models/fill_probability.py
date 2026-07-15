@@ -85,14 +85,23 @@ def fill_horizon_labels(
     return {k: np.asarray(v, dtype=int) for k, v in ys.items()}
 
 
-def _features_from_record(rec) -> dict:
+def fill_features_from_attempt(rec) -> dict:
+    """
+    Canonical fill-attempt feature builder (train AND live serve).
+
+    Feature names and units must remain identical across training
+    (`FillProbabilityModel.fit` / `FillConcessionModel.fit`) and live
+    inference. Do not invent alternate live schemas.
+    """
     if isinstance(rec, dict):
         d = rec
     else:
         d = rec.to_dict() if hasattr(rec, "to_dict") else dict(rec.__dict__)
     mid = float(d.get("mid_credit_at_submit") or 0.0)
     nat = float(d.get("natural_credit_at_submit") or 0.0)
-    lim = float(d.get("limit_credit") or mid)
+    lim = float(d.get("limit_credit") if d.get("limit_credit") is not None else mid)
+    qa = d.get("quote_age_seconds")
+    mtc = d.get("minutes_to_close")
     return {
         "n_legs": float(d.get("n_legs") or 0),
         "is_credit": 1.0 if (d.get("side") or "credit").lower()
@@ -102,8 +111,10 @@ def _features_from_record(rec) -> dict:
         "relative_spread": float(d.get("relative_spread") or 0.0),
         "absolute_spread": float(d.get("absolute_spread") or 0.0),
         "option_price_scale": float(d.get("option_price_scale") or 0.0),
-        "quote_age_seconds": float(d.get("quote_age_seconds") or 0.0),
-        "minutes_to_close": float(d.get("minutes_to_close") or 0.0),
+        # Unknown age stays None so FeatureVectorizer marks missingness —
+        # never treat unknown as a fresh (0s) quote.
+        "quote_age_seconds": None if qa is None else float(qa),
+        "minutes_to_close": None if mtc is None else float(mtc),
         "realized_volatility": d.get("realized_volatility"),
         "implied_remaining_move": d.get("implied_remaining_move"),
         "data_quality": d.get("data_quality"),
@@ -112,6 +123,10 @@ def _features_from_record(rec) -> dict:
         "family_code": float(
             sum(ord(c) for c in str(d.get("family") or "")) % 97),
     }
+
+
+# Backward-compatible alias used by existing training code.
+_features_from_record = fill_features_from_attempt
 
 
 @dataclass
