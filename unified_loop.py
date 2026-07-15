@@ -174,6 +174,10 @@ class UnifiedOrchestrator:
     # signature: (snap, signals, intent, regime_state) -> PredictionBundle|None.
     prediction_bundle: Optional[object] = None
     prediction_bundle_provider: Optional[Callable] = None
+    # When True (default), all paper tracks share the same risk envelope:
+    # matrix stand-down blocks legacy/v2/v3, and V3 fills go through Track A
+    # decide()+gate like V2 so sizing/gates are comparable.
+    paper_fair_comparison: bool = True
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
@@ -499,6 +503,7 @@ class UnifiedOrchestrator:
             # Part 3 shadow decision (observation-only) for dashboard assessment.
             try:
                 from prediction.part3_shadow import build_part3_live_payload
+                from prediction.track_parity import flatten_part3_signals
                 ts_iso = getattr(snap, "ts", None)
                 if hasattr(ts_iso, "isoformat"):
                     ts_iso = ts_iso.isoformat()
@@ -507,11 +512,9 @@ class UnifiedOrchestrator:
                 hard = list(getattr(self, "_tick_hard_vetoes", None) or [])
                 for v in (signals.get("_hard_vetoes") or []):
                     hard.append(str(v))
-                # Also surface regime / risk veto strings already on signals
                 for key in ("stand_down_reason", "no_trade_reason"):
                     if signals.get(key):
                         hard.append(str(signals[key]))
-                # Dedupe while preserving order
                 seen = set()
                 hard_u = []
                 for h in hard:
@@ -532,6 +535,7 @@ class UnifiedOrchestrator:
                                   or signals.get("policy_direction")
                                   or "unknown"),
                 )
+                flatten_part3_signals(self._tick_part3, signals)
             except Exception as exc:
                 log.warning("Part 3 shadow payload failed: %s", exc)
                 self._tick_part3 = {
@@ -647,17 +651,42 @@ class UnifiedOrchestrator:
         """
         Build parallel paper intents for legacy / V2 / V3.
 
-        - legacy: matrix intent → Track A decide (independent of champion override)
-        - v2: PredictionPolicy TRADE → decide with V2 structure/direction
-        - v3: Part 3 TRADE → selected shadow candidate
-
-        Session warmup is enforced in PaperBroker. Regime stand-down blocks
-        legacy only — V2/V3 still fill when their engines say TRADE so the
-        tracks can be compared.
+        Fair comparison (paper_fair_comparison=True, default):
+          * matrix stand-down blocks ALL tracks
+          * V2/V3 TRADE still go through Track A decide()+gate
+          * sizing uses the same gate Kelly / size_cap path
+          * every intent carries snapshot_id for learning joins
         """
+        from prediction.track_parity import family_to_structure
+
         intents: list = []
         if snap is None or snap.chain is None:
             return intents
+
+        fair = bool(getattr(self, "paper_fair_comparison", True))
+        snap_id = str(signals.get("_snapshot_id") or "")
+        blocked = bool(matrix_stand_down) if fair else False
+
+        def _intent(track, cand, *, size_mult, gate_kelly, gate_score,
+                    structure, direction, reason, candidate_id=None,
+                    extra=None):
+            row = {
+                "track": track,
+                "candidate": cand,
+                "size_mult": float(size_mult or 1.0) or 1.0,
+                "gate_kelly": gate_kelly,
+                "gate_score": gate_score,
+                "structure": structure,
+                "direction": direction,
+                "reason": reason,
+                "snapshot_id": snap_id,
+                "candidate_id": candidate_id or getattr(
+                    cand, "_v2_candidate_id", None) or getattr(
+                    cand, "v2_candidate_id", None),
+            }
+            if extra:
+                row.update(extra)
+            return row
 
         # ---- LEGACY (matrix) ----
         raw_struct = getattr(getattr(intent, "decision", None), "structure", None)
@@ -667,8 +696,8 @@ class UnifiedOrchestrator:
             and raw_struct not in (None, "NT", "none", "NONE")
         )
         if legacy_ok:
-            # Prefer the live decision candidate when it already matches matrix
             leg_cand = None
+            gate_kelly = gate_score = None
             if (decision is not None and getattr(decision, "decision", None) == "TRADE"
                     and getattr(decision, "gate_pass", False)
                     and decision.candidate is not None
@@ -686,16 +715,15 @@ class UnifiedOrchestrator:
                 gate_kelly = getattr(leg_dec, "gate_kelly", None) if leg_dec else None
                 gate_score = getattr(leg_dec, "gate_score", None) if leg_dec else None
             if leg_cand is not None:
-                intents.append({
-                    "track": "legacy",
-                    "candidate": leg_cand,
-                    "size_mult": float(getattr(intent, "size_mult", 1.0) or 1.0),
-                    "gate_kelly": gate_kelly,
-                    "gate_score": gate_score,
-                    "structure": raw_struct,
-                    "direction": raw_dir,
-                    "reason": "matrix_intent",
-                })
+                intents.append(_intent(
+                    "legacy", leg_cand,
+                    size_mult=float(getattr(intent, "size_mult", 1.0) or 1.0),
+                    gate_kelly=gate_kelly, gate_score=gate_score,
+                    structure=raw_struct, direction=raw_dir,
+                    reason="matrix_intent"))
+
+        if blocked:
+            return intents
 
         # ---- V2 (PredictionPolicy) ----
         v2_action = str(signals.get("v2_policy_action") or "").upper()
@@ -704,7 +732,6 @@ class UnifiedOrchestrator:
         if v2_action == "TRADE" and v2_struct not in (None, "NT", "none", "NONE", ""):
             v2_mode = density_mode
             v2_moments = density_moments
-            # Prefer V2 physical density when available on signals
             if signals.get("phys_density_mode") == "v2":
                 v2_mode = "v2"
             v2_dec = self._resolve_structure_candidate(
@@ -713,7 +740,7 @@ class UnifiedOrchestrator:
                 pin_active=pin_active, density_mode=v2_mode,
                 density_moments=v2_moments)
             v2_cand = getattr(v2_dec, "candidate", None) if v2_dec else None
-            if v2_cand is None:
+            if v2_cand is None and not fair:
                 v2_cand = self._pick_shadow_candidate(
                     family=signals.get("v2_top_family"),
                     structure_code=str(v2_struct),
@@ -722,42 +749,52 @@ class UnifiedOrchestrator:
                 size = float(signals.get("policy_size_cap")
                              or signals.get("v2_policy_size_cap")
                              or 1.0)
-                intents.append({
-                    "track": "v2",
-                    "candidate": v2_cand,
-                    "size_mult": size,
-                    "gate_kelly": getattr(v2_dec, "gate_kelly", None) if v2_dec else None,
-                    "gate_score": getattr(v2_dec, "gate_score", None) if v2_dec else None,
-                    "structure": v2_struct,
-                    "direction": v2_dir,
-                    "reason": "prediction_policy",
-                })
+                intents.append(_intent(
+                    "v2", v2_cand,
+                    size_mult=size,
+                    gate_kelly=getattr(v2_dec, "gate_kelly", None) if v2_dec else None,
+                    gate_score=getattr(v2_dec, "gate_score", None) if v2_dec else None,
+                    structure=v2_struct, direction=v2_dir,
+                    reason="prediction_policy",
+                    candidate_id=signals.get("v2_top_candidate_id")))
 
-        # ---- V3 (Part 3 TradeDecisionV3) ----
+        # ---- V3 (Part 3) — TRADE decision from meta; fill via gated decide() ----
         part3 = getattr(self, "_tick_part3", None) or {}
         ds = part3.get("decision_summary") or {}
-        # Use statistical_action so regime stand-down overlay doesn't erase
-        # the prediction-engine decision we want to paper-trade.
-        v3_action = str(ds.get("statistical_action") or ds.get("action") or "").upper()
+        v3_action = str(
+            ds.get("statistical_action") or ds.get("action") or "").upper()
         if v3_action == "TRADE":
             cid = ds.get("selected_candidate_id")
-            v3_cand = self._pick_shadow_candidate(
-                candidate_id=cid,
-                family=ds.get("family") or (part3.get("ranking") or {}).get("top_family"),
-            )
+            fam = ds.get("family") or (part3.get("ranking") or {}).get("top_family")
+            v3_struct = family_to_structure(fam) or signals.get("v2_policy_structure")
+            v3_dir = ds.get("direction") or signals.get("v2_policy_direction") or "both"
+            v3_dec = None
+            v3_cand = None
+            if v3_struct:
+                v3_mode = "v2" if signals.get("phys_density_mode") == "v2" else density_mode
+                v3_dec = self._resolve_structure_candidate(
+                    snap, decide_pdf, cfg,
+                    structure=str(v3_struct), direction=str(v3_dir),
+                    pin_active=pin_active, density_mode=v3_mode,
+                    density_moments=density_moments)
+                v3_cand = getattr(v3_dec, "candidate", None) if v3_dec else None
+            if v3_cand is None and not fair:
+                v3_cand = self._pick_shadow_candidate(
+                    candidate_id=cid, family=fam)
             if v3_cand is not None:
-                intents.append({
-                    "track": "v3",
-                    "candidate": v3_cand,
-                    "size_mult": float(final_size_mult or 1.0) or 1.0,
-                    "gate_kelly": None,
-                    "gate_score": None,
-                    "structure": ds.get("family"),
-                    "direction": ds.get("direction") or signals.get("v2_policy_direction"),
-                    "candidate_id": cid,
-                    "v3_action": v3_action,
-                    "reason": "part3_meta",
-                })
+                size = float(signals.get("policy_size_cap")
+                             or signals.get("v2_policy_size_cap")
+                             or final_size_mult
+                             or 1.0)
+                intents.append(_intent(
+                    "v3", v3_cand,
+                    size_mult=size,
+                    gate_kelly=getattr(v3_dec, "gate_kelly", None) if v3_dec else None,
+                    gate_score=getattr(v3_dec, "gate_score", None) if v3_dec else None,
+                    structure=v3_struct or fam, direction=v3_dir,
+                    reason="part3_meta",
+                    candidate_id=cid,
+                    extra={"v3_action": v3_action}))
 
         return intents
 

@@ -15,6 +15,7 @@ EnvironmentFile=/etc/zerodte/zerodte.env
 ExecStart=/opt/zerodte/venv/bin/python /opt/zerodte/validation_pipeline.py \
     --mode daily \
     --db /var/lib/zerodte/shadow.db \
+    --paper-db /var/lib/zerodte/paper.sqlite \
     --record-dir /var/lib/zerodte/ticks \
     --notify
 
