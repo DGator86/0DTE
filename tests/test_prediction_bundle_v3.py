@@ -90,30 +90,33 @@ def test_e2e_replay_determinism_shadow_bundle(tmp_path):
         PredictionModelGroup, build_prediction_bundle, run_shadow_predictions,
     )
 
-    rng = np.random.default_rng(42)
-    store = PredictionStore(db_path=str(tmp_path / "pred.sqlite"))
-    rows, y, sessions = [], [], []
-    for s in range(10):
-        date = f"2026-07-{s + 1:02d}"
-        for j in range(8):
-            x = float(rng.standard_normal())
-            feat = {"signal": x, "noise": float(rng.standard_normal())}
-            sid = f"{date}-r{j}"
-            store.log_feature_snapshot(ObservationRow(
-                snapshot_id=sid, session_date=date,
-                ts=f"{date}T14:30:00Z", symbol="SPY",
-                feature_version=FEATURE_VERSION,
-                minutes_since_open=60.0, minutes_to_close=180.0,
-                spot=600.0, features=feat, standardized={},
-                missingness={}, source_ages={},
-                quality={"feature_coverage": 0.9},
-            ))
-            store.log_labels(sid, {"up_30m": int(rng.uniform() < 1 / (1 + np.exp(-2 * x)))},
-                             label_version="v2.0.0")
-            rows.append(feat)
-            y.append(int(rng.uniform() < 1 / (1 + np.exp(-2 * x))))
-            sessions.append(date)
+    def _populate(store, seed=42):
+        rng = np.random.default_rng(seed)
+        rows, y, sessions = [], [], []
+        for s in range(10):
+            date = f"2026-07-{s + 1:02d}"
+            for j in range(8):
+                x = float(rng.standard_normal())
+                feat = {"signal": x, "noise": float(rng.standard_normal())}
+                sid = f"{date}-r{j}"
+                lab = int(rng.uniform() < 1 / (1 + np.exp(-2 * x)))
+                store.log_feature_snapshot(ObservationRow(
+                    snapshot_id=sid, session_date=date,
+                    ts=f"{date}T14:30:00Z", symbol="SPY",
+                    feature_version=FEATURE_VERSION,
+                    minutes_since_open=60.0, minutes_to_close=180.0,
+                    spot=600.0, features=feat, standardized={},
+                    missingness={}, source_ages={},
+                    quality={"feature_coverage": 0.9},
+                ))
+                store.log_labels(sid, {"up_30m": lab}, label_version="v2.0.0")
+                rows.append(feat)
+                y.append(lab)
+                sessions.append(date)
+        return rows, y, sessions
 
+    store = PredictionStore(db_path=str(tmp_path / "pred.sqlite"))
+    rows, y, sessions = _populate(store)
     cfg = DirectionModelConfig(
         horizon="30m", c_grid=(1.0,), l1_ratio_grid=(0.0,),
         class_weight_options=(None,), max_iter=300)
@@ -139,19 +142,35 @@ def test_e2e_replay_determinism_shadow_bundle(tmp_path):
     assert n > 0
     preds = store.fetch_predictions(mode="shadow")
     assert len(preds) == n
-    # V3 uncertainty journaled
     unc = store.fetch_uncertainty_outputs()
     assert len(unc) == n
-    # Replay is deterministic: re-run produces identical first prediction
-    store2 = PredictionStore(db_path=str(tmp_path / "pred2.sqlite"))
-    # copy same features by re-logging from first store is heavy; instead
-    # compare two build_prediction_bundle calls (already done) and that
-    # journaled predictions_json round-trips.
     roundtrip = PredictionBundle.from_dict(preds[0]["predictions"])
     assert roundtrip.snapshot_id == preds[0]["snapshot_id"]
     assert roundtrip.uncertainty_components or roundtrip.uncertainty is not None
     assert roundtrip.ood_score is not None
     assert "missing_conformal_component" in (roundtrip.uncertainty_reasons or ())
+
+    # Second identical store + model → identical uncertainty audit fields.
+    store2 = PredictionStore(db_path=str(tmp_path / "pred2.sqlite"))
+    rows2, y2, sessions2 = _populate(store2, seed=42)
+    m3 = DirectionModel(config=cfg).fit(rows2, y2, sessions2)
+    g3 = PredictionModelGroup(
+        direction={"30m": m3}, feature_version=FEATURE_VERSION,
+        group_version="v3-test")
+    n2 = run_shadow_predictions(store2, g3)
+    assert n2 == n
+    preds2 = store2.fetch_predictions(mode="shadow")
+    by_id = {p["snapshot_id"]: p for p in preds}
+    for p2 in preds2:
+        a = PredictionBundle.from_dict(by_id[p2["snapshot_id"]]["predictions"])
+        b = PredictionBundle.from_dict(p2["predictions"])
+        assert a.p_up_30m == pytest.approx(b.p_up_30m)
+        assert a.ood_score == pytest.approx(b.ood_score)
+        assert a.ood_percentile == pytest.approx(b.ood_percentile)
+        assert a.ensemble_size == b.ensemble_size
+        assert a.uncertainty == pytest.approx(b.uncertainty)
+        assert a.uncertainty_components == b.uncertainty_components
+        assert a.uncertainty_reasons == b.uncertainty_reasons
 
 
 def test_run_shadow_predictions_warns_when_schema_is_unavailable():
