@@ -150,6 +150,8 @@ def test_e2e_replay_determinism_shadow_bundle(tmp_path):
     roundtrip = PredictionBundle.from_dict(preds[0]["predictions"])
     assert roundtrip.snapshot_id == preds[0]["snapshot_id"]
     assert roundtrip.uncertainty_components or roundtrip.uncertainty is not None
+    assert roundtrip.ood_score is not None
+    assert "missing_conformal_component" in (roundtrip.uncertainty_reasons or ())
 
 
 def test_run_shadow_predictions_warns_when_schema_is_unavailable():
@@ -173,6 +175,7 @@ def test_run_shadow_predictions_warns_when_uncertainty_logging_fails(monkeypatch
         quality=[{"feature_coverage": 1.0}],
         snapshot_ids=["snap-1"],
         ts=["2026-07-14T14:30:00Z"],
+        labels=[{}],
     )
     monkeypatch.setattr(training, "load_training_frame",
                         lambda *args, **kwargs: frame)
@@ -198,8 +201,70 @@ def test_run_shadow_predictions_warns_when_uncertainty_logging_fails(monkeypatch
         def log_uncertainty_output(self, *args, **kwargs):
             raise sqlite3.OperationalError("no such table: uncertainty_outputs")
 
-    group = SimpleNamespace(feature_version="v3-test",
-                            group_version="group-v3",
-                            uncertainty=lambda: 0.1)
+    group = SimpleNamespace(
+        feature_version="v3-test",
+        group_version="group-v3",
+        direction={},
+        uncertainty=lambda: 0.1,
+    )
     with pytest.warns(RuntimeWarning, match="uncertainty journaling skipped"):
         assert training.run_shadow_predictions(_Store(), group) == 1
+
+
+def test_shadow_populates_ood_and_ensemble_fields(tmp_path):
+    """PR6: shadow path must populate ood_score / ensemble when labels exist."""
+    from prediction.dataset import FEATURE_VERSION, ObservationRow
+    from prediction.models.direction import DirectionModel, DirectionModelConfig
+    from prediction.storage import PredictionStore
+    from prediction.training import PredictionModelGroup, run_shadow_predictions
+
+    rng = np.random.default_rng(7)
+    store = PredictionStore(db_path=str(tmp_path / "ood.sqlite"))
+    rows, y, sessions = [], [], []
+    for s in range(8):
+        date = f"2026-08-{s + 1:02d}"
+        for j in range(6):
+            x = float(rng.standard_normal())
+            feat = {
+                "signal": x,
+                "noise": float(rng.standard_normal()),
+                "realized_vol": abs(float(rng.standard_normal())),
+                "adx": 20.0 + float(rng.standard_normal()),
+                "minutes_to_close": 120.0,
+            }
+            sid = f"{date}-r{j}"
+            store.log_feature_snapshot(ObservationRow(
+                snapshot_id=sid, session_date=date,
+                ts=f"{date}T14:30:00Z", symbol="SPY",
+                feature_version=FEATURE_VERSION,
+                minutes_since_open=60.0, minutes_to_close=180.0,
+                spot=600.0, features=feat, standardized={},
+                missingness={}, source_ages={},
+                quality={"feature_coverage": 0.95},
+            ))
+            lab = int(rng.uniform() < 1 / (1 + np.exp(-1.5 * x)))
+            store.log_labels(sid, {"up_30m": lab}, label_version="v2.0.0")
+            rows.append(feat)
+            y.append(lab)
+            sessions.append(date)
+
+    cfg = DirectionModelConfig(
+        horizon="30m", c_grid=(1.0,), l1_ratio_grid=(0.0,),
+        class_weight_options=(None,), max_iter=300)
+    model = DirectionModel(config=cfg).fit(rows, y, sessions)
+    group = PredictionModelGroup(
+        direction={"30m": model}, feature_version=FEATURE_VERSION,
+        group_version="v3-ood")
+
+    n = run_shadow_predictions(store, group)
+    assert n > 0
+    preds = store.fetch_predictions(mode="shadow")
+    b = PredictionBundle.from_dict(preds[0]["predictions"])
+    assert b.ood_score is not None
+    assert 0.0 <= b.ood_score <= 1.0
+    assert b.ood_percentile is not None
+    assert b.uncertainty_components.get("out_of_distribution") is not None
+    # Ensemble fits when enough labeled sessions exist
+    assert b.ensemble_size is not None and b.ensemble_size >= 5
+    assert "missing_conformal_component" in b.uncertainty_reasons
+    assert "missing_out_of_distribution_component" not in b.uncertainty_reasons
