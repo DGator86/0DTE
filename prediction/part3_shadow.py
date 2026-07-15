@@ -177,11 +177,7 @@ def build_part3_live_payload(
     cand_rows = []
     abs_utils = {}
     for c in candidates:
-        cid = (
-            getattr(c, "candidate_id", None)
-            or getattr(c, "v2_candidate_id", None)
-            or getattr(c, "_v2_candidate_id", None)
-        )
+        cid = getattr(c, "_v2_candidate_id", None) or getattr(c, "v2_candidate_id", None)
         if not cid:
             continue
         fc = forecasts.get(cid)
@@ -245,11 +241,7 @@ def build_part3_live_payload(
         top_c = None
         v2_top = signals.get("v2_top_candidate_id")
         for c in candidates:
-            cid = (
-                getattr(c, "candidate_id", None)
-                or getattr(c, "v2_candidate_id", None)
-                or getattr(c, "_v2_candidate_id", None)
-            )
+            cid = getattr(c, "_v2_candidate_id", None)
             if v2_top and cid == v2_top:
                 top_c = c
                 break

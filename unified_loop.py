@@ -39,7 +39,6 @@ import math
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol, Sequence
-from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -102,14 +101,6 @@ class TickResult:
     # Parallel paper fills: list of {track, candidate, size_mult, ...} for
     # legacy / v2 / v3. PaperBroker opens each track independently.
     paper_intents: list = field(default_factory=list)
-    # Unified decision stack (UNIFIED handoff §11.2) — optional until fully wired.
-    legacy_decision: Optional[object] = None
-    v3_decision: Optional[object] = None
-    authoritative_decision: Optional[object] = None
-    authority_source: Optional[str] = None
-    deployment_id: Optional[str] = None
-    fallback_used: bool = False
-    candidate_universe_summary: Optional[dict] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -131,9 +122,6 @@ class UnifiedOrchestrator:
     classifier_cfg: Optional[ClassifierConfig] = None
     physical_pdf: Optional[Callable] = None     # callable(grid)->density for Track A
     risk_manager: Optional[RiskManager] = None
-    # Separate ledger for the V3 candidate dual-paper account (candidate mode).
-    # When None, portfolio_risk_fn falls back to risk_manager for both accounts.
-    candidate_risk_manager: Optional[RiskManager] = None
     state_path: Optional[str] = None            # persist adaptive scales across restarts
     ras_cfg: Optional[RASConfig] = None
     # Static per-dominant-regime engine deltas from the champion config
@@ -186,15 +174,6 @@ class UnifiedOrchestrator:
     # signature: (snap, signals, intent, regime_state) -> PredictionBundle|None.
     prediction_bundle: Optional[object] = None
     prediction_bundle_provider: Optional[Callable] = None
-    # Unified decision stack (UNIFIED handoff). When set, tick() can produce
-    # UnifiedDecisionRecord alongside the legacy path. Legacy remains
-    # authoritative until deployment mode says otherwise.
-    decision_stack: Optional[object] = None
-    deployment_bundle: Optional[object] = None
-    # When True (default), all paper tracks share the same risk envelope:
-    # matrix stand-down blocks legacy/v2/v3, and V3 fills go through Track A
-    # decide()+gate like V2 so sizing/gates are comparable.
-    paper_fair_comparison: bool = True
 
     def __post_init__(self):
         self._classifier = RegimeClassifier(
@@ -474,12 +453,11 @@ class UnifiedOrchestrator:
             from spread_selector import select_spreads, GammaContext
 
             rcfg = self.candidate_ranker_cfg or RankerConfig()
-            shadow_cands = list(getattr(self, "_tick_shared_cands", None) or [])
-            if not shadow_cands and decision is not None:
+            shadow_cands = []
+            if decision is not None:
                 shadow_cands = list(decision.all_candidates or [])
-            # Prefer the shared tick universe; only regenerate when absent.
-            if not shadow_cands and (
-                    getattr(rcfg, "shadow_all_families", True)):
+            # §14.4: generate outside the routed family for research / NT ticks
+            if getattr(rcfg, "shadow_all_families", True) or not shadow_cands:
                 try:
                     rnd_s = extract_rnd(snap.chain, cfg.rnd)
                     edge_s = compute_edge(
@@ -496,8 +474,6 @@ class UnifiedOrchestrator:
                     log.warning("shadow candidate gen failed: %s", exc)
             if not shadow_cands:
                 return decision
-            self._tick_shared_cands = list(shadow_cands)
-            self._tick_shadow_cands = list(shadow_cands)
             mkt = snap.market
             minutes_left = None
             try:
@@ -523,7 +499,6 @@ class UnifiedOrchestrator:
             # Part 3 shadow decision (observation-only) for dashboard assessment.
             try:
                 from prediction.part3_shadow import build_part3_live_payload
-                from prediction.track_parity import flatten_part3_signals
                 ts_iso = getattr(snap, "ts", None)
                 if hasattr(ts_iso, "isoformat"):
                     ts_iso = ts_iso.isoformat()
@@ -532,9 +507,11 @@ class UnifiedOrchestrator:
                 hard = list(getattr(self, "_tick_hard_vetoes", None) or [])
                 for v in (signals.get("_hard_vetoes") or []):
                     hard.append(str(v))
+                # Also surface regime / risk veto strings already on signals
                 for key in ("stand_down_reason", "no_trade_reason"):
                     if signals.get(key):
                         hard.append(str(signals[key]))
+                # Dedupe while preserving order
                 seen = set()
                 hard_u = []
                 for h in hard:
@@ -555,7 +532,6 @@ class UnifiedOrchestrator:
                                   or signals.get("policy_direction")
                                   or "unknown"),
                 )
-                flatten_part3_signals(self._tick_part3, signals)
             except Exception as exc:
                 log.warning("Part 3 shadow payload failed: %s", exc)
                 self._tick_part3 = {
@@ -573,11 +549,7 @@ class UnifiedOrchestrator:
                             == decision.candidate.short_strikes
                             and c.long_strikes
                             == decision.candidate.long_strikes):
-                        live_id = (
-                            getattr(c, "candidate_id", None)
-                            or getattr(c, "v2_candidate_id", None)
-                            or getattr(c, "_v2_candidate_id", None)
-                        )
+                        live_id = getattr(c, "_v2_candidate_id", None)
                         break
                 if live_id and live_id in ranking.forecasts:
                     fc = ranking.forecasts[live_id]
@@ -597,28 +569,16 @@ class UnifiedOrchestrator:
     def _pick_shadow_candidate(self, candidate_id: Optional[str] = None,
                                family: Optional[str] = None,
                                structure_code: Optional[str] = None):
-        """Pick a concrete SpreadCandidate from this tick's shadow set.
-
-        When ``candidate_id`` is supplied, resolve **exactly** that identity
-        (``candidate_id`` / ``v2_candidate_id`` / ``_v2_candidate_id`` aliases).
-        Never fall back by family — an unresolved explicit ID returns ``None``
-        so the caller can mark the decision UNAVAILABLE rather than paper-
-        trading a substitute.
-        """
+        """Pick a concrete SpreadCandidate from this tick's shadow set."""
         cands = list(getattr(self, "_tick_shadow_cands", None) or [])
         if not cands:
             return None
-        if candidate_id is not None and str(candidate_id).strip():
-            want = str(candidate_id).strip()
+        if candidate_id:
             for c in cands:
-                aliases = (
-                    getattr(c, "candidate_id", None),
-                    getattr(c, "v2_candidate_id", None),
-                    getattr(c, "_v2_candidate_id", None),
-                )
-                if any(a is not None and str(a) == want for a in aliases):
+                cid = getattr(c, "_v2_candidate_id", None) or getattr(
+                    c, "v2_candidate_id", None)
+                if cid == candidate_id:
                     return c
-            return None
         if structure_code:
             try:
                 from spread_selector import STRUCTURE_TO_FAMILIES
@@ -637,10 +597,7 @@ class UnifiedOrchestrator:
         forecasts = getattr(self, "_tick_shadow_forecasts", None) or {}
         best, best_u = None, None
         for c in cands:
-            cid = (
-                getattr(c, "candidate_id", None)
-                or getattr(c, "_v2_candidate_id", None)
-            )
+            cid = getattr(c, "_v2_candidate_id", None)
             fc = forecasts.get(cid) if cid else None
             u = float(getattr(fc, "utility_score", None)
                       or getattr(c, "v2_utility_score", None)
@@ -649,66 +606,6 @@ class UnifiedOrchestrator:
             if best is None or u > best_u:
                 best, best_u = c, u
         return best
-
-    def _ensure_shared_candidate_universe(
-            self, snap, decide_pdf, cfg, *, pin_active: bool = False,
-            snapshot_id: str = "", now: Optional[dt.datetime] = None) -> list:
-        """
-        Generate the tick's candidate set exactly once (all families).
-
-        Legacy decide() and the unified V3 stack both consume this immutable
-        list — never re-run select_spreads for the same tick.
-        """
-        existing = list(getattr(self, "_tick_shared_cands", None) or [])
-        if existing:
-            return existing
-        if snap is None or getattr(snap, "chain", None) is None:
-            self._tick_shared_cands = []
-            return []
-        try:
-            from spread_selector import select_spreads, GammaContext
-            rnd_s = extract_rnd(snap.chain, cfg.rnd)
-            edge_s = compute_edge(
-                rnd_s, snap.chain, cfg.rnd, physical_pdf=decide_pdf)
-            ctx_s = GammaContext.from_market_snapshot(
-                snap.market, pin_active=pin_active)
-            sel = select_spreads(
-                snap.chain, rnd_s, edge_s, ctx_s, cfg.selector,
-                physical_pdf=decide_pdf, target_families=None)
-            cands = list(sel.all_candidates or sel.ranked or [])
-        except Exception as exc:
-            log.warning("shared candidate universe generation failed: %s", exc)
-            cands = []
-        # Stamp stable candidate ids (canonical + v2 aliases)
-        if snapshot_id and cands:
-            try:
-                from prediction.candidate_universe import stamp_candidate_id
-                for c in cands:
-                    stamp_candidate_id(c, snapshot_id)
-            except Exception:
-                pass
-        self._tick_shared_cands = cands
-        self._tick_shadow_cands = list(cands)
-        if snapshot_id and cands:
-            try:
-                from prediction.candidate_universe import build_candidate_universe
-                ts_iso = (now.astimezone(ET).isoformat()
-                          if now is not None else snapshot_id)
-                self._tick_shared_universe = build_candidate_universe(
-                    snapshot_id=snapshot_id,
-                    generated_at=ts_iso,
-                    candidates=cands,
-                    generator_config={
-                        "selector_min_ev": getattr(cfg.selector, "min_ev", None),
-                        "shared": True,
-                    },
-                )
-            except Exception as exc:
-                log.warning("build_candidate_universe failed: %s", exc)
-                self._tick_shared_universe = None
-        else:
-            self._tick_shared_universe = None
-        return cands
 
     def _resolve_structure_candidate(
             self, snap, decide_pdf, cfg, *, structure: str, direction: str,
@@ -721,7 +618,6 @@ class UnifiedOrchestrator:
             return None
         try:
             from decision_engine import decide
-            shared = list(getattr(self, "_tick_shared_cands", None) or [])
             dec = decide(
                 snap.market, snap.chain, cfg,
                 physical_pdf=decide_pdf,
@@ -729,8 +625,7 @@ class UnifiedOrchestrator:
                 direction=direction or "both",
                 physical_density_mode=density_mode,
                 physical_moments=density_moments,
-                pin_active=pin_active,
-                precomputed_candidates=shared if shared else None)
+                pin_active=pin_active)
             if dec is None or dec.candidate is None:
                 return None
             # Prediction-engine paper fills: require gate pass so we don't
@@ -752,47 +647,17 @@ class UnifiedOrchestrator:
         """
         Build parallel paper intents for legacy / V2 / V3.
 
-        Fair comparison (paper_fair_comparison=True, default):
-          * matrix stand-down blocks ALL tracks
-          * V2/V3 TRADE still go through Track A decide()+gate
-          * sizing uses the same gate Kelly / size_cap path
-          * every intent carries snapshot_id for learning joins
-        """
-        from prediction.track_parity import family_to_structure
+        - legacy: matrix intent → Track A decide (independent of champion override)
+        - v2: PredictionPolicy TRADE → decide with V2 structure/direction
+        - v3: Part 3 TRADE → selected shadow candidate
 
+        Session warmup is enforced in PaperBroker. Regime stand-down blocks
+        legacy only — V2/V3 still fill when their engines say TRADE so the
+        tracks can be compared.
+        """
         intents: list = []
         if snap is None or snap.chain is None:
             return intents
-
-        from decision_stack.authority import coerce_size_mult
-
-        fair = (bool(self.paper_fair_comparison)
-                if "paper_fair_comparison" in vars(self)
-                else False)
-        snap_id = str(signals.get("_snapshot_id") or "")
-        blocked = bool(matrix_stand_down) if fair else False
-
-        def _intent(track, cand, *, size_mult, gate_kelly, gate_score,
-                    structure, direction, reason, candidate_id=None,
-                    extra=None):
-            size = coerce_size_mult(size_mult, default=1.0)
-            row = {
-                "track": track,
-                "candidate": cand,
-                "size_mult": size,
-                "gate_kelly": gate_kelly,
-                "gate_score": gate_score,
-                "structure": structure,
-                "direction": direction,
-                "reason": reason,
-                "snapshot_id": snap_id,
-                "candidate_id": candidate_id or getattr(
-                    cand, "_v2_candidate_id", None) or getattr(
-                    cand, "v2_candidate_id", None),
-            }
-            if extra:
-                row.update(extra)
-            return row
 
         # ---- LEGACY (matrix) ----
         raw_struct = getattr(getattr(intent, "decision", None), "structure", None)
@@ -802,8 +667,8 @@ class UnifiedOrchestrator:
             and raw_struct not in (None, "NT", "none", "NONE")
         )
         if legacy_ok:
+            # Prefer the live decision candidate when it already matches matrix
             leg_cand = None
-            gate_kelly = gate_score = None
             if (decision is not None and getattr(decision, "decision", None) == "TRADE"
                     and getattr(decision, "gate_pass", False)
                     and decision.candidate is not None
@@ -821,18 +686,16 @@ class UnifiedOrchestrator:
                 gate_kelly = getattr(leg_dec, "gate_kelly", None) if leg_dec else None
                 gate_score = getattr(leg_dec, "gate_score", None) if leg_dec else None
             if leg_cand is not None:
-                size = coerce_size_mult(
-                    getattr(intent, "size_mult", None), default=1.0)
-                if size > 0.0:
-                    intents.append(_intent(
-                        "legacy", leg_cand,
-                        size_mult=size,
-                        gate_kelly=gate_kelly, gate_score=gate_score,
-                        structure=raw_struct, direction=raw_dir,
-                        reason="matrix_intent"))
-
-        if blocked:
-            return intents
+                intents.append({
+                    "track": "legacy",
+                    "candidate": leg_cand,
+                    "size_mult": float(getattr(intent, "size_mult", 1.0) or 1.0),
+                    "gate_kelly": gate_kelly,
+                    "gate_score": gate_score,
+                    "structure": raw_struct,
+                    "direction": raw_dir,
+                    "reason": "matrix_intent",
+                })
 
         # ---- V2 (PredictionPolicy) ----
         v2_action = str(signals.get("v2_policy_action") or "").upper()
@@ -841,6 +704,7 @@ class UnifiedOrchestrator:
         if v2_action == "TRADE" and v2_struct not in (None, "NT", "none", "NONE", ""):
             v2_mode = density_mode
             v2_moments = density_moments
+            # Prefer V2 physical density when available on signals
             if signals.get("phys_density_mode") == "v2":
                 v2_mode = "v2"
             v2_dec = self._resolve_structure_candidate(
@@ -849,169 +713,51 @@ class UnifiedOrchestrator:
                 pin_active=pin_active, density_mode=v2_mode,
                 density_moments=v2_moments)
             v2_cand = getattr(v2_dec, "candidate", None) if v2_dec else None
-            if v2_cand is None and not fair:
+            if v2_cand is None:
                 v2_cand = self._pick_shadow_candidate(
                     family=signals.get("v2_top_family"),
                     structure_code=str(v2_struct),
                     candidate_id=signals.get("v2_top_candidate_id"))
             if v2_cand is not None:
-                size = coerce_size_mult(
-                    signals.get("policy_size_cap")
-                    if signals.get("policy_size_cap") is not None
-                    else signals.get("v2_policy_size_cap"),
-                    default=1.0,
-                )
-                if size > 0.0:
-                    intents.append(_intent(
-                        "v2", v2_cand,
-                        size_mult=size,
-                        gate_kelly=(getattr(v2_dec, "gate_kelly", None)
-                                    if v2_dec else None),
-                        gate_score=(getattr(v2_dec, "gate_score", None)
-                                    if v2_dec else None),
-                        structure=v2_struct, direction=v2_dir,
-                        reason="prediction_policy",
-                        candidate_id=signals.get("v2_top_candidate_id")))
+                size = float(signals.get("policy_size_cap")
+                             or signals.get("v2_policy_size_cap")
+                             or 1.0)
+                intents.append({
+                    "track": "v2",
+                    "candidate": v2_cand,
+                    "size_mult": size,
+                    "gate_kelly": getattr(v2_dec, "gate_kelly", None) if v2_dec else None,
+                    "gate_score": getattr(v2_dec, "gate_score", None) if v2_dec else None,
+                    "structure": v2_struct,
+                    "direction": v2_dir,
+                    "reason": "prediction_policy",
+                })
 
-        # ---- V3 (unified stack / Part 3 TradeDecisionV3) ----
-        # Prefer the post-stack unified V3 decision so paper intents are built
-        # AFTER authority resolution — never from a stale pre-stack summary.
-        v3 = getattr(self, "_tick_unified_v3", None) or {}
+        # ---- V3 (Part 3 TradeDecisionV3) ----
         part3 = getattr(self, "_tick_part3", None) or {}
         ds = part3.get("decision_summary") or {}
-        v3_action = str(
-            v3.get("final_action")
-            or part3.get("final_action")
-            or ds.get("statistical_action")
-            or ds.get("action")
-            or ""
-        ).upper()
+        # Use statistical_action so regime stand-down overlay doesn't erase
+        # the prediction-engine decision we want to paper-trade.
+        v3_action = str(ds.get("statistical_action") or ds.get("action") or "").upper()
         if v3_action == "TRADE":
-            fam = (v3.get("structure")
-                   or ds.get("family")
-                   or (part3.get("ranking") or {}).get("top_family"))
-            v3_struct = (
-                family_to_structure(fam)
-                or signals.get("v2_policy_structure")
-                or fam
+            cid = ds.get("selected_candidate_id")
+            v3_cand = self._pick_shadow_candidate(
+                candidate_id=cid,
+                family=ds.get("family") or (part3.get("ranking") or {}).get("top_family"),
             )
-            v3_dir = (
-                v3.get("direction")
-                or ds.get("direction")
-                or signals.get("v2_policy_direction")
-                or "both"
-            )
-            cid = (
-                v3.get("candidate_id")
-                or part3.get("selected_candidate_id")
-                or ds.get("selected_candidate_id")
-            )
-            # Explicit ID required for V3 paper — never family-fallback.
-            if not cid:
-                log.warning(
-                    "V3 TRADE without selected_candidate_id; skip paper intent")
-            else:
-                v3_dec = None
-                v3_cand = None
-                if fair and v3_struct:
-                    v3_mode = (
-                        "v2" if signals.get("phys_density_mode") == "v2"
-                        else density_mode
-                    )
-                    v3_dec = self._resolve_structure_candidate(
-                        snap, decide_pdf, cfg,
-                        structure=str(v3_struct), direction=str(v3_dir),
-                        pin_active=pin_active, density_mode=v3_mode,
-                        density_moments=density_moments)
-                    gated = getattr(v3_dec, "candidate", None) if v3_dec else None
-                    gated_id = (
-                        getattr(gated, "candidate_id", None)
-                        or getattr(gated, "v2_candidate_id", None)
-                        or getattr(gated, "_v2_candidate_id", None)
-                    )
-                    if gated is not None and str(gated_id) == str(cid):
-                        v3_cand = gated
-                if v3_cand is None:
-                    v3_cand = self._pick_shadow_candidate(candidate_id=str(cid))
-                if v3_cand is None:
-                    log.warning(
-                        "V3 selected candidate_id=%s unresolved in shared "
-                        "universe; skip paper intent (no family substitute)",
-                        cid)
-                else:
-                    resolved_id = (
-                        getattr(v3_cand, "candidate_id", None)
-                        or getattr(v3_cand, "v2_candidate_id", None)
-                        or getattr(v3_cand, "_v2_candidate_id", None)
-                    )
-                    if str(resolved_id) != str(cid):
-                        log.error(
-                            "V3 candidate identity mismatch: selected=%s "
-                            "resolved=%s; refusing paper intent",
-                            cid, resolved_id)
-                    else:
-                        auth = getattr(self, "_tick_authoritative", None) or {}
-                        if auth.get("size_mult") is not None:
-                            size = coerce_size_mult(auth.get("size_mult"),
-                                                    default=0.0)
-                        else:
-                            size = coerce_size_mult(
-                                signals.get("policy_size_cap")
-                                if signals.get("policy_size_cap") is not None
-                                else (
-                                    signals.get("v2_policy_size_cap")
-                                    if signals.get("v2_policy_size_cap") is not None
-                                    else final_size_mult
-                                ),
-                                default=1.0,
-                            )
-                        if size <= 0.0:
-                            log.info(
-                                "V3 TRADE suppressed: size_mult=%.4f <= 0",
-                                size)
-                        else:
-                            sel_eval = (
-                                (getattr(self, "_tick_part3", None) or {})
-                                .get("unified", {})
-                                .get("selected_candidate_evaluation")
-                            ) or {}
-                            diag = sel_eval.get("diagnostics") or {}
-                            exec_est = {
-                                "fill_probability": sel_eval.get(
-                                    "fill_probability"),
-                                "expected_fill_price": sel_eval.get(
-                                    "expected_fill_price"),
-                                "conservative_fill_price": sel_eval.get(
-                                    "conservative_fill_price"),
-                                "expected_order_value": sel_eval.get(
-                                    "expected_order_value"),
-                                "expected_concession": sel_eval.get(
-                                    "expected_concession"),
-                                "fees": sel_eval.get("fees"),
-                                "entry_fees": diag.get("entry_fees"),
-                                "expected_exit_fees": diag.get(
-                                    "expected_exit_fees"),
-                                "mid_credit": diag.get("mid_credit"),
-                            }
-                            intents.append(_intent(
-                                "v3", v3_cand,
-                                size_mult=size,
-                                gate_kelly=(getattr(v3_dec, "gate_kelly", None)
-                                            if v3_dec else None),
-                                gate_score=(getattr(v3_dec, "gate_score", None)
-                                            if v3_dec else None),
-                                structure=v3_struct,
-                                direction=v3_dir,
-                                candidate_id=cid,
-                                reason="unified_v3",
-                                extra={
-                                    "v3_action": v3_action,
-                                    "execution_estimate": exec_est,
-                                }))
-
-        # Each paper account records into its own RiskManager on open.
-        for intent in intents:
-            intent["risk_record"] = True
+            if v3_cand is not None:
+                intents.append({
+                    "track": "v3",
+                    "candidate": v3_cand,
+                    "size_mult": float(final_size_mult or 1.0) or 1.0,
+                    "gate_kelly": None,
+                    "gate_score": None,
+                    "structure": ds.get("family"),
+                    "direction": ds.get("direction") or signals.get("v2_policy_direction"),
+                    "candidate_id": cid,
+                    "v3_action": v3_action,
+                    "reason": "part3_meta",
+                })
 
         return intents
 
@@ -1267,402 +1013,6 @@ class UnifiedOrchestrator:
         except Exception as exc:
             log.warning("feature snapshot logging failed: %s", exc)
 
-
-    def _legacy_decision_dict(self, decision, intent, snapshot_id: str,
-                              final_size_mult: float) -> dict:
-        """Map TradeDecision / stand-down into UnifiedDecisionStack legacy dict."""
-        if decision is None:
-            return {
-                "action": "NO_EDGE",
-                "candidate_id": None,
-                "structure": getattr(getattr(intent, "decision", None),
-                                     "structure", None),
-                "direction": getattr(getattr(intent, "decision", None),
-                                     "direction", None),
-                "size_mult": float(final_size_mult or 0.0),
-            }
-        action = (
-            "TRADE" if (
-                getattr(decision, "decision", None) == "TRADE"
-                and getattr(decision, "gate_pass", False)
-            ) else "NO_EDGE"
-        )
-        cand = getattr(decision, "candidate", None)
-        cid = None
-        structure = None
-        if cand is not None:
-            cid = (getattr(cand, "candidate_id", None)
-                   or getattr(cand, "v2_candidate_id", None)
-                   or getattr(cand, "_v2_candidate_id", None))
-            structure = getattr(cand, "family", None)
-            if not cid:
-                try:
-                    from prediction.candidate_universe import make_candidate_id
-                    from prediction.candidate_universe import _legs_from
-                    cid = make_candidate_id(
-                        snapshot_id,
-                        family=str(structure or "unknown"),
-                        legs=_legs_from(cand),
-                    )
-                    try:
-                        setattr(cand, "candidate_id", cid)
-                    except Exception:
-                        pass
-                except Exception:
-                    cid = None
-        return {
-            "action": action,
-            "candidate_id": cid,
-            "structure": structure or getattr(
-                getattr(intent, "decision", None), "structure", None),
-            "direction": (
-                getattr(decision, "direction", None)
-                or getattr(getattr(intent, "decision", None), "direction", None)),
-            "size_mult": float(final_size_mult or 0.0),
-        }
-
-    def _deployment_mode(self) -> str:
-        dep = getattr(self, "deployment_bundle", None)
-        if dep is not None:
-            return str(getattr(dep, "mode", "shadow") or "shadow").lower()
-        return str(getattr(self, "policy_mode", "shadow") or "shadow").lower()
-
-    def _unified_unavailable_fields(
-            self, *, reason: str, decision=None, intent=None,
-            final_size_mult: float = 0.0, snapshot_id: str = "",
-            exc: Optional[BaseException] = None,
-            now: Optional[dt.datetime] = None) -> dict:
-        """
-        Fail-closed TickResult unified fields for candidate/champion.
-
-        Always routes through resolve_authority() — never a hand-rolled
-        fallback. Persists a UnifiedDecisionRecord when a store is available.
-        """
-        from decision_stack.authority import resolve_authority
-        from decision_stack.contracts import UnifiedDecisionRecord
-
-        mode = self._deployment_mode()
-        dep = getattr(self, "deployment_bundle", None)
-        dep_id = str(getattr(dep, "deployment_id", "") or "") if dep else ""
-        cfg_hash = str(
-            getattr(dep, "configuration_hash", "") or "") if dep else ""
-        fallback = str(
-            getattr(dep, "fallback_policy", "abstain") if dep else "abstain"
-        ).lower()
-        legacy = self._legacy_decision_dict(
-            decision, intent, snapshot_id, final_size_mult)
-        reasons = [reason]
-        if exc is not None:
-            reasons.append(f"{type(exc).__name__}:{exc}")
-
-        v3 = {
-            "statistical_action": "UNAVAILABLE",
-            "final_action": "UNAVAILABLE",
-            "candidate_id": None,
-            "structure": None,
-            "direction": None,
-            "reasons": tuple(reasons),
-        }
-        auth = resolve_authority(
-            mode=mode,
-            legacy_decision=legacy,
-            v3_decision=v3,
-            hard_vetoes=(),
-            fallback_policy=fallback,
-            legacy_size_mult=float(legacy.get("size_mult") or 0.0),
-            v3_size_mult=0.0,
-        )
-        ts_iso = ""
-        session_date = ""
-        if now is not None:
-            ts_iso = now.astimezone(ET).isoformat()
-            session_date = now.astimezone(ET).date().isoformat()
-        record = UnifiedDecisionRecord(
-            snapshot_id=str(snapshot_id or ""),
-            ts=ts_iso,
-            session_date=session_date,
-            symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
-            deployment_id=dep_id,
-            deployment_mode=str(mode),
-            authority_source=auth.authority_source,
-            legacy_action=str(legacy.get("action") or "NO_EDGE"),
-            legacy_candidate_id=legacy.get("candidate_id"),
-            legacy_structure=legacy.get("structure"),
-            legacy_direction=legacy.get("direction"),
-            legacy_size_mult=float(legacy.get("size_mult") or 0.0),
-            v3_statistical_action="UNAVAILABLE",
-            v3_final_action="UNAVAILABLE",
-            selected_candidate_id=auth.selected_candidate_id,
-            final_action=auth.final_action,
-            final_structure=auth.final_structure,
-            final_direction=auth.final_direction,
-            final_size_mult=auth.final_size_mult,
-            reasons=tuple(auth.reasons) + tuple(reasons),
-            fallback_used=auth.fallback_used,
-            fallback_reason=auth.fallback_reason or reason,
-            configuration_hash=cfg_hash,
-            diagnostics={"unavailable_reason": reason},
-        )
-        # Persist fail-closed record so it does not disappear from the journal.
-        store = getattr(self, "prediction_store", None)
-        stack = getattr(self, "decision_stack", None)
-        try:
-            if stack is not None and getattr(stack, "persist_fn", None):
-                stack.persist_fn(record, snapshot=None, universe=None,
-                                 forecast=None, v3_result=None)
-            elif store is not None:
-                from decision_stack.persistence import persist_unified_decision
-                persist_unified_decision(store, record)
-        except Exception as persist_exc:
-            log.warning("unavailable decision persist failed: %s", persist_exc)
-
-        part3_payload = {
-            **(getattr(self, "_tick_part3", None) or {}),
-            "unified": record.to_dict(),
-            "statistical_action": "UNAVAILABLE",
-            "final_action": "UNAVAILABLE",
-            "selected_candidate_id": auth.selected_candidate_id,
-            "authority_source": auth.authority_source,
-            "deployment_id": dep_id,
-            "deployment_mode": mode,
-            "fallback_used": auth.fallback_used,
-            "reasons": list(record.reasons),
-            "mode": mode,
-            "shadow_label": f"{mode.upper()} — UNAVAILABLE ({reason})",
-        }
-        self._tick_part3 = part3_payload
-        self._tick_unified_v3 = v3
-        self._tick_authoritative = {
-            "final_action": auth.final_action,
-            "selected_candidate_id": auth.selected_candidate_id,
-            "structure": auth.final_structure,
-            "direction": auth.final_direction,
-            "size_mult": auth.final_size_mult,
-        }
-        return {
-            "legacy_decision": legacy,
-            "v3_decision": v3,
-            "authoritative_decision": self._tick_authoritative,
-            "authority_source": auth.authority_source,
-            "deployment_id": dep_id,
-            "fallback_used": auth.fallback_used,
-            "candidate_universe_summary": None,
-            "part3": part3_payload,
-        }
-
-    def _evaluate_unified_stack(
-            self, *, snap, now, snapshot_id: str, signals: dict,
-            intent, regime_state, decision, final_size_mult: float,
-            decide_pdf, cfg) -> dict:
-        """
-        Run UnifiedDecisionStack when configured. Builds one CanonicalSnapshot
-        and one CandidateUniverse from the shared select_spreads enumeration.
-
-        Returns TickResult unified-field kwargs. In candidate/champion mode,
-        failures never return {} — they return UNAVAILABLE (or legacy fallback
-        when fallback_policy=legacy).
-        """
-        stack = getattr(self, "decision_stack", None)
-        if stack is None:
-            return {}
-        mode = self._deployment_mode()
-        strict = mode in ("candidate", "champion")
-
-        try:
-            from prediction.canonical_snapshot import (
-                build_canonical_snapshot,
-                compute_source_ages_seconds,
-                extract_source_timestamps,
-            )
-            from prediction.candidate_universe import build_candidate_universe
-            from prediction.inference import live_feature_row
-        except Exception as exc:
-            log.warning("unified stack imports failed: %s", exc)
-            if strict:
-                return self._unified_unavailable_fields(
-                    reason="unified_import_failed", decision=decision,
-                    intent=intent, final_size_mult=final_size_mult,
-                    snapshot_id=snapshot_id, exc=exc, now=now)
-            return {}
-
-        try:
-            row = live_feature_row(snap, signals)
-            ts_iso = now.astimezone(ET).isoformat()
-            session_date = now.astimezone(ET).date().isoformat()
-            src_ts = extract_source_timestamps(
-                now_iso=ts_iso,
-                bars=getattr(snap, "bars", None),
-                chain=getattr(snap, "chain", None),
-                market=getattr(snap, "market", None),
-                signals=signals,
-            )
-            ages = compute_source_ages_seconds(ts_iso, src_ts)
-            canon = build_canonical_snapshot(
-                symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
-                ts=ts_iso,
-                session_date=session_date,
-                market=snap.market,
-                bars=getattr(snap, "bars", None),
-                chain=getattr(snap, "chain", None),
-                raw_features=row,
-                snapshot_id=snapshot_id,
-                quality={
-                    "data_quality": (
-                        float(signals["data_quality"])
-                        if signals.get("data_quality") is not None
-                        else 0.85
-                    ),
-                    "feature_coverage": min(1.0, len(row) / 40.0),
-                },
-                source_timestamps=src_ts,
-                source_ages_seconds=ages,
-            )
-
-            # One immutable shared universe for V1 + V3 (built earlier in tick).
-            universe = getattr(self, "_tick_shared_universe", None)
-            cands = list(getattr(self, "_tick_shared_cands", None) or [])
-            if not cands:
-                cands = list(getattr(self, "_tick_shadow_cands", None) or [])
-            if universe is None:
-                universe = build_candidate_universe(
-                    snapshot_id=snapshot_id,
-                    generated_at=ts_iso,
-                    candidates=cands,
-                    generator_config={
-                        "selector_min_ev": getattr(cfg.selector, "min_ev", None),
-                        "shared": True,
-                    },
-                )
-                self._tick_shared_universe = universe
-
-            # Capture universe for the stack without replacing a caller-provided fn.
-            stack.candidate_universe_fn = (
-                lambda snapshot, forecast=None, _u=universe: _u)
-
-            # Portfolio risk is account-scoped. record_trade deferred to paper open.
-            def _portfolio_risk(candidate_id: str, session_date: str,
-                                account: str = "v3"):
-                rm = self.risk_manager
-                if str(account).lower() in ("v3", "candidate"):
-                    rm = getattr(self, "candidate_risk_manager", None) or rm
-                if rm is None:
-                    return ()
-                cand = self._pick_shadow_candidate(candidate_id=candidate_id)
-                if cand is None:
-                    return ("risk:candidate_unresolved",)
-                # Prefer execution-adjusted max loss when V3 economics exist.
-                risk_cand = cand
-                try:
-                    sel = (
-                        (getattr(self, "_tick_part3", None) or {})
-                        .get("unified", {})
-                        .get("selected_candidate_evaluation")
-                    ) or {}
-                    if (str(sel.get("candidate_id") or "") == str(candidate_id)
-                            and sel.get("expected_fill_price") is not None):
-                        mid = (sel.get("diagnostics") or {}).get("mid_credit")
-                        if mid is None:
-                            mid = getattr(cand, "credit", None)
-                        exp = float(sel["expected_fill_price"])
-                        base_ml = float(getattr(cand, "max_loss", 0.0) or 0.0)
-                        if mid is not None:
-                            # Worse fill → higher max loss for credit structures.
-                            adj = base_ml + max(0.0, float(mid) - exp)
-                            risk_cand = SimpleNamespace(
-                                family=getattr(cand, "family", None),
-                                max_loss=adj,
-                                gamma=getattr(cand, "gamma", 0.0),
-                                capital=getattr(cand, "capital", adj),
-                            )
-                except Exception:
-                    risk_cand = cand
-                rcheck = rm.check(risk_cand, session_date)
-                if rcheck.approved:
-                    return ()
-                return tuple(f"risk:{v}" for v in (rcheck.vetoes or []))
-
-            stack.portfolio_risk_fn = _portfolio_risk
-
-            legacy = self._legacy_decision_dict(
-                decision, intent, snapshot_id, final_size_mult)
-            hard = tuple(getattr(regime_state, "vetoes", None) or ())
-            for key in ("hard_veto", "op_risk_vetoes"):
-                extra = signals.get(key)
-                if isinstance(extra, (list, tuple)):
-                    hard = hard + tuple(str(x) for x in extra)
-
-            record = stack.evaluate(
-                canon,
-                legacy_decision=legacy,
-                hard_vetoes=hard,
-            )
-
-            part3_payload = getattr(self, "_tick_part3", None)
-            if record is not None:
-                part3_payload = {
-                    **(part3_payload or {}),
-                    "unified": record.to_dict(),
-                    "statistical_action": record.v3_statistical_action,
-                    "final_action": record.v3_final_action,
-                    "selected_candidate_id": record.v3_candidate_id,
-                    "authority_source": record.authority_source,
-                    "deployment_id": record.deployment_id,
-                    "deployment_mode": record.deployment_mode,
-                    "fallback_used": record.fallback_used,
-                    "hard_vetoes": list(record.hard_vetoes),
-                    "reasons": list(record.reasons),
-                    "shadow_label": (
-                        f"{record.deployment_mode.upper()} — "
-                        f"authority={record.authority_source}"),
-                    "mode": record.deployment_mode,
-                    # Keep decision_summary in sync for paper intents / dashboards
-                    "decision_summary": {
-                        **((part3_payload or {}).get("decision_summary") or {}),
-                        "action": record.v3_final_action,
-                        "statistical_action": record.v3_statistical_action,
-                        "selected_candidate_id": record.v3_candidate_id,
-                        "family": record.v3_structure,
-                        "direction": record.v3_direction,
-                        "reasons": list(record.reasons),
-                    },
-                }
-                self._tick_part3 = part3_payload
-
-            v3 = {
-                "statistical_action": record.v3_statistical_action,
-                "final_action": record.v3_final_action,
-                "candidate_id": record.v3_candidate_id,
-                "structure": record.v3_structure,
-                "direction": record.v3_direction,
-            }
-            auth = {
-                "final_action": record.final_action,
-                "selected_candidate_id": record.selected_candidate_id,
-                "structure": record.final_structure,
-                "direction": record.final_direction,
-                "size_mult": record.final_size_mult,
-            }
-            self._tick_unified_v3 = v3
-            self._tick_authoritative = auth
-            return {
-                "legacy_decision": legacy,
-                "v3_decision": v3,
-                "authoritative_decision": auth,
-                "authority_source": record.authority_source,
-                "deployment_id": record.deployment_id,
-                "fallback_used": record.fallback_used,
-                "candidate_universe_summary": universe.to_dict(),
-                "part3": part3_payload,
-            }
-        except Exception as exc:
-            log.warning("unified decision stack failed: %s", exc)
-            if strict:
-                return self._unified_unavailable_fields(
-                    reason="unified_stack_exception", decision=decision,
-                    intent=intent, final_size_mult=final_size_mult,
-                    snapshot_id=snapshot_id, exc=exc, now=now)
-            return {}
-
     def tick(self, now: dt.datetime,
              position_contexts: Optional[list[PositionContext]] = None
              ) -> Optional[TickResult]:
@@ -1673,12 +1023,8 @@ class UnifiedOrchestrator:
         self._tick_prediction_bundle = None
         self._tick_part3 = None
         self._tick_shadow_cands = []
-        self._tick_shared_cands = []
-        self._tick_shared_universe = None
         self._tick_shadow_forecasts = {}
         self._tick_paper_intents = []
-        self._tick_unified_v3 = None
-        self._tick_authoritative = None
         snapshot_id = self._next_snapshot_id(now)
         cfg = self.engine_cfg or EngineConfig()
 
@@ -1920,13 +1266,7 @@ class UnifiedOrchestrator:
                     signals[k] = v
             # Refresh signals_json so policy provenance lands on the journal.
             signals, signals_json = self._signals_with_ras(signals, ras_results)
-            # Single authority: when UnifiedDecisionStack is wired, V2 champion
-            # must not mutate live structure / stand-down — the stack owns that.
-            apply_v2_champion = (
-                str(getattr(policy_route, "mode", "")).lower() == "champion"
-                and getattr(self, "decision_stack", None) is None
-            )
-            if apply_v2_champion:
+            if str(getattr(policy_route, "mode", "")).lower() == "champion":
                 auth = policy_route.authoritative
                 if auth.action == "NO_TRADE":
                     stand_down_now = True
@@ -1950,18 +1290,6 @@ class UnifiedOrchestrator:
         if snap.chain is not None and rnd is not None:
             v2_result = self._build_v2_physical_result(
                 snap, signals, intent, rnd, cfg)
-
-        # ---- Shared candidate universe (once per tick, before V1 + V3) ----
-        # Both legacy decide() and the unified stack consume this immutable set.
-        decide_pdf_for_universe = phys_pdf
-        if (v2_result is not None and not self.use_legacy_directional_tilt
-                and self.physical_pdf is None):
-            decide_pdf_for_universe = v2_result.as_callable()
-        if snap.chain is not None:
-            self._ensure_shared_candidate_universe(
-                snap, decide_pdf_for_universe, cfg,
-                pin_active=bool(pin.is_pin),
-                snapshot_id=snapshot_id, now=now)
 
         # ---- Stand-down: regime unstable or NT cell (or champion NO_TRADE) ----
         if stand_down_now:
@@ -2008,12 +1336,6 @@ class UnifiedOrchestrator:
                 p3["decision_summary"] = ds
                 self._tick_part3 = p3
             density_mode_sd = str(signals.get("phys_density_mode") or "vrp")
-            # Unified first — paper intents must read post-stack V3 outputs.
-            unified_fields = self._evaluate_unified_stack(
-                snap=snap, now=now, snapshot_id=snapshot_id, signals=signals,
-                intent=intent, regime_state=regime_state, decision=None,
-                final_size_mult=0.0, decide_pdf=decide_pdf, cfg=cfg,
-            )
             paper_intents = self._build_paper_intents(
                 snap=snap, signals=signals, intent=intent,
                 regime_state=regime_state, decision=None,
@@ -2031,18 +1353,8 @@ class UnifiedOrchestrator:
                 ras_results=ras_results,
                 signals=pub_signals,
                 sigma_cones=getattr(self, "_tick_sigma_cones", None),
-                part3=unified_fields.get(
-                    "part3", getattr(self, "_tick_part3", None)),
+                part3=getattr(self, "_tick_part3", None),
                 paper_intents=paper_intents,
-                legacy_decision=unified_fields.get("legacy_decision"),
-                v3_decision=unified_fields.get("v3_decision"),
-                authoritative_decision=unified_fields.get(
-                    "authoritative_decision"),
-                authority_source=unified_fields.get("authority_source"),
-                deployment_id=unified_fields.get("deployment_id"),
-                fallback_used=bool(unified_fields.get("fallback_used")),
-                candidate_universe_summary=unified_fields.get(
-                    "candidate_universe_summary"),
             )
             if self.journal:
                 row = _no_trade_row(snap.market, intent, regime_state,
@@ -2094,7 +1406,6 @@ class UnifiedOrchestrator:
             # prices the live decision (or vice versa), re-price the same
             # candidate set under the other density and journal both EVs.
             pin_active = bool(pin.is_pin)
-            shared = list(getattr(self, "_tick_shared_cands", None) or []) or None
             if (v2_result is not None and self.physical_pdf is None
                     and density_mode != "v2"):
                 try:
@@ -2105,8 +1416,7 @@ class UnifiedOrchestrator:
                         direction=live_direction,
                         physical_density_mode="v2",
                         physical_moments=v2_result.moments,
-                        pin_active=pin_active,
-                        precomputed_candidates=shared)
+                        pin_active=pin_active)
                     if shadow.candidate is not None:
                         signals["phys_v2_shadow_ev"] = shadow.candidate.ev
                         signals["phys_v2_shadow_family"] = shadow.candidate.family
@@ -2119,8 +1429,7 @@ class UnifiedOrchestrator:
                               direction=live_direction,
                               physical_density_mode=density_mode,
                               physical_moments=density_moments,
-                              pin_active=pin_active,
-                              precomputed_candidates=shared)
+                              pin_active=pin_active)
             signals["phys_density_mode"] = density_mode
             if (decision.candidate is not None
                     and isinstance(decision.candidate.ev, (int, float))):
@@ -2138,8 +1447,7 @@ class UnifiedOrchestrator:
                             target_structure=raw_struct,
                             direction=raw_intent.decision.direction,
                             physical_density_mode=density_mode,
-                            pin_active=False,
-                            precomputed_candidates=shared)
+                            pin_active=False)
                         if cf.candidate is not None:
                             signals["cf_debit_ev"] = cf.candidate.ev
                             signals["cf_debit_family"] = cf.candidate.family
@@ -2151,8 +1459,7 @@ class UnifiedOrchestrator:
                         target_structure="IF",
                         direction="both",
                         physical_density_mode=density_mode,
-                        pin_active=True,
-                        precomputed_candidates=shared)
+                        pin_active=True)
                     if cf.candidate is not None:
                         signals["cf_premium_ev"] = cf.candidate.ev
                         signals["cf_premium_family"] = cf.candidate.family
@@ -2169,11 +1476,7 @@ class UnifiedOrchestrator:
 
             # Re-finalize signals_json after density provenance is attached.
             signals, signals_json = self._signals_with_ras(signals, ras_results)
-            # ---- Risk gate (legacy journal only) ----
-            # Portfolio RiskManager.check/record_trade for the *authoritative*
-            # candidate runs via UnifiedDecisionStack.portfolio_risk_fn /
-            # paper open. Here we only annotate the legacy decision for the
-            # journal — never record_trade (that would desync state from V3).
+            # ---- Risk gate (optional, applied before journaling) ----
             if (self.risk_manager is not None
                     and decision.decision == "TRADE"
                     and decision.candidate is not None):
@@ -2185,6 +1488,8 @@ class UnifiedOrchestrator:
                         decision="NO_TRADE",
                         no_trade_reason="risk:" + ",".join(rcheck.vetoes),
                     )
+                else:
+                    self.risk_manager.record_trade(decision.candidate, session_date)
             if self.journal:
                 row = decision.as_row()
                 row["signals_json"] = signals_json
@@ -2209,13 +1514,6 @@ class UnifiedOrchestrator:
 
         pub_signals = {k: v for k, v in signals.items()
                        if not str(k).startswith("_")}
-        # Unified evaluation before paper intents so V3 track uses the
-        # post-stack decision, not a stale Part 3 summary.
-        unified_fields = self._evaluate_unified_stack(
-            snap=snap, now=now, snapshot_id=snapshot_id, signals=signals,
-            intent=intent, regime_state=regime_state, decision=decision,
-            final_size_mult=final_size, decide_pdf=decide_pdf, cfg=cfg,
-        )
         paper_intents = self._build_paper_intents(
             snap=snap, signals=signals, intent=intent,
             regime_state=regime_state, decision=decision,
@@ -2234,17 +1532,8 @@ class UnifiedOrchestrator:
             ras_results=ras_results,
             signals=pub_signals,
             sigma_cones=getattr(self, "_tick_sigma_cones", None),
-            part3=unified_fields.get("part3",
-                                     getattr(self, "_tick_part3", None)),
+            part3=getattr(self, "_tick_part3", None),
             paper_intents=paper_intents,
-            legacy_decision=unified_fields.get("legacy_decision"),
-            v3_decision=unified_fields.get("v3_decision"),
-            authoritative_decision=unified_fields.get("authoritative_decision"),
-            authority_source=unified_fields.get("authority_source"),
-            deployment_id=unified_fields.get("deployment_id"),
-            fallback_used=bool(unified_fields.get("fallback_used")),
-            candidate_universe_summary=unified_fields.get(
-                "candidate_universe_summary"),
         )
 
     def run_replay(self, timestamps: Sequence[dt.datetime]) -> list[TickResult]:

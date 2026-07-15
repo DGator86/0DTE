@@ -76,16 +76,6 @@ def validate_promotion_packet(packet: PromotionReviewPacket) -> None:
         raise DeploymentError("promotion requires fold_definitions")
     if not packet.dataset_hashes:
         raise DeploymentError("promotion requires dataset_hashes")
-    if not packet.headline_metrics:
-        raise DeploymentError("promotion requires nonempty headline_metrics")
-    if not packet.bootstrap_intervals:
-        raise DeploymentError("promotion requires nonempty bootstrap_intervals")
-    if not packet.known_weaknesses:
-        raise DeploymentError("promotion requires nonempty known_weaknesses")
-    if not packet.unsupported_slices:
-        raise DeploymentError("promotion requires nonempty unsupported_slices")
-    if not packet.model_ids:
-        raise DeploymentError("promotion requires model_ids")
 
 
 def promote_model(

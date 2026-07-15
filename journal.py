@@ -66,12 +66,6 @@ OPTIONAL_COLUMNS = [
 #   v2_expected_shortfall, candidate_model_version, v2_legacy_spearman,
 #   v2_vs_legacy_pnl_delta, legacy_top_score
 #
-# Prediction Engine V3 / Part 3 decision keys (observation-only):
-#   v3_action, v3_statistical_action, v3_selected_candidate_id, v3_family,
-#   v3_direction, v3_expected_order_value, v3_candidate_utility,
-#   v3_p_positive_utility, v3_fill_probability, v3_uncertainty, v3_ood_score,
-#   v3_top_candidate_id, v3_top_score_margin, v3_hard_veto_count
-#
 # Prediction Engine V2 / PR 9 GEX variant keys (observation-only, §16.3):
 #   gex_oi_*, gex_weekly_*, gex_volume_*, gex_hybrid_*
 #     (net_gex, gamma_flip, call_wall, put_wall, gex_concentration,

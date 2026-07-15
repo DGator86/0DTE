@@ -37,7 +37,6 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
-from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -159,13 +158,11 @@ class PaperBroker:
 
     def __init__(self, db_path: str = "paper.sqlite", cfg: Optional[PaperConfig] = None,
                  notifier=None, symbol: str = "SPY",
-                 position_monitor: Optional[PositionMonitor] = None,
-                 risk_manager=None) -> None:
+                 position_monitor: Optional[PositionMonitor] = None) -> None:
         self.cfg = cfg or PaperConfig()
         self.symbol = symbol
         self._notifier = notifier
         self.position_monitor = position_monitor or PositionMonitor()
-        self.risk_manager = risk_manager
         self.open_positions: list[PaperPosition] = []
         self._db = sqlite3.connect(db_path)
         self._init_db()
@@ -238,24 +235,6 @@ class PaperBroker:
             self._db.execute("ALTER TABLE paper_trades ADD COLUMN entry_ctx TEXT")
         if "peak_pnl_ps" not in cols:
             self._db.execute("ALTER TABLE paper_trades ADD COLUMN peak_pnl_ps REAL")
-        self._db.execute("""
-            CREATE TABLE IF NOT EXISTS paper_fill_attempts (
-                id TEXT PRIMARY KEY,
-                track TEXT,
-                candidate_id TEXT,
-                family TEXT,
-                submitted_at TEXT,
-                resolved_at TEXT,
-                filled INTEGER,
-                p_fill REAL,
-                expected_fill_price REAL,
-                fill_credit REAL,
-                entry_fees REAL,
-                mid_credit REAL,
-                max_loss_ps REAL,
-                contracts INTEGER,
-                ctx_json TEXT
-            )""")
         self._db.commit()
 
     def _record(self, pos: PaperPosition, now: dt.datetime, credit_now: float,
@@ -358,24 +337,11 @@ class PaperBroker:
             self._day_realized[key] = self._day_realized.get(key, 0.0) + pnl_dollars
             self.open_positions.remove(pos)
             self.position_monitor.release(pos.id)
-            rid = (pos.entry_ctx or {}).get("risk_position_id") or pos.id
-            if self.risk_manager is not None:
-                try:
-                    self.risk_manager.release_trade(str(rid))
-                except Exception as exc:
-                    log.warning("risk_manager.release_trade failed: %s", exc)
             pos.entry_ctx["ras_at_exit"] = ras.score
             pos.entry_ctx["ras_exit_note"] = "chain_unavailable"
             self._last_exit_at[track] = now
             self._last_exit_reason[track] = "ras_invalidate"
             self._record(pos, now, credit_now, net_ps, pnl_dollars, "ras_invalidate")
-            on_close = getattr(self, "on_track_close", None)
-            if callable(on_close):
-                try:
-                    on_close(pos, track=track, pnl_dollars=pnl_dollars,
-                             exit_reason="ras_invalidate", closed_at=now)
-                except Exception:
-                    log.exception("on_track_close hook failed")
             self._notify("PAPER EXIT",
                          f"[{track}] {pos.family} {pos.strikes_str()} ras_invalidate "
                          f"(no chain) pnl=${pnl_dollars:+.2f}")
@@ -396,14 +362,10 @@ class PaperBroker:
         mode_l = str(sig.get("policy_mode") or "").lower()
         # Pre-triple-paper: champion tagged the single fill as v2.
         track = "v2" if mode_l == "champion" else "legacy"
-        raw_size = getattr(result, "final_size_mult", None)
-        size_mult = 1.0 if raw_size is None else float(raw_size)
-        if size_mult <= 0.0:
-            return None
         return self._open_candidate(
             now, result, cand, chain, cmid, pmid, spr,
             track=track,
-            size_mult=size_mult,
+            size_mult=float(getattr(result, "final_size_mult", 1.0) or 1.0),
             gate_kelly=getattr(dec, "gate_kelly", None),
             gate_score=getattr(dec, "gate_score", None),
         )
@@ -418,16 +380,10 @@ class PaperBroker:
         cand = intent.get("candidate")
         if cand is None:
             return None
-        raw_size = intent.get("size_mult")
-        size_mult = 1.0 if raw_size is None else float(raw_size)
-        if size_mult <= 0.0:
-            log.info("paper entry suppressed [%s]: size_mult=%.4f <= 0",
-                     track, size_mult)
-            return None
         return self._open_candidate(
             now, result, cand, chain, cmid, pmid, spr,
             track=track,
-            size_mult=size_mult,
+            size_mult=float(intent.get("size_mult") or 1.0),
             gate_kelly=intent.get("gate_kelly"),
             gate_score=intent.get("gate_score"),
             intent_meta=intent,
@@ -477,55 +433,9 @@ class PaperBroker:
 
         legs = tuple(cand.legs)
         slip_entry = self._slippage_ps(legs, spr)
-        meta_early = intent_meta or {}
-        exec_est = meta_early.get("execution_estimate") or {}
-        # Prefer V3 authorization fill price when present so paper P&L
-        # matches the execution distribution used for the decision.
-        exp_fill = exec_est.get("expected_fill_price")
-        entry_fees = float(
-            exec_est.get("entry_fees")
-            if exec_est.get("entry_fees") is not None
-            else 0.0)
-        mid_credit = exec_est.get("mid_credit")
-        if mid_credit is None:
-            mid_credit = getattr(cand, "credit", None)
-        p_fill = exec_est.get("fill_probability")
-
-        # Modeled fill attempt: unfilled outcomes remain learning evidence.
-        filled = True
-        if p_fill is not None:
-            filled = self._simulate_fill(
-                float(p_fill),
-                seed_key=f"{date}|{track}|{getattr(cand, 'candidate_id', '')}|"
-                         f"{getattr(cand, 'family', '')}|{now.isoformat()}",
-            )
-        if not filled:
-            self._record_fill_attempt(
-                track=track, cand=cand, now=now, date=date,
-                filled=False, p_fill=float(p_fill),
-                expected_fill_price=(
-                    float(exp_fill) if exp_fill is not None else None),
-                fill_credit=None, entry_fees=entry_fees,
-                mid_credit=(float(mid_credit) if mid_credit is not None else None),
-                max_loss_ps=float(getattr(cand, "max_loss", 0.0) or 0.0),
-                contracts=0, ctx=meta_early,
-            )
-            log.info("paper unfilled [%s]: p_fill=%.3f", track, float(p_fill))
-            return (f"PAPER UNFILLED [{track}] {cand.family} "
-                    f"p_fill={float(p_fill):.3f}")
-
-        if exp_fill is not None:
-            entry_credit = float(exp_fill) - entry_fees
-            slip_entry = 0.0  # already embedded in expected fill
-        else:
-            entry_credit = float(cand.credit) - slip_entry - entry_fees
+        entry_credit = float(cand.credit) - slip_entry
 
         mp, ml = self._payoff_extents(legs, chain.spot, entry_credit)
-        # When V3 supplies an expected fill vs mid, worsen max-loss by the
-        # credit shortfall. Do NOT floor geometric ml with cand.max_loss —
-        # that field is often width-based and wrong for debit structures.
-        if exp_fill is not None and mid_credit is not None:
-            ml = float(ml) + max(0.0, float(mid_credit) - float(exp_fill))
         if ml <= 0:
             return None
 
@@ -618,13 +528,7 @@ class PaperBroker:
                 (getattr(result, "part3", None) or {})
                 .get("decision_summary", {}) or {}).get("action"),
             "v3_selected_candidate_id": meta.get("candidate_id"),
-            "candidate_id": meta.get("candidate_id"),
-            "snapshot_id": meta.get("snapshot_id") or sig.get("_snapshot_id"),
             "intent_reason": meta.get("reason"),
-            "execution_estimate": exec_est or None,
-            "entry_fees": entry_fees,
-            "p_fill": float(p_fill) if p_fill is not None else None,
-            "symbol": getattr(self, "symbol", "SPY"),
         }
 
         pos = PaperPosition(
@@ -636,37 +540,6 @@ class PaperBroker:
         self.open_positions.append(pos)
         self.position_monitor.register(pos.id, entry_ctx)
         self._day_entries[key] = self._day_entries.get(key, 0) + 1
-        self._record_fill_attempt(
-            track=track, cand=cand, now=now, date=date,
-            filled=True, p_fill=(float(p_fill) if p_fill is not None else None),
-            expected_fill_price=(
-                float(exp_fill) if exp_fill is not None else None),
-            fill_credit=entry_credit, entry_fees=entry_fees,
-            mid_credit=(float(mid_credit) if mid_credit is not None else None),
-            max_loss_ps=ml, contracts=contracts, ctx=meta,
-        )
-        # Record portfolio risk state only after the position opens.
-        if (meta.get("risk_record")
-                and self.risk_manager is not None):
-            try:
-                # Use execution-adjusted max loss for risk accounting.
-                risk_cand = SimpleNamespace(
-                    family=cand.family, max_loss=ml,
-                    gamma=getattr(cand, "gamma", 0.0),
-                    capital=ml,
-                )
-                rid = self.risk_manager.record_trade(
-                    risk_cand, date, position_id=pos.id)
-                pos.entry_ctx["risk_position_id"] = rid
-            except Exception as exc:
-                log.warning("risk_manager.record_trade failed: %s", exc)
-        # Optional learning hook (shadow_runner attaches prediction_store settle)
-        on_open = getattr(self, "on_track_open", None)
-        if callable(on_open):
-            try:
-                on_open(pos, track=track)
-            except Exception:
-                log.exception("on_track_open hook failed")
         self._notify("PAPER ENTRY",
                      f"[{track}] {pos.family} {pos.strikes_str()} x{contracts} "
                      f"entry={entry_credit:+.2f} maxP={mp:.2f} maxL={ml:.2f}")
@@ -739,23 +612,10 @@ class PaperBroker:
 
         self.open_positions.remove(pos)
         self.position_monitor.release(pos.id)
-        rid = (pos.entry_ctx or {}).get("risk_position_id") or pos.id
-        if self.risk_manager is not None:
-            try:
-                self.risk_manager.release_trade(str(rid))
-            except Exception as exc:
-                log.warning("risk_manager.release_trade failed: %s", exc)
         pos.entry_ctx["ras_at_exit"] = pos.entry_ctx.get("ras_score")
         self._last_exit_at[track] = now
         self._last_exit_reason[track] = reason
         self._record(pos, now, credit_now, net_ps, pnl_dollars, reason)
-        on_close = getattr(self, "on_track_close", None)
-        if callable(on_close):
-            try:
-                on_close(pos, track=track, pnl_dollars=pnl_dollars,
-                         exit_reason=reason, closed_at=now)
-            except Exception:
-                log.exception("on_track_close hook failed")
         eq = self.ledgers[track]
         self._notify("PAPER EXIT",
                      f"[{track}] {pos.family} {pos.strikes_str()} {reason} "
@@ -817,53 +677,6 @@ class PaperBroker:
         grid = np.linspace(lo, hi, 4001)
         curve = _payoff_curve(legs, grid, entry_credit)
         return float(curve.max()), float(-curve.min())
-
-    @staticmethod
-    def _simulate_fill(p_fill: float, *, seed_key: str) -> bool:
-        """Deterministic Bernoulli fill from a stable seed key."""
-        import hashlib
-        h = int(hashlib.sha256(seed_key.encode("utf-8")).hexdigest()[:8], 16)
-        u = (h % 10_000) / 10_000.0
-        return u < float(np.clip(p_fill, 0.0, 1.0))
-
-    def _record_fill_attempt(
-        self, *, track: str, cand, now, date: str, filled: bool,
-        p_fill, expected_fill_price, fill_credit, entry_fees,
-        mid_credit, max_loss_ps, contracts: int, ctx: dict,
-    ) -> None:
-        """Persist filled and unfilled paper attempts for learning."""
-        try:
-            fid = uuid.uuid4().hex[:12]
-            safe_ctx = {}
-            for k, v in (ctx or {}).items():
-                if k in ("candidate",):
-                    continue
-                try:
-                    json.dumps(v)
-                    safe_ctx[k] = v
-                except (TypeError, ValueError):
-                    safe_ctx[k] = repr(v)
-            self._db.execute(
-                "INSERT OR REPLACE INTO paper_fill_attempts "
-                "(id, track, candidate_id, family, submitted_at, resolved_at, "
-                " filled, p_fill, expected_fill_price, fill_credit, entry_fees, "
-                " mid_credit, max_loss_ps, contracts, ctx_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    fid, track,
-                    str(getattr(cand, "candidate_id", None)
-                        or (ctx or {}).get("candidate_id") or ""),
-                    str(getattr(cand, "family", "") or ""),
-                    now.isoformat(), now.isoformat(),
-                    1 if filled else 0,
-                    p_fill, expected_fill_price, fill_credit, entry_fees,
-                    mid_credit, max_loss_ps, int(contracts),
-                    json.dumps(safe_ctx) if safe_ctx else None,
-                ),
-            )
-            self._db.commit()
-        except Exception as exc:
-            log.warning("paper fill-attempt persist failed: %s", exc)
 
     def _notify(self, title: str, body: str) -> None:
         if self._notifier is None:
