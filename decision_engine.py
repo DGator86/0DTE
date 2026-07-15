@@ -39,7 +39,7 @@ from gate_scorer import MarketSnapshot, GateConfig, Decision, evaluate as gate_e
 from rnd_extractor import ChainSnapshot, RNDConfig, extract_rnd, compute_edge
 from spread_selector import (
     GammaContext, SelectorConfig, select_spreads, SpreadCandidate,
-    STRUCTURE_TO_FAMILIES, DEBIT_FAMILIES, reprice_candidates,
+    STRUCTURE_TO_FAMILIES, DEBIT_FAMILIES,
 )
 
 
@@ -150,7 +150,6 @@ def decide(
     physical_density_mode: str = "",
     physical_moments: Optional[dict] = None,
     pin_active: bool = False,
-    precomputed_candidates: Optional[list] = None,
 ) -> TradeDecision:
     """
     Compose gate + selector into a TradeDecision.
@@ -162,11 +161,6 @@ def decide(
     never be used to construct the density that prices the trade (§12.2).
     `pin_active` soft-exempts short-gamma / below-flip / trending on the
     premium gate and selector so credit can fill into a flip pin.
-
-    When ``precomputed_candidates`` is provided (shared tick universe), the
-    selector is NOT re-run for geometry — but EV / score / vetoes are
-    **repriced** under the supplied ``physical_pdf`` so alternate-density
-    shadow and tilt paths remain meaningful.
     """
     cfg = cfg or EngineConfig()
     session_date = market.now.astimezone().date().isoformat()
@@ -195,52 +189,25 @@ def decide(
                          direction=direction, pin_active=pin_active)
     gate_pass = gate.decision is Decision.GO
 
-    # --- selector: needs a usable chain (or shared precomputed universe) ---
+    # --- selector: needs a usable chain ---
     candidate = None
     selector_reason = ""
     edge_rich = float("nan")
     all_candidates: list = []
     try:
-        if precomputed_candidates is not None:
-            # Freeze geometry from the shared universe; reprice under this
-            # call's physical density (tilt / V2 shadow / pin CF).
-            rnd = extract_rnd(chain, cfg.rnd)
-            edge = compute_edge(rnd, chain, cfg.rnd, physical_pdf=physical_pdf)
-            edge_rich = edge.richness_signal
-            ctx = GammaContext.from_market_snapshot(market, pin_active=pin_active)
-            all_candidates = reprice_candidates(
-                list(precomputed_candidates),
-                chain, rnd, ctx, cfg.selector,
-                physical_pdf=physical_pdf,
-            )
-            pool = all_candidates
-            if fams is not None:
-                pool = [c for c in all_candidates
-                        if getattr(c, "family", None) in fams]
-            tradable_pool = [c for c in pool
-                             if getattr(c, "passes_vetoes", False)]
-            ranked_pool = tradable_pool or pool
-            if ranked_pool:
-                candidate = max(
-                    ranked_pool,
-                    key=lambda c: float(getattr(c, "score", 0.0) or 0.0))
-            if candidate is None:
-                selector_reason = "no candidate in shared universe"
-        else:
-            rnd = extract_rnd(chain, cfg.rnd)
-            edge = compute_edge(rnd, chain, cfg.rnd, physical_pdf=physical_pdf)
-            edge_rich = edge.richness_signal
-            ctx = GammaContext.from_market_snapshot(market, pin_active=pin_active)
-            sel = select_spreads(chain, rnd, edge, ctx, cfg.selector,
-                                 physical_pdf=physical_pdf,
-                                 target_families=fams)
-            all_candidates = list(sel.all_candidates or sel.ranked or [])
-            candidate = sel.best
-            if candidate is None:
-                # keep the top-by-score would-be candidate for diagnostics if any exist
-                if sel.ranked:
-                    candidate = max(sel.ranked, key=lambda c: c.score)
-                selector_reason = sel.no_trade_reason or "no candidate"
+        rnd = extract_rnd(chain, cfg.rnd)
+        edge = compute_edge(rnd, chain, cfg.rnd, physical_pdf=physical_pdf)
+        edge_rich = edge.richness_signal
+        ctx = GammaContext.from_market_snapshot(market, pin_active=pin_active)
+        sel = select_spreads(chain, rnd, edge, ctx, cfg.selector, physical_pdf=physical_pdf,
+                             target_families=fams)
+        all_candidates = list(sel.all_candidates or sel.ranked or [])
+        candidate = sel.best
+        if candidate is None:
+            # keep the top-by-score would-be candidate for diagnostics if any exist
+            if sel.ranked:
+                candidate = max(sel.ranked, key=lambda c: c.score)
+            selector_reason = sel.no_trade_reason or "no candidate"
     except Exception as e:  # thin/!arbitrage-free chain etc.
         selector_reason = f"chain_unavailable: {e}"
 

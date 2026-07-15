@@ -34,7 +34,7 @@ NOT financial advice.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional
 
 import numpy as np
 from scipy.stats import norm
@@ -543,63 +543,6 @@ def _evaluate(family: str, legs: tuple, chain: ChainSnapshot, rnd: RiskNeutralDe
     )
 
 
-def _normalize_phys(
-    rnd: RiskNeutralDensity,
-    physical_pdf: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-) -> np.ndarray:
-    """Physical density on the RND grid (same measure as select_spreads)."""
-    if physical_pdf is not None:
-        phys = np.asarray(physical_pdf(rnd.grid), dtype=float)
-        a = np.sum(phys) * (rnd.grid[1] - rnd.grid[0])
-        return phys / a if a > 0 else phys
-    return _physical_pdf_from_rnd(rnd, RNDConfig().vol_risk_premium)
-
-
-def reprice_candidates(
-    candidates: Sequence[SpreadCandidate],
-    chain: ChainSnapshot,
-    rnd: RiskNeutralDensity,
-    ctx: GammaContext,
-    cfg: Optional[SelectorConfig] = None,
-    physical_pdf: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-) -> list[SpreadCandidate]:
-    """
-    Re-evaluate candidate *geometry* under a specific physical density.
-
-    Shared-universe ticks freeze legs/family/identity once, then each decide()
-    branch (live tilt, V2 shadow EV, pin counterfactual) must reprice EV,
-    score, vetoes, and execution economics under its own density. Identity
-    attributes (``candidate_id`` / aliases) are copied onto the fresh objects.
-    """
-    cfg = cfg or SelectorConfig()
-    phys = _normalize_phys(rnd, physical_pdf)
-    vol_cache: dict = {}
-    out: list[SpreadCandidate] = []
-    for src in candidates:
-        family = getattr(src, "family", None)
-        legs = getattr(src, "legs", None)
-        if not family or not legs:
-            continue
-        fresh = _evaluate(
-            str(family), tuple(legs), chain, rnd, phys, ctx, cfg, vol_cache)
-        if fresh is None:
-            continue
-        for attr in ("candidate_id", "v2_candidate_id", "_v2_candidate_id",
-                     "v2_utility_score"):
-            val = getattr(src, attr, None)
-            if val is None:
-                continue
-            try:
-                setattr(fresh, attr, val)
-            except Exception:
-                try:
-                    object.__setattr__(fresh, attr, val)
-                except Exception:
-                    pass
-        out.append(fresh)
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # Candidate generation                                                         #
 # --------------------------------------------------------------------------- #
@@ -849,7 +792,12 @@ def select_spreads(
     cfg = cfg or SelectorConfig()
 
     # physical density on the rnd grid (same measure used by compute_edge)
-    phys = _normalize_phys(rnd, physical_pdf)
+    if physical_pdf is not None:
+        phys = np.asarray(physical_pdf(rnd.grid), dtype=float)
+        a = np.sum(phys) * (rnd.grid[1] - rnd.grid[0])
+        phys = phys / a if a > 0 else phys
+    else:
+        phys = _physical_pdf_from_rnd(rnd, RNDConfig().vol_risk_premium)
 
     F = rnd.forward
     pinned = _is_pinned(F, ctx, cfg)

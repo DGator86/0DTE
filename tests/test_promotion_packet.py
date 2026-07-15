@@ -34,11 +34,11 @@ def _packet(**kw) -> PromotionReviewPacket:
         fold_definitions={"fold0": {"train": [], "test": []}},
         headline_metrics={"brier_skill": 0.1},
         slice_metrics={},
-        bootstrap_intervals={"brier_skill": [0.0, 0.2]},
+        bootstrap_intervals={},
         drift_status={"severity": "NORMAL"},
         legacy_comparison={"utility_delta": 0.05},
         known_weaknesses=["late session thin"],
-        unsupported_slices=["illiquid names"],
+        unsupported_slices=[],
         rollback_target={"prediction_model_group": "legacy"},
     )
     base.update(kw)

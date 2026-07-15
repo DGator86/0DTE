@@ -14,7 +14,6 @@ EnvironmentFile=/etc/zerodte/zerodte.env
 ExecStart=/opt/zerodte/venv/bin/python -m adaptive_learning.learner \
     --mode weekly \
     --db /var/lib/zerodte/shadow.db \
-    --paper-db /var/lib/zerodte/paper.sqlite \
     --record-dir /var/lib/zerodte/ticks \
     --configs-dir /var/lib/zerodte/configs \
     --reports-dir /var/lib/zerodte/reports/promotion \
