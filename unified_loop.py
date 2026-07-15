@@ -766,8 +766,6 @@ class UnifiedOrchestrator:
 
         from decision_stack.authority import coerce_size_mult
 
-        from decision_stack.authority import coerce_size_mult
-
         fair = bool(getattr(self, "__dict__", {}).get(
             "paper_fair_comparison", False))
         snap_id = str(signals.get("_snapshot_id") or "")
