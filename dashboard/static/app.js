@@ -112,9 +112,94 @@
     return `<div class="metric"><span class="k">${esc(k)}</span><span class="v${cls ? " " + cls : ""}">${v}</span></div>`;
   }
 
+  /* ---------------- live.v1 accessors (PR D — no flat aliases) ---------------- */
+  const LIVE_SCHEMA_VERSION = "live.v1";
+  const LIVE_V1_SECTIONS = [
+    "schema_version", "generated_at", "snapshot", "feeds", "market",
+    "legacy", "forecast", "v3", "accounts", "risk", "paper", "system",
+  ];
+
+  function requireLiveV1(payload) {
+    if (!payload || typeof payload !== "object") return null;
+    if (payload.schema_version !== LIVE_SCHEMA_VERSION) return null;
+    for (let i = 0; i < LIVE_V1_SECTIONS.length; i++) {
+      if (!(LIVE_V1_SECTIONS[i] in payload)) return null;
+    }
+    if (!payload.feeds || payload.feeds.overall_status == null) return null;
+    return payload;
+  }
+
+  function liveTs(live) {
+    return (live && live.snapshot && live.snapshot.ts)
+      || (live && live.generated_at) || null;
+  }
+  function liveStatus(live) {
+    return (live && live.system && live.system.status) || null;
+  }
+  function liveNote(live) {
+    return (live && live.system && live.system.note) || null;
+  }
+  function liveDoing(live) {
+    return (live && live.legacy && live.legacy.doing) || {};
+  }
+  function liveWhy(live) {
+    return (live && live.legacy && live.legacy.why) || {};
+  }
+  function liveInputs(live) {
+    return (live && live.market && live.market.inputs) || {};
+  }
+  function liveParallel(live) {
+    return {
+      legacy: (live && live.legacy && live.legacy.parallel) || {},
+      v2: (live && live.forecast && live.forecast.parallel) || {},
+    };
+  }
+  function liveV2Signals(live) {
+    return (live && live.forecast && live.forecast.v2_signals) || {};
+  }
+  function livePart3(live) {
+    return (live && live.v3 && live.v3.decision) || {};
+  }
+  function liveSigmaCones(live) {
+    return (live && live.forecast && live.forecast.sigma_cones) || {};
+  }
+  function liveFeedDown(live) {
+    const st = liveStatus(live);
+    return st === "feed_not_ready" || st === "feed_error";
+  }
+  function liveIdle(live) {
+    const ts = liveTs(live);
+    const st = liveStatus(live);
+    return !ts || (st && st !== "live");
+  }
+  function feedStatusCls(status) {
+    const s = String(status || "").toUpperCase();
+    if (s === "LIVE") return "feed-live";
+    if (s === "DELAYED" || s === "FALLBACK") return "feed-delayed";
+    if (s === "STALE") return "feed-stale";
+    return "feed-missing";
+  }
+
+  function showLiveUnavailable(reason) {
+    const sub = reason || "awaiting live.v1 payload";
+    ["verdict", "v2-verdict", "v3-decision-verdict"].forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      el.className = "verdict wait";
+    });
+    if ($("verdict-word")) $("verdict-word").textContent = "UNAVAILABLE";
+    if ($("verdict-sub")) $("verdict-sub").textContent = sub;
+    if ($("v2-verdict-word")) $("v2-verdict-word").textContent = "UNAVAILABLE";
+    if ($("v2-verdict-sub")) $("v2-verdict-sub").textContent = sub;
+    if ($("v3-decision-word")) $("v3-decision-word").textContent = "UNAVAILABLE";
+    if ($("v3-decision-sub")) $("v3-decision-sub").textContent = sub;
+    if ($("meta-feeds")) $("meta-feeds").textContent = "—";
+    if ($("meta-feeds-detail")) $("meta-feeds-detail").innerHTML = "";
+  }
+
   /* ---------------- top bar ---------------- */
   function renderTopbar(live, market, ticks) {
-    const inp = live.inputs || {};
+    const inp = liveInputs(live);
     const spot = num(inp.spot);
     $("spot-px").textContent = spot != null ? spot.toFixed(2) : "—";
 
@@ -130,15 +215,35 @@
       chgEl.textContent = "";
     }
 
-    $("meta-feed").textContent = live.feed_source || "—";
-    $("meta-chain").textContent = live.chain_available ? "live" : "n/a";
+    const feeds = live.feeds || {};
+    const overall = feeds.overall_status || "—";
+    const snap = live.snapshot || {};
+    const provider = snap.feed_source || (feeds.spot && feeds.spot.provider) || "";
+    $("meta-feeds").textContent = provider
+      ? `${overall} · ${provider}` : String(overall);
+    $("meta-feeds-wrap").className = "meta-chip " + feedStatusCls(overall);
 
-    // freshness
+    const sources = [
+      ["spot", "Spot"], ["bars", "Bars"],
+      ["option_chain", "Chain"], ["settlement", "Settle"],
+    ];
+    $("meta-feeds-detail").innerHTML = sources.map(([key, label]) => {
+      const block = feeds[key] || {};
+      const st = block.status || "MISSING";
+      const age = block.age_seconds;
+      const title = `${label}: ${st}`
+        + (age != null ? ` · age ${Number(age).toFixed(0)}s` : "")
+        + (block.error_code ? ` · ${block.error_code}` : "");
+      return `<span class="feed-src ${feedStatusCls(st)}" title="${esc(title)}">${esc(label)} <b>${esc(st)}</b></span>`;
+    }).join("");
+
+    // freshness from snapshot.ts (not a flat alias)
     const freshEl = $("meta-fresh");
     const wrap = $("meta-fresh-wrap");
-    if (live.ts) {
-      const age = (Date.now() - new Date(live.ts).getTime()) / 1000;
-      freshEl.textContent = age < 90 ? etTime(live.ts) : Math.floor(age / 60) + "m ago";
+    const ts = liveTs(live);
+    if (ts) {
+      const age = (Date.now() - new Date(ts).getTime()) / 1000;
+      freshEl.textContent = age < 90 ? etTime(ts) : Math.floor(age / 60) + "m ago";
       wrap.classList.toggle("warn", age > 180);
     } else {
       freshEl.textContent = "—";
@@ -178,12 +283,13 @@
 
   /* ---------------- signal / verdict ---------------- */
   function renderSignal(live) {
-    const d = live.doing || {};
-    const w = live.why || {};
-    $("signal-time").textContent = live.ts ? etTime(live.ts) + " ET" : "—";
+    const d = liveDoing(live);
+    const w = liveWhy(live);
+    const ts = liveTs(live);
+    $("signal-time").textContent = ts ? etTime(ts) + " ET" : "—";
 
-    const feedDown = live.status === "feed_not_ready" || live.status === "feed_error";
-    const idle = !live.ts || (live.status && live.status !== "live");
+    const feedDown = liveFeedDown(live);
+    const idle = liveIdle(live);
     let cls = "wait", word = "WAIT", sub = "";
     if (feedDown) {
       cls = "stop"; word = "NO FEED";
@@ -237,9 +343,9 @@
   /* ---------------- playbook (latest journaled tick) ---------------- */
   function renderPlaybook(latest, live) {
     const t = latest || {};
-    const inp = live.inputs || {};
+    const inp = liveInputs(live);
     const s = tickSignals(t) || {};
-    $("playbook-fam").textContent = t.selected_family || (live.doing && live.doing.structure) || "—";
+    $("playbook-fam").textContent = t.selected_family || liveDoing(live).structure || "—";
 
     // The candidate journaled on a NO_TRADE tick is the measurement loop's
     // would-be pick (kept so settlement can score its hypothetical P&L).
@@ -288,10 +394,12 @@
 
   /* ---------------- parallel Legacy vs V3 ---------------- */
   function renderParallel(live, latest) {
-    const p = (live && live.parallel) || {};
+    const p = liveParallel(live);
     const leg = p.legacy || {};
     const v2 = p.v2 || {};
-    const s = tickSignals(latest) || (live && live.v2_signals) || {};
+    // Journal signals only for dual-run metadata; V3 structure/action from
+    // live.forecast.parallel (never fall back to legacy policy_*).
+    const s = tickSignals(latest) || liveV2Signals(live);
     const mode = v2.mode || s.policy_mode || "—";
     $("parallel-mode").textContent = mode;
     const disagree = num(v2.disagreement) === 1 || num(s.policy_disagreement) === 1;
@@ -305,8 +413,8 @@
       </div>
       <div class="policy-side${disagree ? " disagree" : ""}">
         <div class="ps-label">V3 policy</div>
-        <div class="ps-struct">${esc(v2.structure || s.v2_policy_structure || "—")}</div>
-        <div class="ps-meta">${esc(v2.action || s.v2_policy_action || "—")}${(v2.direction || s.v2_policy_direction) ? " · " + esc(v2.direction || s.v2_policy_direction) : ""}</div>
+        <div class="ps-struct">${esc(v2.structure || "—")}</div>
+        <div class="ps-meta">${esc(v2.action || "—")}${v2.direction ? " · " + esc(v2.direction) : ""}</div>
       </div>`;
 
     $("parallel-metrics").innerHTML = [
@@ -314,10 +422,10 @@
         leg.gate_pass ? "pos" : (leg.gate_pass === false ? "warn" : "")),
       metricCard("Legacy size", fmt(leg.size_mult, 2)),
       metricCard("V3 size cap", fmt(v2.size_cap != null ? v2.size_cap : s.policy_size_cap, 2)),
-      metricCard("V3 conf.", fmt(v2.confidence != null ? v2.confidence : s.v2_policy_confidence, 2)),
-      metricCard("V3 unc.", fmt(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty, 2),
-        num(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty) > 0.5 ? "warn" : ""),
-      metricCard("Source", esc(v2.source || s.policy_source || "—")),
+      metricCard("V3 conf.", fmt(v2.confidence, 2)),
+      metricCard("V3 unc.", fmt(v2.uncertainty, 2),
+        num(v2.uncertainty) > 0.5 ? "warn" : ""),
+      metricCard("Source", esc(v2.source || "—")),
     ].join("");
 
     const chips = [];
@@ -391,15 +499,17 @@
 
   /* ---------------- V3 signal (policy shadow, mirrors Legacy signal panel) ---------------- */
   function renderV2Signal(live, latest) {
-    const p = (live && live.parallel) || {};
+    const p = liveParallel(live);
     const v2 = p.v2 || {};
     const s = mergeV2Signals(latest, live);
-    $("v2-signal-time").textContent = live && live.ts ? etTime(live.ts) + " ET" : "—";
+    const ts = liveTs(live);
+    $("v2-signal-time").textContent = ts ? etTime(ts) + " ET" : "—";
 
-    const feedDown = live && (live.status === "feed_not_ready" || live.status === "feed_error");
-    const idle = !live || !live.ts || (live.status && live.status !== "live");
-    const action = String(v2.action || s.v2_policy_action || s.policy_action || "").toUpperCase();
-    const struct = v2.structure || s.v2_policy_structure || s.policy_structure || "";
+    const feedDown = liveFeedDown(live);
+    const idle = liveIdle(live);
+    // Prefer live.forecast.parallel; journal fallback is v2_policy_* only.
+    const action = String(v2.action != null ? v2.action : (s.v2_policy_action || "")).toUpperCase();
+    const struct = v2.structure != null ? v2.structure : (s.v2_policy_structure || "");
     const mode = v2.mode || s.policy_mode || "—";
     const disagree = num(v2.disagreement) === 1 || num(s.policy_disagreement) === 1;
     const fallback = num(v2.fallback_used) === 1 || num(s.policy_fallback_used) === 1;
@@ -433,7 +543,7 @@
     $("v2-verdict-word").textContent = word;
     $("v2-verdict-sub").textContent = sub || "—";
 
-    const dir = String(v2.direction || s.v2_policy_direction || "").toLowerCase();
+    const dir = String(v2.direction != null ? v2.direction : (s.v2_policy_direction || "")).toLowerCase();
     const dirCls = dir.includes("call") || dir.includes("bull") ? "call"
       : dir.includes("put") || dir.includes("bear") ? "put" : "";
     const chips = [];
@@ -484,29 +594,31 @@
 
   function renderV2Why(live, latest) {
     const s = mergeV2Signals(latest, live);
-    const p = (live && live.parallel) || {};
+    const p = liveParallel(live);
     const v2 = p.v2 || {};
     const leg = p.legacy || {};
     const disagree = num(v2.disagreement) === 1 || num(s.policy_disagreement) === 1;
     const rationale = s.policy_rationale || "";
+    const v2Struct = v2.structure != null ? v2.structure : s.v2_policy_structure;
+    const v2Act = v2.action != null ? v2.action : s.v2_policy_action;
     let html = "";
-    if (!live || !live.ts || (live.status && live.status !== "live")) {
+    if (!live || liveIdle(live)) {
       html = "<b>Standing by.</b> No live V3 observation yet.";
     } else if (rationale) {
       html = `<b>Policy.</b> ${esc(String(rationale).replace(/_/g, " "))}.`;
     } else if (disagree) {
-      html = `<b>Disagreement.</b> Legacy ${esc(leg.structure || "NT")} vs V3 ${esc(v2.structure || s.v2_policy_structure || "—")}.`;
+      html = `<b>Disagreement.</b> Legacy ${esc(leg.structure || "NT")} vs V3 ${esc(v2Struct || "—")}.`;
     } else {
-      html = `<b>Aligned.</b> V3 ${esc(v2.structure || s.v2_policy_structure || "NT")} · ${esc(v2.action || s.v2_policy_action || "—")}.`;
+      html = `<b>Aligned.</b> V3 ${esc(v2Struct || "NT")} · ${esc(v2Act || "—")}.`;
     }
     $("v2-reason").innerHTML = html;
     $("v2-why-metrics").innerHTML = [
-      metricCard("V3 structure", esc(v2.structure || s.v2_policy_structure || "—")),
-      metricCard("V3 action", esc(v2.action || s.v2_policy_action || "—")),
+      metricCard("V3 structure", esc(v2Struct || "—")),
+      metricCard("V3 action", esc(v2Act || "—")),
       metricCard("Source", esc(v2.source || s.policy_source || "—"),
         (v2.source || s.policy_source) === "fallback_legacy" ? "warn" : ""),
       metricCard("Legacy structure", esc(leg.structure || s.legacy_policy_structure || "—")),
-      metricCard("Version", esc(s.policy_version || s.v2_policy_version || "—")),
+      metricCard("Version", esc(s.v2_policy_version || s.policy_version || "—")),
       metricCard("Uncertainty", fmt(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty, 2),
         num(v2.uncertainty != null ? v2.uncertainty : s.v2_policy_uncertainty) > 0.5 ? "warn" : ""),
     ].join("");
@@ -521,13 +633,13 @@
   }
 
   function renderV2Regime(live) {
-    const conf = (live.why && live.why.regime_confidences) || {};
+    const conf = liveWhy(live).regime_confidences || {};
     const entries = Object.entries(conf).sort((a, b) => b[1] - a[1]);
     if (!entries.length) {
       $("v2-regime-bars").innerHTML = '<p class="empty">No regime data</p>';
       return;
     }
-    const dom = (live.doing && live.doing.dominant_regime) || "";
+    const dom = liveDoing(live).dominant_regime || "";
     $("v2-regime-bars").innerHTML = entries.map(([k, v]) => {
       const val = num(v) || 0;
       const isDom = k === dom;
@@ -698,14 +810,16 @@
     $("policy-mode").textContent = mode;
     const disagree = num(s.policy_disagreement) === 1;
     const fallback = num(s.policy_fallback_used) === 1;
-    const legStruct = s.legacy_policy_structure || s.policy_structure || "—";
-    const legAct = s.legacy_policy_action || s.policy_action || "—";
-    const legDir = s.legacy_policy_direction || s.policy_direction || "";
+    // Explicit tracks: legacy_* for matrix, v2_policy_* for V3 — no cross-OR.
+    const legStruct = s.legacy_policy_structure || "—";
+    const legAct = s.legacy_policy_action || "—";
+    const legDir = s.legacy_policy_direction || "";
     const v2Struct = s.v2_policy_structure || "—";
     const v2Act = s.v2_policy_action || (fallback ? "fallback" : "—");
     const v2Dir = s.v2_policy_direction || "";
 
-    if (!s.policy_mode && !s.policy_action && !s.legacy_policy_structure) {
+    if (!s.policy_mode && !s.v2_policy_action && !s.legacy_policy_structure
+        && !s.v2_policy_structure) {
       $("policy-compare").innerHTML = '<p class="empty">No policy signals on latest tick</p>';
       $("policy-metrics").innerHTML = "";
       $("policy-chips").innerHTML = "";
@@ -727,14 +841,15 @@
     $("policy-metrics").innerHTML = [
       metricCard("Source", esc(s.policy_source || "—"),
         s.policy_source === "fallback_legacy" ? "warn" : ""),
-      metricCard("Confidence", fmt(s.policy_confidence != null ? s.policy_confidence
-        : s.v2_policy_confidence, 2)),
-      metricCard("Uncertainty", fmt(s.policy_uncertainty != null ? s.policy_uncertainty
-        : s.v2_policy_uncertainty, 2),
-        num(s.policy_uncertainty) > 0.5 ? "warn" : ""),
+      metricCard("Confidence", fmt(s.v2_policy_confidence != null
+        ? s.v2_policy_confidence : s.policy_confidence, 2)),
+      metricCard("Uncertainty", fmt(s.v2_policy_uncertainty != null
+        ? s.v2_policy_uncertainty : s.policy_uncertainty, 2),
+        num(s.v2_policy_uncertainty != null
+          ? s.v2_policy_uncertainty : s.policy_uncertainty) > 0.5 ? "warn" : ""),
       metricCard("Size cap", fmt(s.policy_size_cap, 2)),
       metricCard("V3 conf.", fmt(s.v2_policy_confidence, 2)),
-      metricCard("Version", esc(s.policy_version || s.v2_policy_version || "—")),
+      metricCard("Version", esc(s.v2_policy_version || s.policy_version || "—")),
     ].join("");
 
     const chips = [];
@@ -910,10 +1025,10 @@
 
   /* ---------------- regime confidence bars ---------------- */
   function renderRegime(live) {
-    const conf = (live.why && live.why.regime_confidences) || {};
+    const conf = liveWhy(live).regime_confidences || {};
     const entries = Object.entries(conf).sort((a, b) => b[1] - a[1]);
     if (!entries.length) { $("regime-bars").innerHTML = '<p class="empty">No regime data</p>'; return; }
-    const dom = (live.doing && live.doing.dominant_regime) || "";
+    const dom = liveDoing(live).dominant_regime || "";
     $("regime-bars").innerHTML = entries.map(([k, v]) => {
       const val = num(v) || 0;
       const isDom = k === dom;
@@ -928,11 +1043,11 @@
 
   /* ---------------- reason sentence ---------------- */
   function renderReason(live, latest) {
-    const d = live.doing || {}, w = live.why || {}, t = latest || {};
+    const d = liveDoing(live), w = liveWhy(live), t = latest || {};
     let html = "";
-    if (!live.ts || (live.status && live.status !== "live")) {
-      const lead = (live.status === "feed_not_ready" || live.status === "feed_error") ? "No market feed." : "Standing by.";
-      $("reason").innerHTML = `<b>${lead}</b> ${esc(live.note || "No live tick yet — the pipeline is idle.")}`;
+    if (liveIdle(live)) {
+      const lead = liveFeedDown(live) ? "No market feed." : "Standing by.";
+      $("reason").innerHTML = `<b>${lead}</b> ${esc(liveNote(live) || "No live tick yet — the pipeline is idle.")}`;
       return;
     }
     if (d.stand_down) {
@@ -970,7 +1085,7 @@
 
   /* ---------------- why panel ---------------- */
   function renderWhy(live) {
-    const w = live.why || {}, d = live.doing || {};
+    const w = liveWhy(live), d = liveDoing(live);
     const cell = arr(w.matrix_cell).filter(Boolean).join(" × ") || "—";
     const cards = [
       metricCard("Matrix cell", esc(cell)),
@@ -995,7 +1110,7 @@
 
   /* ---------------- volatility term structure ---------------- */
   function renderVol(live) {
-    const inp = live.inputs || {};
+    const inp = liveInputs(live);
     const rows = [];
     const maxVix = Math.max(20, num(inp.vix9d) || 0, num(inp.vix) || 0, num(inp.vix3m) || 0) * 1.15;
     const volRow = (lbl, v, color) => {
@@ -1030,7 +1145,7 @@
 
   /* ---------------- technicals + dealer positioning ---------------- */
   function renderTech(live) {
-    const inp = live.inputs || {};
+    const inp = liveInputs(live);
     const spot = num(inp.spot);
     const zg = num(inp.zero_gamma_dist_pct);
     const gexPos = num(inp.net_gex) >= 0;
@@ -1377,7 +1492,7 @@
   }
 
   function mergeV2Signals(tick, live) {
-    const fromLive = (live && live.v2_signals) || {};
+    const fromLive = liveV2Signals(live);
     const fromTick = tickSignals(tick) || {};
     return { ...fromLive, ...fromTick };
   }
@@ -1482,8 +1597,8 @@
     const py = (g) => cy - g * (H / 2 - pad);          // gamma -1..+1 → y (up = favorable)
 
     // current state from the live payload, falling back to the newest tick
-    const doing = live && live.doing ? live.doing : {};
-    const inputs = live && live.inputs ? live.inputs : {};
+    const doing = liveDoing(live);
+    const inputs = liveInputs(live);
     const latest = ticks && ticks.length ? ticks[ticks.length - 1] : null;
     let bias = num(doing.bias_value) != null
       ? Math.max(-1, Math.min(1, (doing.bias_value - 50) / 50))
@@ -1582,7 +1697,7 @@
     const cv = $("chart");
     if (!cv || !lastChartData) return;
     const { ticks, live, market } = lastChartData;
-    const inp = live.inputs || {};
+    const inp = liveInputs(live);
 
     const dpr = window.devicePixelRatio || 1;
     const W = cv.clientWidth, H = cv.clientHeight;
@@ -1880,15 +1995,16 @@
     const host = $("signal-panel");
     let note = host.querySelector(".stale-note");
     let msg = "";
-    const age = live.ts ? (Date.now() - new Date(live.ts).getTime()) / 1000 : Infinity;
+    const ts = liveTs(live);
+    const age = ts ? (Date.now() - new Date(ts).getTime()) / 1000 : Infinity;
     if (age > 180) {
       // No fresh heartbeat in >3 min — the pipeline process itself is likely down.
-      msg = live.ts
+      msg = ts
         ? "Pipeline offline — no update in " + Math.floor(age / 60) + " min (check zerodte-shadow service)."
         : "Pipeline offline — no data received yet (check zerodte-shadow service).";
-    } else if (live.status && live.status !== "live" && live.note) {
+    } else if (liveStatus(live) && liveStatus(live) !== "live" && liveNote(live)) {
       // Fresh heartbeat with a reason (feed down / market closed).
-      msg = live.note;
+      msg = liveNote(live);
     }
     if (msg) {
       if (!note) { note = document.createElement("div"); note.className = "stale-note"; host.insertBefore(note, host.firstChild.nextSibling); }
@@ -1933,7 +2049,7 @@
   let predTfFilter = "";
 
   function renderLiveCones(live) {
-    const cones = (live && live.sigma_cones) || {};
+    const cones = liveSigmaCones(live) || {};
     const panes = cones.panes || [];
     $("pred-live-sub").textContent = cones.model_version
       ? `${cones.model_version} · live`
@@ -2049,13 +2165,13 @@
 
   /* ---------------- Part 3 decision / execution / model state ---------------- */
   function renderPart3(live, latest) {
-    const p3 = (live && live.part3) || {};
+    const p3 = livePart3(live);
     const ds = p3.decision_summary || {};
     const ranking = p3.ranking || {};
     const execution = p3.execution || {};
     const model = p3.model_state || {};
     const mode = p3.mode || "shadow";
-    const genAt = p3.generated_at || (live && live.ts) || null;
+    const genAt = p3.generated_at || liveTs(live) || null;
     const versions = p3.model_versions || {};
 
     if ($("v3-decision-mode")) {
@@ -2084,7 +2200,7 @@
     } else if (action === "TRADE") {
       cls = "go"; word = "TRADE";
       sub = (ds.family || "candidate") + " · " + mode;
-    } else if (live && (live.status === "feed_not_ready" || live.status === "feed_error")) {
+    } else if (live && liveFeedDown(live)) {
       cls = "stop"; word = "NO FEED";
       sub = "feed not ready — check data source";
     }
@@ -2168,7 +2284,7 @@
         metricCard("Mode", esc(mode)),
         metricCard("Drift", esc(sev)),
         metricCard("Data quality", fmt(
-          model.data_quality != null ? model.data_quality : (live.why || {}).data_quality, 2)),
+          model.data_quality != null ? model.data_quality : liveWhy(live).data_quality, 2)),
         metricCard("Load", esc(model.load_status || (p3.note ? "waiting" : "ok"))),
       ].join("");
     }
@@ -2603,12 +2719,12 @@
   function renderLearningV2Status(live) {
     const el = $("lrn-v2-metrics");
     if (!el) return;
-    const p = (live && live.parallel) || {};
+    const p = liveParallel(live);
     const v2 = p.v2 || {};
-    const s = (live && live.v2_signals) || {};
+    const s = liveV2Signals(live);
     const mode = v2.mode || s.policy_mode || "—";
     $("lrn-v2-sub").textContent = mode;
-    if (!live || (!live.ts && !Object.keys(s).length && !v2.mode)) {
+    if (!live || (!liveTs(live) && !Object.keys(s).length && !v2.mode)) {
       el.innerHTML = '<p class="empty">No live V3 observation yet — Learning stays empty until '
         + '<span class="mono">adaptive_learning.learner</span> runs; V3 status appears once the shadow pipeline ticks</p>';
       $("lrn-v2-chips").innerHTML = "";
@@ -2618,8 +2734,8 @@
     const fallback = num(v2.fallback_used) === 1 || num(s.policy_fallback_used) === 1;
     el.innerHTML = [
       metricCard("Policy mode", esc(mode)),
-      metricCard("V3 structure", esc(v2.structure || s.v2_policy_structure || "—")),
-      metricCard("V3 action", esc(v2.action || s.v2_policy_action || "—")),
+      metricCard("V3 structure", esc(v2.structure != null ? v2.structure : (s.v2_policy_structure || "—"))),
+      metricCard("V3 action", esc(v2.action != null ? v2.action : (s.v2_policy_action || "—"))),
       metricCard("Confidence", fmt(v2.confidence != null ? v2.confidence : s.v2_policy_confidence, 2)),
       metricCard("Source", esc(v2.source || s.policy_source || "—"),
         fallback ? "warn" : ""),
@@ -2849,6 +2965,11 @@
       ]);
       renderValidationBadge(valLatest);
       renderLearningBadge(pendingPromos);
+      live = requireLiveV1(live);
+      if (!live) {
+        showLiveUnavailable("Invalid or missing live.v1 schema");
+        return;
+      }
       const ticks = history.ticks || [];
       const latest = ticks.length ? ticks[ticks.length - 1] : null;
       // Playbook should show the live candidate: prefer the newest tick, but if it

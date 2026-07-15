@@ -256,15 +256,16 @@ class TestLiveStateParallel:
             },
         )
         payload = serialize_tick_result(result)
-        assert "parallel" in payload
-        assert payload["parallel"]["legacy"]["structure"] == "IC"
-        assert payload["parallel"]["v2"]["structure"] == "IC"
-        assert "v2_signals" in payload
-        assert "phys_v2_mean" in payload["v2_signals"]
+        assert "parallel" not in payload
+        assert payload["legacy"]["parallel"]["structure"] == "IC"
+        assert payload["forecast"]["parallel"]["structure"] == "IC"
+        assert "v2_signals" not in payload
+        assert "phys_v2_mean" in payload["forecast"]["v2_signals"]
         # live.v1 forecast section is always present; summary stays empty
         # when no v2_fc_* keys were journaled on this fixture.
         assert payload["forecast"]["source_version"] == "v2"
         assert payload["forecast"]["summary"] is None
+        assert payload["system"]["compat_flat_keys"] is False
 
 
 class TestV2ObservationOnStandDown:
@@ -319,7 +320,7 @@ class TestV2ObservationOnStandDown:
         payload = serialize_tick_result(result)
         assert payload["forecast"] is not None
         assert "p_up_30m" in payload["forecast"]
-        assert "phys_v2_mean" in payload["v2_signals"]
+        assert "phys_v2_mean" in payload["forecast"]["v2_signals"]
 
 
 class TestHeuristicRanker:

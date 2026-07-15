@@ -4,9 +4,9 @@ dashboard/state.py
 Serialize TickResult into live_state.json for the observability dashboard.
 Read-only snapshot — no decision logic.
 
-PR C: payloads use schema_version=live.v1 with explicit sections (feeds,
-legacy, forecast, v3, …). Flat top-level aliases remain temporarily for the
-pre-migration dashboard (system.compat_flat_keys=True); PR D removes them.
+PR C/D: payloads use schema_version=live.v1 with explicit sections (feeds,
+legacy, forecast, v3, …). Flat top-level aliases are gone
+(system.compat_flat_keys=False); the dashboard reads documented sections only.
 """
 from __future__ import annotations
 
@@ -194,7 +194,8 @@ def serialize_tick_result(
         if k.startswith("v2_fc_")
     }
 
-    # Parallel decision summary for Legacy vs V2 tabs.
+    # Parallel decision summary for Legacy vs V3 tabs.
+    # V3 side uses only v2_policy_* — never fall back to policy_* (legacy).
     parallel = {
         "legacy": {
             "structure": intent.decision.structure,
@@ -205,16 +206,11 @@ def serialize_tick_result(
             "decision": doing.get("decision"),
         },
         "v2": {
-            "structure": raw_signals.get("v2_policy_structure")
-            or raw_signals.get("policy_structure"),
-            "direction": raw_signals.get("v2_policy_direction")
-            or raw_signals.get("policy_direction"),
-            "action": raw_signals.get("v2_policy_action")
-            or raw_signals.get("policy_action"),
-            "confidence": raw_signals.get("v2_policy_confidence")
-            or raw_signals.get("policy_confidence"),
-            "uncertainty": raw_signals.get("v2_policy_uncertainty")
-            or raw_signals.get("policy_uncertainty"),
+            "structure": raw_signals.get("v2_policy_structure"),
+            "direction": raw_signals.get("v2_policy_direction"),
+            "action": raw_signals.get("v2_policy_action"),
+            "confidence": raw_signals.get("v2_policy_confidence"),
+            "uncertainty": raw_signals.get("v2_policy_uncertainty"),
             "size_cap": raw_signals.get("policy_size_cap"),
             "source": raw_signals.get("policy_source"),
             "mode": raw_signals.get("policy_mode"),
@@ -275,16 +271,14 @@ def serialize_tick_result(
     ts_iso = result.ts.isoformat()
     market_session = market_status or {}
 
-    # live.v1 market: session fields at top level for pre-PR-D compat
-    # (app.js reads live.market.is_open), plus nested session/inputs.
+    # live.v1 market: session fields + nested session/inputs.
     market_section = {
         **dict(market_session),
         "session": dict(market_session),
         "inputs": inputs,
     }
 
-    # live.v1 forecast: flat summary keys at top for app.js spread-merge,
-    # plus explicit source labeling (never source_version=v3).
+    # live.v1 forecast: summary + shadow signals; never source_version=v3.
     forecast_section: dict[str, Any] = {
         "source_version": "v2",
         "source_type": (
@@ -301,7 +295,7 @@ def serialize_tick_result(
 
     paper_section = paper_summary or {}
 
-    envelope: dict[str, Any] = {
+    return {
         "schema_version": LIVE_SCHEMA_VERSION,
         "generated_at": ts_iso,
         "snapshot": {
@@ -344,27 +338,10 @@ def serialize_tick_result(
         "system": {
             "status": "live",
             "note": None,
-            "compat_flat_keys": True,
+            "compat_flat_keys": False,
             "schema_version": LIVE_SCHEMA_VERSION,
         },
     }
-    # Temporary non-colliding flat aliases for pre-PR-D dashboard / tests.
-    # Do NOT overwrite live.v1 sections (market/forecast/paper already set).
-    envelope.update({
-        "ts": ts_iso,
-        "status": "live",
-        "note": None,
-        "feed_source": feed_source,
-        "chain_available": chain_available,
-        "doing": doing,
-        "inputs": inputs,
-        "why": why,
-        "v2_signals": v2_signals,
-        "parallel": parallel,
-        "sigma_cones": sigma_cones,
-        "part3": part3_payload,
-    })
-    return envelope
 
 
 def heartbeat_state(
@@ -409,7 +386,7 @@ def heartbeat_state(
         "inputs": {},
     }
     paper_section = paper_summary or {}
-    envelope: dict[str, Any] = {
+    return {
         "schema_version": LIVE_SCHEMA_VERSION,
         "generated_at": ts_iso,
         "snapshot": {
@@ -447,21 +424,10 @@ def heartbeat_state(
         "system": {
             "status": status,
             "note": note,
-            "compat_flat_keys": True,
+            "compat_flat_keys": False,
             "schema_version": LIVE_SCHEMA_VERSION,
         },
     }
-    envelope.update({
-        "ts": ts_iso,
-        "status": status,
-        "note": note,
-        "feed_source": feed_source,
-        "chain_available": False,
-        "doing": {},
-        "inputs": {},
-        "why": {},
-    })
-    return envelope
 
 
 def _sanitize_non_finite(obj: Any) -> Any:

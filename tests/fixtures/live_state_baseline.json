@@ -1,7 +1,7 @@
 {
-  "_comment": "live.v1 /api/live payload shape lock (PR C). Regenerate when serializer changes intentionally. Values synthetic; only recursive key/type structure is asserted.",
+  "_comment": "live.v1 /api/live payload shape lock (PR D). Flat aliases removed; dashboard consumes sections only. Regenerate when serializer changes intentionally. Values synthetic; only recursive key/type structure is asserted.",
   "schema_version": "live.v1",
-  "baseline_tree": "430d665 (post PR #121 / PR B)",
+  "baseline_tree": "3ada4db (post PR #122 / PR C; PR D removes compat_flat_keys)",
   "payload": {
     "schema_version": "live.v1",
     "generated_at": "2026-06-30T10:00:00-04:00",
@@ -205,107 +205,8 @@
     "system": {
       "status": "live",
       "note": null,
-      "compat_flat_keys": true,
+      "compat_flat_keys": false,
       "schema_version": "live.v1"
-    },
-    "ts": "2026-06-30T10:00:00-04:00",
-    "status": "live",
-    "note": null,
-    "feed_source": "Tradier",
-    "chain_available": false,
-    "doing": {
-      "dominant_regime": "compression",
-      "permitted_engine": "premium_selling",
-      "stand_down": false,
-      "structure": "IC",
-      "direction": "both",
-      "conviction": "HIGH",
-      "size_mult": 1.0,
-      "final_size_mult": 1.0,
-      "direction_bias": "neutral",
-      "bias_value": 0.0,
-      "bias_fast": null,
-      "bias_slow": null,
-      "gate_pass": false,
-      "gate_score": 0.0,
-      "decision": "NO_TRADE"
-    },
-    "inputs": {
-      "spot": 600.0,
-      "net_gex": 4000000000.0,
-      "gamma_flip": 595.0,
-      "zero_gamma_dist": 5.0,
-      "zero_gamma_dist_pct": 0.008333333333333333,
-      "gex_pct_rank": 0.85,
-      "call_wall": 605.0,
-      "put_wall": 595.0,
-      "vix9d": 12.0,
-      "vix": 13.0,
-      "vix3m": 15.0,
-      "vvix": 92.0,
-      "vvix_baseline": 95.0,
-      "straddle_breakeven": 4.0,
-      "expected_range": 3.2,
-      "adx": 14.0,
-      "rsi": 50.0,
-      "bb_width": 1.4,
-      "bb_width_baseline": 2.0,
-      "vwap": 600.0,
-      "vwap_reversion_count": 2,
-      "tick_abs_mean": 400.0,
-      "cvd_slope": 0.01,
-      "has_catalyst": false
-    },
-    "why": {
-      "regime_confidences": {
-        "compression": 72,
-        "trend": 18
-      },
-      "global_information_gain": 12.0,
-      "stand_down_reason": null,
-      "dealer_vetoes": [],
-      "matrix_cell": [
-        "compression",
-        "compression",
-        "neutral"
-      ],
-      "intent_note": "",
-      "capture": "theta",
-      "strike_rule": "shorts inside walls",
-      "gate_failed": [],
-      "selector_vetoes": [],
-      "no_trade_reason": "",
-      "risk_vetoes": [],
-      "intent_vetoes": []
-    },
-    "v2_signals": {},
-    "parallel": {
-      "legacy": {
-        "structure": "IC",
-        "direction": "both",
-        "size_mult": 1.0,
-        "gate_pass": false,
-        "gate_score": 0.0,
-        "decision": "NO_TRADE"
-      },
-      "v2": {
-        "structure": null,
-        "direction": null,
-        "action": null,
-        "confidence": null,
-        "uncertainty": null,
-        "size_cap": null,
-        "source": null,
-        "mode": null,
-        "disagreement": null,
-        "fallback_used": null
-      }
-    },
-    "sigma_cones": null,
-    "part3": {
-      "note": "part3 decision not available",
-      "shadow_label": "SHADOW \u2014 not an executed order",
-      "mode": "shadow"
     }
   }
 }

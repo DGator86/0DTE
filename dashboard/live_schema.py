@@ -1,11 +1,11 @@
 """
 dashboard/live_schema.py
 ========================
-Versioned /api/live contract — live.v1 (unified handoff §12 / PR C).
+Versioned /api/live contract — live.v1 (unified handoff §12 / PR C–D).
 
-The serializer emits this envelope. Flat top-level aliases remain temporarily
-under system.compat_flat_keys=True until the dashboard migration PR (PR D)
-consumes only documented live.v1 sections.
+The serializer emits this envelope. The dashboard (PR D) consumes only
+documented live.v1 sections; flat top-level aliases are no longer emitted
+(system.compat_flat_keys=False).
 
 NOT financial advice.
 """
@@ -38,13 +38,8 @@ LIVE_V1_SECTIONS: tuple[str, ...] = (
     "system",
 )
 
-# Temporary flat aliases retained for pre-PR-D dashboard (must not invent
-# V3 labels for V2 data — they mirror the historical flat payload only).
-COMPAT_FLAT_KEYS: tuple[str, ...] = (
-    "ts", "status", "note", "market", "feed_source", "chain_available",
-    "doing", "inputs", "why", "paper", "v2_signals", "forecast",
-    "parallel", "sigma_cones", "part3",
-)
+# Historical flat aliases (removed in PR D). Kept for inventory/docs only.
+COMPAT_FLAT_KEYS: tuple[str, ...] = ()
 
 _DEFAULT_LIMITS = {
     "spot": 5.0,

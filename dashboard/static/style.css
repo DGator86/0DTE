@@ -149,6 +149,19 @@ html, body {
 .meta-chip { font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: nowrap; }
 .meta-chip b { color: var(--ink); font-weight: 600; }
 .meta-chip.warn b { color: var(--amber); }
+.meta-chip.feed-live b { color: var(--green); }
+.meta-chip.feed-delayed b { color: var(--amber); }
+.meta-chip.feed-stale b { color: var(--amber); }
+.meta-chip.feed-missing b { color: var(--red); }
+.meta-feeds-detail {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  font-family: var(--mono); font-size: 10px; color: var(--muted);
+}
+.meta-feeds-detail .feed-src b { font-weight: 600; }
+.meta-feeds-detail .feed-live b { color: var(--green); }
+.meta-feeds-detail .feed-delayed b { color: var(--amber); }
+.meta-feeds-detail .feed-stale b { color: var(--amber); }
+.meta-feeds-detail .feed-missing b { color: var(--red); }
 
 /* ---------------- Layout grid ---------------- */
 .grid {

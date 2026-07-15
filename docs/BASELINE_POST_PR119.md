@@ -63,9 +63,8 @@ Authority notes locked by tests:
 (`schema_version: "live.v1"`) with explicit sections: `snapshot`, `feeds`,
 `market`, `legacy`, `forecast`, `v3`, `accounts`, `risk`, `paper`, `system`.
 Per-source feed status lives under `feeds` (overall LIVE only when every
-required source is fresh). Flat aliases (`doing`, `why`, `part3`, …) remain
-temporarily for the pre-migration dashboard (`system.compat_flat_keys=true`);
-PR D removes them.
+required source is fresh). Flat aliases are **removed**
+(`system.compat_flat_keys=false`); the dashboard reads sections only (PR D).
 
 `write_live_state()` sanitizes non-finite floats and writes atomically;
 `GET /api/live` returns the file content unmodified.
@@ -76,13 +75,11 @@ Top-level live.v1 keys (locked by fixture
 ```
 schema_version, generated_at, snapshot, feeds, market, legacy, forecast,
 v3, accounts, risk, paper, system
-(+ temporary flat aliases: ts, status, note, feed_source, chain_available,
- doing, inputs, why, v2_signals, parallel, sigma_cones, part3)
 ```
 
-`heartbeat_state()` is the no-tick variant; its `system.status` /
-flat `status` values are `market_closed | feed_not_ready | feed_error`
-(plus `live` on real ticks). Overall feed status is never LIVE on heartbeat.
+`heartbeat_state()` is the no-tick variant; its `system.status` values are
+`market_closed | feed_not_ready | feed_error` (plus `live` on real ticks).
+Overall feed status is never LIVE on heartbeat.
 
 ## Dashboard API endpoints (dashboard/server.py)
 
@@ -105,15 +102,16 @@ independently by the frontend and merged client-side.
 
 One `setInterval(refresh, REFRESH_MS)` polling loop plus per-tab refreshers:
 
-- `refresh()` — main loop; `Promise.all` over 9 endpoints, then ~35
-  `render*` calls (see the inventory test for the exact list).
+- `refresh()` — main loop; `Promise.all` over 9 endpoints, then
+  `requireLiveV1(live)` once, then ~35 `render*` calls (see the inventory
+  test for the exact list). Invalid schema → `showLiveUnavailable`.
 - `refreshJournal()`, `refreshValidation()`, `refreshLearning()`,
   `refreshPrediction()` — tab-scoped.
 
-Known baseline weaknesses (to be fixed in the dashboard-migration PR, not
-here): render functions read undocumented fields, several fall back across
-versions (e.g. `v2_policy_* || policy_*`), and feed health is inferred, not
-served.
+PR D closed the baseline weaknesses: renderers read live.v1 sections
+(`legacy`, `forecast`, `v3`, `feeds`, `market`, `system`), do not fall back
+across versions (no `v2_policy_* || policy_*`), and feed health comes from
+`feeds` (not a truthy `feed_source` / `chain_available`).
 
 ## Feed status logic
 
@@ -129,7 +127,8 @@ Per-source feed status is serialized under `feeds` (PR C / live.v1):
   `serialize_tick_result`; otherwise statuses are synthesized honestly from
   `feed_source` + `chain_available`.
 
-Flat `feed_source` / `chain_available` remain as temporary aliases.
+Provider / chain availability for the tick live under `snapshot.feed_source`
+and `snapshot.chain_available` (not top-level flat aliases).
 
 ## Paper accounts
 
