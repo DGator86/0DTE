@@ -110,5 +110,6 @@ def test_serialize_tick_result_includes_part3():
         part3=part3,
     )
     payload = serialize_tick_result(result)
-    assert payload["part3"]["decision_summary"]["action"] == "NO_EDGE"
-    assert payload["part3"]["mode"] == "shadow"
+    assert payload["v3"]["decision"]["decision_summary"]["action"] == "NO_EDGE"
+    assert payload["v3"]["decision"]["mode"] == "shadow"
+    assert "part3" not in payload

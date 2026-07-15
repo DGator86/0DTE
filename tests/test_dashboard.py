@@ -74,16 +74,18 @@ def test_serialize_tick_result_sections():
         paper_summary={"trades": 0, "equity": 1000},
         market_status={"is_open": True},
     )
-    assert "doing" in payload
-    assert "inputs" in payload
-    assert "why" in payload
-    assert payload["doing"]["dominant_regime"] == "compression"
-    assert payload["inputs"]["spot"] == 600.0
-    assert payload["why"]["matrix_cell"] == ["compression", "compression", "neutral"]
-    assert payload["feed_source"] == "Tradier"
+    assert payload["schema_version"] == "live.v1"
+    assert "doing" not in payload
+    assert "inputs" not in payload
+    assert payload["legacy"]["doing"]["dominant_regime"] == "compression"
+    assert payload["market"]["inputs"]["spot"] == 600.0
+    assert payload["legacy"]["why"]["matrix_cell"] == [
+        "compression", "compression", "neutral"]
+    assert payload["snapshot"]["feed_source"] == "Tradier"
+    assert payload["system"]["compat_flat_keys"] is False
     # continuous direction bias for the four-way quadrant / regime shading
-    assert payload["doing"]["direction_bias"] == "neutral"
-    assert payload["doing"]["bias_value"] == 0.0
+    assert payload["legacy"]["doing"]["direction_bias"] == "neutral"
+    assert payload["legacy"]["doing"]["bias_value"] == 0.0
 
 
 def test_write_read_live_state():
@@ -130,7 +132,10 @@ def test_api_live_with_auth(client):
     r = client.get("/api/live", headers={"Authorization": "Bearer test-secret-token"})
     assert r.status_code == 200
     data = r.json()
-    assert data["doing"]["structure"] == "IC"
+    assert data["schema_version"] == "live.v1"
+    assert data["legacy"]["doing"]["structure"] == "IC"
+    assert "doing" not in data
+    assert "feeds" in data and "overall_status" in data["feeds"]
 
 
 def test_api_market_status(client):

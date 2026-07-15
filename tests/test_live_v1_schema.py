@@ -86,9 +86,11 @@ def test_serialize_emits_live_v1_sections():
     # No ambiguous V2-under-V3
     assert payload["v3"].get("source_version") != "v2"
     assert payload["forecast"].get("source_version") != "v3"
-    # Compat: pre-PR-D dashboard still sees is_open
+    # Compat: market session still exposes is_open under market section
     assert payload["market"]["is_open"] is True
-    assert payload["doing"]["dominant_regime"] == "compression"
+    assert payload["legacy"]["doing"]["dominant_regime"] == "compression"
+    assert "doing" not in payload
+    assert payload["system"]["compat_flat_keys"] is False
 
 
 def test_truthy_feed_source_alone_is_not_overall_live():
@@ -97,7 +99,7 @@ def test_truthy_feed_source_alone_is_not_overall_live():
         _tick(), feed_source="Tradier",
         market_status={"is_open": True},
     )
-    assert payload["feed_source"] == "Tradier"
+    assert payload["snapshot"]["feed_source"] == "Tradier"
     assert payload["feeds"]["overall_status"] != "LIVE"
     assert payload["feeds"]["overall_status"] in ("DEGRADED", "MISSING", "STALE")
 

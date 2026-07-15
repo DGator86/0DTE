@@ -120,14 +120,12 @@ def _shape(obj):
 # --------------------------------------------------------------------------- #
 def test_live_state_top_level_keys():
     keys = set(baseline_live_payload().keys())
-    # live.v1 sections
-    for k in ("schema_version", "generated_at", "snapshot", "feeds", "market",
-              "legacy", "forecast", "v3", "accounts", "risk", "paper", "system"):
-        assert k in keys
-    # Temporary flat aliases for pre-PR-D dashboard
-    for k in ("ts", "status", "note", "feed_source", "chain_available",
-              "doing", "inputs", "why", "v2_signals", "parallel", "part3"):
-        assert k in keys
+    # live.v1 sections only (PR D removed flat aliases)
+    assert keys == {
+        "schema_version", "generated_at", "snapshot", "feeds", "market",
+        "legacy", "forecast", "v3", "accounts", "risk", "paper", "system",
+    }
+    assert baseline_live_payload()["system"]["compat_flat_keys"] is False
 
 
 def test_live_state_shape_matches_committed_fixture():
@@ -139,16 +137,17 @@ def test_live_state_shape_matches_committed_fixture():
 
 
 def test_live_state_has_versioned_live_v1_contract():
-    """PR C closed the baseline gap: schema_version + per-source feeds."""
+    """PR C/D: schema_version + per-source feeds; no flat feed aliases."""
     from dashboard.live_schema import LIVE_SCHEMA_VERSION, validate_live_v1
     payload = baseline_live_payload()
     assert payload["schema_version"] == LIVE_SCHEMA_VERSION
     assert "feeds" in payload
     assert "overall_status" in payload["feeds"]
     assert validate_live_v1(payload) == []
-    # Feed health is no longer only a provider name + chain bool.
-    assert payload["feed_source"] == "Tradier"
-    assert payload["chain_available"] is False
+    assert "feed_source" not in payload
+    assert "chain_available" not in payload
+    assert payload["snapshot"]["feed_source"] == "Tradier"
+    assert payload["snapshot"]["chain_available"] is False
     assert payload["feeds"]["option_chain"]["status"] == "MISSING"
 
 
@@ -160,11 +159,12 @@ def test_heartbeat_state_contract():
                          market_status={"is_open": False})
     assert hb["schema_version"] == LIVE_SCHEMA_VERSION
     assert validate_live_v1(hb) == []
-    assert hb["status"] == "market_closed"
+    assert hb["system"]["status"] == "market_closed"
+    assert "status" not in hb
     assert hb["feeds"]["overall_status"] != "LIVE"
     # The three no-tick statuses shadow_runner emits (real ticks use "live").
     for status in ("market_closed", "feed_not_ready", "feed_error"):
-        assert heartbeat_state(now, status=status, note="n")["status"] == status
+        assert heartbeat_state(now, status=status, note="n")["system"]["status"] == status
 
 
 # --------------------------------------------------------------------------- #
@@ -264,20 +264,42 @@ def test_appjs_api_endpoint_inventory():
 
 
 def test_appjs_single_polling_loop():
-    """One setInterval(refresh, ...) drives the page. The dashboard-migration
-    PR replaces this with a single schema-validated render cycle; until then,
-    a second polling loop would reintroduce the duplicate-refresh failure
-    mode PR #113 existed to fix."""
+    """One setInterval(refresh, ...) drives the page; refresh() schema-validates
+    live.v1 once before the render cycle."""
     assert len(re.findall(r"setInterval\(refresh\b", _appjs())) == 1
+    assert "requireLiveV1" in _appjs()
+    assert "showLiveUnavailable" in _appjs()
 
 
-def test_appjs_still_contains_known_ambiguous_fallbacks():
-    """Documents (not endorses) the baseline's cross-version fallback reads,
-    e.g. v2_policy_* || policy_*. The dashboard-migration PR removes them;
-    when it does, flip this test to assert absence."""
-    assert 'raw_signals.get("v2_policy_structure")' in (
-        ROOT / "dashboard" / "state.py").read_text()
+def test_appjs_no_ambiguous_cross_version_fallbacks():
+    """PR D: no v2_policy_* || policy_* cross-version reads in serializer or UI."""
+    state = (ROOT / "dashboard" / "state.py").read_text(encoding="utf-8")
+    assert 'or raw_signals.get("policy_structure")' not in state
+    assert 'or raw_signals.get("policy_action")' not in state
+    assert 'or raw_signals.get("policy_direction")' not in state
+    assert 'or raw_signals.get("policy_confidence")' not in state
+    assert 'or raw_signals.get("policy_uncertainty")' not in state
+    js = _appjs()
+    assert "v2_policy_action || s.policy_action" not in js
+    assert "v2_policy_structure || s.policy_structure" not in js
+    assert "v2_policy_direction || s.policy_direction" not in js
+    assert "live.chain_available" not in js
+    assert "live.feed_source" not in js
+    assert "live.doing" not in js
+    assert "live.v2_signals" not in js
+    assert "meta-feeds" in js
+    assert "liveParallel" in js
+    assert "liveInputs" in js
+    assert "liveDoing" in js
 
+
+def test_appjs_consumes_feeds_section():
+    js = _appjs()
+    assert "feeds.overall_status" in js
+    assert "option_chain" in js
+    assert "feedStatusCls" in js
+    assert "LIVE_SCHEMA_VERSION" in js
+    assert "live.v1" in js
 
 # --------------------------------------------------------------------------- #
 # 5. Paper accounts and risk-manager wiring                                   #
