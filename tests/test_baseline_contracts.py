@@ -119,11 +119,15 @@ def _shape(obj):
 # 1. Serializer contract                                                      #
 # --------------------------------------------------------------------------- #
 def test_live_state_top_level_keys():
-    assert set(baseline_live_payload().keys()) == {
-        "ts", "status", "note", "market", "feed_source", "chain_available",
-        "doing", "inputs", "why", "paper", "v2_signals", "forecast",
-        "parallel", "sigma_cones", "part3",
-    }
+    keys = set(baseline_live_payload().keys())
+    # live.v1 sections
+    for k in ("schema_version", "generated_at", "snapshot", "feeds", "market",
+              "legacy", "forecast", "v3", "accounts", "risk", "paper", "system"):
+        assert k in keys
+    # Temporary flat aliases for pre-PR-D dashboard
+    for k in ("ts", "status", "note", "feed_source", "chain_available",
+              "doing", "inputs", "why", "v2_signals", "parallel", "part3"):
+        assert k in keys
 
 
 def test_live_state_shape_matches_committed_fixture():
@@ -134,26 +138,30 @@ def test_live_state_shape_matches_committed_fixture():
     assert _shape(baseline_live_payload()) == _shape(fixture["payload"])
 
 
-def test_live_state_baseline_has_no_versioned_contract_yet():
-    """Documents the gap the live.v1 PR will close: today's payload carries
-    no schema version and no per-source feed status."""
+def test_live_state_has_versioned_live_v1_contract():
+    """PR C closed the baseline gap: schema_version + per-source feeds."""
+    from dashboard.live_schema import LIVE_SCHEMA_VERSION, validate_live_v1
     payload = baseline_live_payload()
-    assert "schema_version" not in payload
-    assert "feeds" not in payload
-    # Feed health today is only a provider name + a chain bool.
+    assert payload["schema_version"] == LIVE_SCHEMA_VERSION
+    assert "feeds" in payload
+    assert "overall_status" in payload["feeds"]
+    assert validate_live_v1(payload) == []
+    # Feed health is no longer only a provider name + chain bool.
     assert payload["feed_source"] == "Tradier"
     assert payload["chain_available"] is False
+    assert payload["feeds"]["option_chain"]["status"] == "MISSING"
 
 
 def test_heartbeat_state_contract():
+    from dashboard.live_schema import LIVE_SCHEMA_VERSION, validate_live_v1
     now = dt.datetime(2026, 6, 30, 7, 0, tzinfo=ET)
     hb = heartbeat_state(now, status="market_closed", note="closed",
                          feed_source=None, paper_summary=None,
                          market_status={"is_open": False})
-    assert set(hb.keys()) == {
-        "ts", "status", "note", "market", "feed_source", "chain_available",
-        "doing", "inputs", "why", "paper",
-    }
+    assert hb["schema_version"] == LIVE_SCHEMA_VERSION
+    assert validate_live_v1(hb) == []
+    assert hb["status"] == "market_closed"
+    assert hb["feeds"]["overall_status"] != "LIVE"
     # The three no-tick statuses shadow_runner emits (real ticks use "live").
     for status in ("market_closed", "feed_not_ready", "feed_error"):
         assert heartbeat_state(now, status=status, note="n")["status"] == status

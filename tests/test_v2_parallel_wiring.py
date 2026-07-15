@@ -261,7 +261,10 @@ class TestLiveStateParallel:
         assert payload["parallel"]["v2"]["structure"] == "IC"
         assert "v2_signals" in payload
         assert "phys_v2_mean" in payload["v2_signals"]
-        assert payload.get("forecast") is None  # no v2_fc_* on this fixture
+        # live.v1 forecast section is always present; summary stays empty
+        # when no v2_fc_* keys were journaled on this fixture.
+        assert payload["forecast"]["source_version"] == "v2"
+        assert payload["forecast"]["summary"] is None
 
 
 class TestV2ObservationOnStandDown:
