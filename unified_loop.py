@@ -766,8 +766,7 @@ class UnifiedOrchestrator:
 
         from decision_stack.authority import coerce_size_mult
 
-        fair = bool(getattr(self, "__dict__", {}).get(
-            "paper_fair_comparison", False))
+        fair = bool(vars(self).get("paper_fair_comparison", False))
         snap_id = str(signals.get("_snapshot_id") or "")
         blocked = bool(matrix_stand_down) if fair else False
 
@@ -993,20 +992,20 @@ class UnifiedOrchestrator:
                                 "mid_credit": diag.get("mid_credit"),
                             }
                             intents.append(_intent(
-                            "v3", v3_cand,
-                            size_mult=size,
-                            gate_kelly=(getattr(v3_dec, "gate_kelly", None)
-                                        if v3_dec else None),
-                            gate_score=(getattr(v3_dec, "gate_score", None)
-                                        if v3_dec else None),
-                            structure=v3_struct,
-                            direction=v3_dir,
-                            candidate_id=cid,
-                            reason="unified_v3",
-                            extra={
-                                "v3_action": v3_action,
-                                "execution_estimate": exec_est,
-                            }))
+                                "v3", v3_cand,
+                                size_mult=size,
+                                gate_kelly=(getattr(v3_dec, "gate_kelly", None)
+                                            if v3_dec else None),
+                                gate_score=(getattr(v3_dec, "gate_score", None)
+                                            if v3_dec else None),
+                                structure=v3_struct,
+                                direction=v3_dir,
+                                candidate_id=cid,
+                                reason="unified_v3",
+                                extra={
+                                    "v3_action": v3_action,
+                                    "execution_estimate": exec_est,
+                                }))
 
         # Each paper account records into its own RiskManager on open.
         for intent in intents:
