@@ -66,10 +66,10 @@ def _plan(family: str, legs: list[dict]) -> dict:
         "family": family,
         "direction": "neutral",
         "legs": legs,
-        "limit_price": 0.01,
+        "limit_price": 5.00,
         "risk_fraction": 0.05,
         "confidence": 0.70,
-        "thesis": "synthetic premium-structure validation",
+        "thesis": "synthetic defined-risk structure validation",
         "supporting_evidence": [],
         "contradictory_evidence": [],
         "invalidation_conditions": [],
@@ -77,14 +77,12 @@ def _plan(family: str, legs: list[dict]) -> dict:
     }
 
 
-def test_exact_premium_family_mandate():
-    assert _cfg().allowed_families == (
-        "put_credit",
-        "call_credit",
-        "iron_condor",
-        "iron_fly",
-        "broken_wing",
-    )
+def test_requested_premium_families_are_included_without_excluding_debit_spreads():
+    families = set(_cfg().allowed_families)
+    assert {
+        "put_credit", "call_credit", "iron_condor", "iron_fly", "broken_wing"
+    } <= families
+    assert {"long_call_spread", "long_put_spread"} <= families
 
 
 def test_iron_fly_is_approved_and_preserves_family(tmp_path):
@@ -94,6 +92,7 @@ def test_iron_fly_is_approved_and_preserves_family(tmp_path):
         {"kind": "C", "strike": 620.0, "side": "sell"},
         {"kind": "C", "strike": 623.0, "side": "buy"},
     ])
+    plan["limit_price"] = 0.01
     out = RiskFirewall(_cfg()).validate_entry(
         now=NOW, plan=plan, result=_result(), broker=_broker(tmp_path),
         allow_new_entry=True,
@@ -114,6 +113,7 @@ def test_broken_wing_is_approved_with_two_short_body_units(tmp_path, kind, strik
         {"kind": kind, "strike": body, "side": "sell", "quantity": 2},
         {"kind": kind, "strike": high, "side": "buy", "quantity": 1},
     ])
+    plan["limit_price"] = 0.01
     out = RiskFirewall(_cfg()).validate_entry(
         now=NOW, plan=plan, result=_result(), broker=_broker(tmp_path),
         allow_new_entry=True,
@@ -138,7 +138,7 @@ def test_equal_wing_butterfly_is_not_accepted_as_broken_wing(tmp_path):
     assert "legs_do_not_match_defined_risk_family" in out.reasons
 
 
-def test_debit_spread_family_is_rejected(tmp_path):
+def test_bullish_debit_spread_remains_available(tmp_path):
     plan = _plan("long_call_spread", [
         {"kind": "C", "strike": 620.0, "side": "buy"},
         {"kind": "C", "strike": 623.0, "side": "sell"},
@@ -147,5 +147,5 @@ def test_debit_spread_family_is_rejected(tmp_path):
         now=NOW, plan=plan, result=_result(), broker=_broker(tmp_path),
         allow_new_entry=True,
     )
-    assert not out.approved
-    assert "family_not_allowed" in out.reasons
+    assert out.approved, out.reasons
+    assert out.paper_intent["candidate"].family == "long_call_spread"
