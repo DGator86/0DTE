@@ -1,7 +1,7 @@
 [Unit]
-# 0DTE GEX shadow-mode pipeline — journals every tick, never places an order.
-# Decision-support only; a human executes the tickets it pushes. Not financial advice.
-Description=0DTE GEX shadow-mode pipeline (journal-only, no orders)
+# 0DTE GEX shadow pipeline + optional Grok 4.5 autonomous paper track.
+# No live-order adapter exists; every fill remains inside PaperBroker.
+Description=0DTE GEX shadow pipeline with Grok paper trader
 After=network-online.target
 Wants=network-online.target
 
@@ -14,11 +14,9 @@ WorkingDirectory=/opt/zerodte
 # Secrets live ONLY here (chmod 600, root:zerodte). Never in the repo or unit.
 EnvironmentFile=/etc/zerodte/zerodte.env
 
-# The journal DB persists under /var/lib/zerodte so it survives restarts and
-# code updates — it is the entire measurement thesis.
-# The paper DB lives under /var/lib/zerodte too — it is the only writable path
-# (ProtectSystem=strict makes /opt/zerodte read-only at runtime).
-ExecStart=/opt/zerodte/venv/bin/python /opt/zerodte/shadow_runner.py \
+# The journal, paper DB, Grok audit/cost ledger, and restart-safe Grok position
+# snapshot persist under /var/lib/zerodte.
+ExecStart=/opt/zerodte/venv/bin/python /opt/zerodte/grok_runner.py \
     --db /var/lib/zerodte/shadow.db \
     --paper-db /var/lib/zerodte/paper.sqlite \
     --live-state /var/lib/zerodte/live_state.json \
@@ -31,7 +29,7 @@ ExecStart=/opt/zerodte/venv/bin/python /opt/zerodte/shadow_runner.py \
 Restart=on-failure
 RestartSec=10
 
-# --- Hardening: the box holds an API key, so lock the process down. ---
+# --- Hardening: the box holds API keys, so lock the process down. ---
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
