@@ -25,7 +25,7 @@ def _float(name: str, default: float) -> float:
 class GrokConfig:
     """Runtime and risk policy for the Grok paper trader.
 
-    All defaults fail closed.  Merely installing the code never calls xAI and
+    All defaults fail closed. Merely installing the code never calls xAI and
     never adds a paper order; both ``enabled`` and ``submission_enabled`` must
     be explicitly set in the VPS secrets file.
     """
@@ -58,8 +58,8 @@ class GrokConfig:
         "put_credit",
         "call_credit",
         "iron_condor",
-        "long_call_spread",
-        "long_put_spread",
+        "iron_fly",
+        "broken_wing",
     )
     max_risk_fraction: float = 0.05
     max_requested_risk_fraction: float = 0.05
@@ -85,7 +85,7 @@ class GrokConfig:
             s.strip().lower()
             for s in os.getenv(
                 "GROK_ALLOWED_FAMILIES",
-                "put_credit,call_credit,iron_condor,long_call_spread,long_put_spread",
+                "put_credit,call_credit,iron_condor,iron_fly,broken_wing",
             ).split(",")
             if s.strip()
         )
