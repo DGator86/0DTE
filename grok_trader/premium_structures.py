@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-"""Premium-selling structure support for the Grok paper trader.
+"""Additional defined-risk structure support for the Grok paper trader.
 
-This module extends the Grok firewall without changing the deterministic
-Legacy/V2/V3 engines.  The public Grok mandate is exactly:
+The Grok mandate is not premium-selling-only. It may trade bullish, bearish,
+neutral, volatility-contraction, or volatility-expansion setups, provided the
+structure is options-only and has deterministically bounded maximum loss.
 
-- bull put credit spread (``put_credit``)
-- bear call credit spread (``call_credit``)
-- iron condor (``iron_condor``)
-- iron butterfly (``iron_fly``)
-- broken-wing butterfly (``broken_wing``)
-
-All structures remain same-day, paper-only, and defined-risk.  The existing
-firewall still reprices every leg from the current chain and computes the full
-payoff curve before approving an intent.
+This module adds iron butterflies and broken-wing butterflies to the original
+vertical-spread and iron-condor support. Existing bull put, bear call, iron
+condor, long call spread, and long put spread behavior remains available.
 """
 
 from typing import Any
@@ -27,6 +22,8 @@ PUBLIC_FAMILIES = (
     "iron_condor",
     "iron_fly",
     "broken_wing",
+    "long_call_spread",
+    "long_put_spread",
 )
 
 
@@ -44,7 +41,6 @@ def _normalized_legs(raw: Any) -> tuple[Leg, ...]:
             kind = "P"
         else:
             raise ValueError("leg kind must be call/C or put/P")
-
         quantity = int(row.get("quantity") or 1)
         if quantity not in {1, 2}:
             raise ValueError("leg quantity must be 1 or 2")
@@ -61,15 +57,17 @@ def _normalized_legs(raw: Any) -> tuple[Leg, ...]:
     return tuple(legs)
 
 
-def _vertical_shape(kind: str, legs: tuple[Leg, ...], *, bullish: bool) -> bool:
+def _vertical_shape(kind: str, legs: tuple[Leg, ...], *, credit: bool) -> bool:
     if len(legs) != 2 or any(leg.kind != kind or abs(leg.qty) != 1 for leg in legs):
         return False
-    long_legs = [leg for leg in legs if leg.qty == 1]
-    short_legs = [leg for leg in legs if leg.qty == -1]
-    if len(long_legs) != 1 or len(short_legs) != 1:
+    longs = [leg for leg in legs if leg.qty == 1]
+    shorts = [leg for leg in legs if leg.qty == -1]
+    if len(longs) != 1 or len(shorts) != 1:
         return False
-    long_strike, short_strike = long_legs[0].strike, short_legs[0].strike
-    return short_strike > long_strike if bullish else short_strike < long_strike
+    long_strike, short_strike = longs[0].strike, shorts[0].strike
+    if kind == "P":
+        return short_strike > long_strike if credit else long_strike > short_strike
+    return short_strike < long_strike if credit else long_strike < short_strike
 
 
 def _iron_shape(legs: tuple[Leg, ...], *, fly: bool) -> bool:
@@ -83,9 +81,7 @@ def _iron_shape(legs: tuple[Leg, ...], *, fly: bool) -> bool:
         return False
     p_long, p_short = p_longs[0], p_shorts[0]
     c_short, c_long = c_shorts[0], c_longs[0]
-    if fly:
-        return p_long < p_short == c_short < c_long
-    return p_long < p_short < c_short < c_long
+    return p_long < p_short == c_short < c_long if fly else p_long < p_short < c_short < c_long
 
 
 def _broken_wing_shape(legs: tuple[Leg, ...]) -> bool:
@@ -101,22 +97,20 @@ def _broken_wing_shape(legs: tuple[Leg, ...]) -> bool:
 
 def _family_shape(family: str, legs: tuple[Leg, ...]) -> bool:
     if family == "put_credit":
-        return _vertical_shape("P", legs, bullish=True) or _broken_wing_shape(legs)
+        return _vertical_shape("P", legs, credit=True) or _broken_wing_shape(legs)
     if family == "call_credit":
-        return _vertical_shape("C", legs, bullish=False) or _broken_wing_shape(legs)
+        return _vertical_shape("C", legs, credit=True) or _broken_wing_shape(legs)
+    if family == "long_call_spread":
+        return _vertical_shape("C", legs, credit=False)
+    if family == "long_put_spread":
+        return _vertical_shape("P", legs, credit=False)
     if family == "iron_condor":
         return _iron_shape(legs, fly=False) or _iron_shape(legs, fly=True)
     return False
 
 
 def install_premium_structure_support() -> None:
-    """Patch the Grok-only adapter to expose the five approved structures.
-
-    The existing RiskFirewall remains responsible for all pricing, liquidity,
-    payoff, risk, time-window, account, and paper-only checks.  This adapter only
-    canonicalizes the two additional multi-leg shapes so they pass through that
-    same audited validation path.
-    """
+    """Install the expanded options-only defined-risk structure adapter."""
     from . import agent as agent_module
     from . import risk as risk_module
 
@@ -159,7 +153,6 @@ def install_premium_structure_support() -> None:
         validate_entry._premium_structure_wrapper = True
         risk_module.RiskFirewall.validate_entry = validate_entry
 
-    # Keep the model-facing tool schema synchronized with the firewall mandate.
     for tool in agent_module.TOOLS:
         if tool.get("name") != "submit_paper_trade":
             continue
@@ -168,17 +161,15 @@ def install_premium_structure_support() -> None:
         props["legs"]["items"]["properties"]["quantity"] = {
             "type": "integer",
             "enum": [1, 2],
-            "description": "Use 2 only for the short body of a broken-wing butterfly.",
+            "description": "Use 2 only when a validated ratio structure requires it.",
         }
         break
 
     agent_module.SYSTEM_PROMPT += """
 
-Approved premium-selling structures only:
-- put_credit: bull put credit spread
-- call_credit: bear call credit spread
-- iron_condor: separated put and call short strikes
-- iron_fly: put and call short legs share the same body strike
-- broken_wing: three same-type legs ordered long 1 / short 2 / long 1 with unequal wings
-Do not propose debit spreads or any other family.
+Trading mandate:
+- Seek opportunity in bullish, bearish, neutral, volatility-expansion, and volatility-contraction regimes.
+- The five requested premium structures are available: bull put credit spread, bear call credit spread, iron condor, iron butterfly, and broken-wing butterfly.
+- Bullish and bearish debit spreads are also available.
+- The controlling rules are options-only construction, no stock ownership requirement, and deterministically bounded maximum loss. Never propose covered-stock, naked-unlimited-risk, or undefined-risk exposure.
 """
