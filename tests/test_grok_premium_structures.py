@@ -77,12 +77,14 @@ def _plan(family: str, legs: list[dict]) -> dict:
     }
 
 
-def test_requested_premium_families_are_included_without_excluding_debit_spreads():
+def test_requested_premium_families_are_included_with_simple_directionals():
     families = set(_cfg().allowed_families)
     assert {
         "put_credit", "call_credit", "iron_condor", "iron_fly", "broken_wing"
     } <= families
-    assert {"long_call_spread", "long_put_spread"} <= families
+    assert {
+        "long_call", "long_put", "long_call_spread", "long_put_spread"
+    } <= families
 
 
 def test_iron_fly_is_approved_and_preserves_family(tmp_path):
@@ -129,6 +131,39 @@ def test_equal_wing_butterfly_is_not_accepted_as_broken_wing(tmp_path):
         {"kind": "P", "strike": 617.0, "side": "buy"},
         {"kind": "P", "strike": 620.0, "side": "sell", "quantity": 2},
         {"kind": "P", "strike": 623.0, "side": "buy"},
+    ])
+    out = RiskFirewall(_cfg()).validate_entry(
+        now=NOW, plan=plan, result=_result(), broker=_broker(tmp_path),
+        allow_new_entry=True,
+    )
+    assert not out.approved
+    assert "legs_do_not_match_defined_risk_family" in out.reasons
+
+
+@pytest.mark.parametrize("family,kind,direction", [
+    ("long_call", "C", "bullish"),
+    ("long_put", "P", "bearish"),
+])
+def test_simple_long_option_directional_is_approved(tmp_path, family, kind, direction):
+    plan = _plan(family, [
+        {"kind": kind, "strike": 620.0, "side": "buy"},
+    ])
+    plan["direction"] = direction
+    out = RiskFirewall(_cfg()).validate_entry(
+        now=NOW, plan=plan, result=_result(), broker=_broker(tmp_path),
+        allow_new_entry=True,
+    )
+    assert out.approved, out.reasons
+    candidate = out.paper_intent["candidate"]
+    assert candidate.family == family
+    assert len(candidate.legs) == 1
+    assert candidate.legs[0].qty == 1
+    assert out.diagnostics["max_loss_per_share"] > 0
+
+
+def test_single_short_option_is_rejected_as_undefined_risk(tmp_path):
+    plan = _plan("long_call", [
+        {"kind": "C", "strike": 620.0, "side": "sell"},
     ])
     out = RiskFirewall(_cfg()).validate_entry(
         now=NOW, plan=plan, result=_result(), broker=_broker(tmp_path),
