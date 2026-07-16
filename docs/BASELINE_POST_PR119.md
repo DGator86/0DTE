@@ -165,9 +165,12 @@ Exactly one `RiskManager` for everything:
   artifact-hash mismatch, feature-version / target / horizon mismatch,
   model feature version newer than live, missing required input fields
   (schema v2), and missing v2 audit fields (calibration/fold/OOF).
-- `prediction/deployment.py` + `configs/champion.json` +
-  `configs/deployment.json` hold the current deployment pointers; there is no
-  unified `DeploymentBundle` yet.
+- `prediction/deployment.py` + `configs/deployment.json` hold the
+  `DeploymentBundle` / pointer (PR E). `ModelRegistry` also persists
+  validated model groups under `models/groups/`. There is still no
+  `PredictionRuntime` serving path (PR F).
+- `configs/champion.json` remains the adaptive-learning rule export, not
+  the V3 deployment pointer.
 
 ## What the baseline tests lock
 

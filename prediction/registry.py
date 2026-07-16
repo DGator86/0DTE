@@ -337,6 +337,247 @@ class ModelRegistry:
                 out.append(meta)
         return out
 
+    # ------------------------------------------------------------------ #
+    # Model groups (post-#119 handoff §16.1 / PR E)                        #
+    # ------------------------------------------------------------------ #
+    def _groups_dir(self) -> str:
+        path = os.path.join(self.directory, "groups")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _group_meta_path(self, group_id: str) -> str:
+        return os.path.join(self._groups_dir(), f"{group_id}.json")
+
+    def save_group(
+        self,
+        *,
+        component_model_ids: dict,
+        feature_version: str,
+        label_version: str,
+        structural_state_version: str = "",
+        training_sessions: Optional[list] = None,
+        calibration_sessions: Optional[list] = None,
+        outer_test_sessions: Optional[list] = None,
+        metrics: Optional[dict] = None,
+        status: str = "research",
+        group_id: Optional[str] = None,
+    ) -> "ModelGroupMetadata":
+        """Persist a model-group metadata record. Validates components exist."""
+        if status not in STATUSES:
+            raise RegistryError(f"unknown status {status!r}")
+        comps = dict(component_model_ids or {})
+        if not comps:
+            raise RegistryError("model group requires at least one component")
+        for role, mid in comps.items():
+            if not mid:
+                raise RegistryError(f"empty component id for role {role!r}")
+            self.load_metadata(str(mid), validate_v2=False)
+        payload = {
+            "component_model_ids": comps,
+            "feature_version": feature_version,
+            "label_version": label_version,
+            "structural_state_version": structural_state_version or "",
+            "training_sessions": list(training_sessions or []),
+            "calibration_sessions": list(calibration_sessions or []),
+            "outer_test_sessions": list(outer_test_sessions or []),
+            "metrics": dict(metrics or {}),
+            "status": status,
+            "kind": "model_group",
+        }
+        payload["configuration_hash"] = _group_config_hash(payload)
+        gid = group_id or _config_hash({
+            "components": comps,
+            "feature_version": feature_version,
+            "label_version": label_version,
+        })[:24]
+        payload["group_id"] = gid
+        meta = ModelGroupMetadata.from_dict(payload)
+        self.validate_group(meta)
+        raw = json.dumps(meta.to_dict(), indent=2, sort_keys=True,
+                         default=str).encode("utf-8")
+        _atomic_write_bytes(self._group_meta_path(gid), lambda f: f.write(raw))
+        return meta
+
+    def load_group(self, group_id: str) -> "ModelGroupMetadata":
+        path = self._group_meta_path(group_id)
+        if not os.path.exists(path):
+            raise RegistryError(f"no model group {group_id!r}")
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RegistryError(
+                f"unreadable group {group_id!r}: {exc}") from exc
+        meta = ModelGroupMetadata.from_dict(data)
+        self.validate_group(meta)
+        return meta
+
+    def set_group_status(
+        self, group_id: str, status: str, note: str = "",
+    ) -> "ModelGroupMetadata":
+        if status not in STATUSES:
+            raise RegistryError(f"unknown status {status!r}")
+        meta = self.load_group(group_id)
+        d = meta.to_dict()
+        d["status"] = status
+        d.setdefault("status_history", []).append({
+            "status": status,
+            "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "note": note,
+        })
+        updated = ModelGroupMetadata.from_dict(d)
+        raw = json.dumps({**d, **updated.to_dict()}, indent=2, sort_keys=True,
+                         default=str).encode("utf-8")
+        _atomic_write_bytes(self._group_meta_path(group_id),
+                            lambda f: f.write(raw))
+        return updated
+
+    def validate_group(
+        self,
+        meta: "ModelGroupMetadata",
+        *,
+        load_mode: Optional[str] = None,
+    ) -> None:
+        """Fail closed when components conflict or are missing."""
+        if not meta.component_model_ids:
+            raise RegistryError(f"group {meta.group_id!r} has no components")
+        feature_versions: set = set()
+        label_versions: set = set()
+        for role, mid in meta.component_model_ids.items():
+            try:
+                m = self.load_metadata(str(mid), validate_v2=False)
+            except RegistryError as exc:
+                raise RegistryError(
+                    f"group {meta.group_id!r} missing component "
+                    f"{role!r}={mid!r}: {exc}") from exc
+            if m.get("feature_version"):
+                feature_versions.add(m["feature_version"])
+            if m.get("label_version"):
+                label_versions.add(m["label_version"])
+            if load_mode is not None:
+                assert_load_mode_allowed(m, load_mode)
+        if meta.feature_version and feature_versions:
+            bad = {fv for fv in feature_versions if fv != meta.feature_version}
+            if bad:
+                raise RegistryError(
+                    f"group {meta.group_id!r} feature_version conflict: "
+                    f"group={meta.feature_version!r} components={sorted(bad)}")
+        if len(feature_versions) > 1:
+            raise RegistryError(
+                f"group {meta.group_id!r} component feature versions conflict: "
+                f"{sorted(feature_versions)}")
+        if meta.label_version and label_versions:
+            bad = {lv for lv in label_versions if lv != meta.label_version}
+            if bad:
+                raise RegistryError(
+                    f"group {meta.group_id!r} label_version conflict: "
+                    f"group={meta.label_version!r} components={sorted(bad)}")
+        if len(label_versions) > 1:
+            raise RegistryError(
+                f"group {meta.group_id!r} component label versions conflict: "
+                f"{sorted(label_versions)}")
+        if load_mode is not None:
+            from prediction.deployment import (
+                DeploymentError, assert_mode_permission,
+            )
+            try:
+                assert_mode_permission(meta.status, load_mode)
+            except DeploymentError as exc:
+                raise RegistryError(str(exc)) from exc
+        expected = _group_config_hash(meta.to_dict())
+        if meta.configuration_hash and meta.configuration_hash != expected:
+            raise RegistryError(
+                f"group {meta.group_id!r} configuration_hash mismatch")
+
+    def list_groups(self, status: Optional[str] = None) -> list:
+        out = []
+        gdir = self._groups_dir()
+        for name in sorted(os.listdir(gdir)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                meta = self.load_group(name[:-5])
+            except RegistryError:
+                continue
+            if status is None or meta.status == status:
+                out.append(meta)
+        return out
+
+
+# --------------------------------------------------------------------------- #
+# Model groups                                                                #
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class ModelGroupMetadata:
+    group_id: str
+    component_model_ids: dict
+    feature_version: str
+    label_version: str
+    structural_state_version: str = ""
+    configuration_hash: str = ""
+    training_sessions: list = None  # type: ignore[assignment]
+    calibration_sessions: list = None  # type: ignore[assignment]
+    outer_test_sessions: list = None  # type: ignore[assignment]
+    metrics: dict = None  # type: ignore[assignment]
+    status: str = "research"
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "training_sessions", list(self.training_sessions or []))
+        object.__setattr__(
+            self, "calibration_sessions",
+            list(self.calibration_sessions or []))
+        object.__setattr__(
+            self, "outer_test_sessions",
+            list(self.outer_test_sessions or []))
+        object.__setattr__(self, "metrics", dict(self.metrics or {}))
+        object.__setattr__(
+            self, "component_model_ids", dict(self.component_model_ids or {}))
+
+    def to_dict(self) -> dict:
+        return {
+            "group_id": self.group_id,
+            "component_model_ids": dict(self.component_model_ids),
+            "feature_version": self.feature_version,
+            "label_version": self.label_version,
+            "structural_state_version": self.structural_state_version,
+            "configuration_hash": self.configuration_hash,
+            "training_sessions": list(self.training_sessions),
+            "calibration_sessions": list(self.calibration_sessions),
+            "outer_test_sessions": list(self.outer_test_sessions),
+            "metrics": dict(self.metrics),
+            "status": self.status,
+            "kind": "model_group",
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelGroupMetadata":
+        return cls(
+            group_id=str(d["group_id"]),
+            component_model_ids=dict(d.get("component_model_ids") or {}),
+            feature_version=str(d.get("feature_version") or ""),
+            label_version=str(d.get("label_version") or ""),
+            structural_state_version=str(
+                d.get("structural_state_version") or ""),
+            configuration_hash=str(d.get("configuration_hash") or ""),
+            training_sessions=list(d.get("training_sessions") or []),
+            calibration_sessions=list(d.get("calibration_sessions") or []),
+            outer_test_sessions=list(d.get("outer_test_sessions") or []),
+            metrics=dict(d.get("metrics") or {}),
+            status=str(d.get("status") or "research"),
+        )
+
+
+def _group_config_hash(meta: dict) -> str:
+    payload = {
+        "component_model_ids": meta.get("component_model_ids") or {},
+        "feature_version": meta.get("feature_version"),
+        "label_version": meta.get("label_version"),
+        "structural_state_version": meta.get("structural_state_version"),
+    }
+    return _config_hash(payload)
+
 
 # Part 3 mode permissions (§30.3)
 PART3_MODEL_TYPES = (
