@@ -6,9 +6,8 @@ The Grok mandate is not premium-selling-only. It may trade bullish, bearish,
 neutral, volatility-contraction, or volatility-expansion setups, provided the
 structure is options-only and has deterministically bounded maximum loss.
 
-This module adds iron butterflies and broken-wing butterflies to the original
-vertical-spread and iron-condor support. Existing bull put, bear call, iron
-condor, long call spread, and long put spread behavior remains available.
+This module adds simple long calls/puts, iron butterflies, and broken-wing
+butterflies to the original vertical-spread and iron-condor support.
 """
 
 from typing import Any
@@ -22,6 +21,8 @@ PUBLIC_FAMILIES = (
     "iron_condor",
     "iron_fly",
     "broken_wing",
+    "long_call",
+    "long_put",
     "long_call_spread",
     "long_put_spread",
 )
@@ -55,6 +56,10 @@ def _normalized_legs(raw: Any) -> tuple[Leg, ...]:
             raise ValueError("leg quantity must be one or two long/short units")
         legs.append(Leg(strike=float(row["strike"]), kind=kind, qty=qty))
     return tuple(legs)
+
+
+def _single_long_shape(kind: str, legs: tuple[Leg, ...]) -> bool:
+    return len(legs) == 1 and legs[0].kind == kind and legs[0].qty == 1
 
 
 def _vertical_shape(kind: str, legs: tuple[Leg, ...], *, credit: bool) -> bool:
@@ -100,6 +105,10 @@ def _family_shape(family: str, legs: tuple[Leg, ...]) -> bool:
         return _vertical_shape("P", legs, credit=True) or _broken_wing_shape(legs)
     if family == "call_credit":
         return _vertical_shape("C", legs, credit=True) or _broken_wing_shape(legs)
+    if family == "long_call":
+        return _single_long_shape("C", legs)
+    if family == "long_put":
+        return _single_long_shape("P", legs)
     if family == "long_call_spread":
         return _vertical_shape("C", legs, credit=False)
     if family == "long_put_spread":
@@ -158,6 +167,7 @@ def install_premium_structure_support() -> None:
             continue
         props = tool["parameters"]["properties"]
         props["family"]["enum"] = list(PUBLIC_FAMILIES)
+        props["legs"]["minItems"] = 1
         props["legs"]["items"]["properties"]["quantity"] = {
             "type": "integer",
             "enum": [1, 2],
@@ -169,7 +179,8 @@ def install_premium_structure_support() -> None:
 
 Trading mandate:
 - Seek opportunity in bullish, bearish, neutral, volatility-expansion, and volatility-contraction regimes.
-- The five requested premium structures are available: bull put credit spread, bear call credit spread, iron condor, iron butterfly, and broken-wing butterfly.
-- Bullish and bearish debit spreads are also available.
+- Simple directional long calls and long puts are explicitly permitted.
+- Bullish and bearish debit spreads are permitted.
+- The requested premium structures are permitted: bull put credit spread, bear call credit spread, iron condor, iron butterfly, and broken-wing butterfly.
 - The controlling rules are options-only construction, no stock ownership requirement, and deterministically bounded maximum loss. Never propose covered-stock, naked-unlimited-risk, or undefined-risk exposure.
 """
