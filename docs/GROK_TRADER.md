@@ -23,15 +23,28 @@ Large inputs are not copied into every prompt. Grok receives a terminal summary
 and can page through raw rows or request a chain slice with local function calls.
 No hosted web or X-search tool is enabled.
 
-## Authority
+## Trading mandate
 
-Grok may propose these same-day, defined-risk families:
+The strategy is not restricted by bullish, bearish, neutral, volatility-
+expansion, or volatility-contraction regime. A structure is eligible when:
 
-- put credit spread;
-- call credit spread;
+1. every leg is an option and no stock ownership is required; and
+2. the deterministic payoff calculation proves a finite maximum loss.
+
+The currently implemented same-day structures are:
+
+- outright long call;
+- outright long put;
+- long call debit spread;
+- long put debit spread;
+- bull put credit spread;
+- bear call credit spread;
 - iron condor;
-- long call spread;
-- long put spread.
+- iron butterfly;
+- broken-wing butterfly.
+
+Covered calls, covered puts, stock-plus-option combinations, naked short
+options, and any structure whose maximum loss cannot be bounded are rejected.
 
 The deterministic firewall independently checks the symbol, expiration, entry
 window, chain availability, quote age when available, leg pattern, current
