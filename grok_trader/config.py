@@ -54,15 +54,17 @@ class GrokConfig:
     output_price_per_million: float = 6.0
 
     allowed_symbols: tuple[str, ...] = ("SPY", "XSP")
-    # These are the currently implemented options-only structures. The five
-    # premium structures requested by the user are included, but they are not
-    # an exclusive market-regime mandate: bullish/bearish debit spreads remain.
+    # Implemented options-only structures. The controlling eligibility rules
+    # are bounded maximum loss and no stock-ownership requirement—not a market
+    # direction or premium-selling restriction.
     allowed_families: tuple[str, ...] = (
         "put_credit",
         "call_credit",
         "iron_condor",
         "iron_fly",
         "broken_wing",
+        "long_call",
+        "long_put",
         "long_call_spread",
         "long_put_spread",
     )
@@ -90,7 +92,8 @@ class GrokConfig:
             s.strip().lower()
             for s in os.getenv(
                 "GROK_ALLOWED_FAMILIES",
-                "put_credit,call_credit,iron_condor,iron_fly,broken_wing,long_call_spread,long_put_spread",
+                "put_credit,call_credit,iron_condor,iron_fly,broken_wing,"
+                "long_call,long_put,long_call_spread,long_put_spread",
             ).split(",")
             if s.strip()
         )
