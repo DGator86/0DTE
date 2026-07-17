@@ -21,3 +21,6 @@ joblib
 # v10+ OAuth2), so an unpinned bump could silently break the live feed. The
 # adapter is verified against this range; widen deliberately, not by accident.
 tastytrade>=12.4,<13
+# xAI exposes a Responses-API-compatible endpoint. Imported lazily and used only
+# when GROK_ENABLED=1, so the deterministic framework remains usable without a key.
+openai>=1.68,<3
