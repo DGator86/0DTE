@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from dashboard.auth import AuthMiddleware, ReadOnlyMiddleware, get_dashboard_token
 from dashboard.queries import (
     candidate_configs,
+    enrich_paper_summary_with_live,
     feature_scores,
     fetch_prediction_for_snapshot,
     fetch_sigma_cone_journal,
@@ -37,7 +38,7 @@ from dashboard.queries import (
     validation_report_by_id,
     validation_reports,
 )
-from dashboard.state import read_live_state
+from dashboard.state import heartbeat_state, read_live_state
 from market_calendar import market_status
 
 ET = ZoneInfo("America/New_York")
@@ -84,11 +85,14 @@ async def api_live():
     path = _config.get("live_state", "live_state.json")
     data = read_live_state(path)
     if data is None:
-        return {
-            "ts": None,
-            "note": "No live tick yet — pipeline idle or waiting for market open",
-            "market": market_status(),
-        }
+        # Always return a valid live.v1 envelope so the SPA does not keep
+        # rendering stale panels after a missing/rotated state file.
+        return heartbeat_state(
+            dt.datetime.now(ET),
+            status="no_live_state",
+            note="No live tick yet — pipeline idle or waiting for market open",
+            market_status=market_status(),
+        )
     return data
 
 
@@ -118,7 +122,10 @@ async def api_tick_row(row_id: int):
 
 @app.get("/api/paper")
 async def api_paper():
-    return paper_summary(_config.get("paper_db", "paper.sqlite"))
+    summary = paper_summary(_config.get("paper_db", "paper.sqlite"))
+    live = read_live_state(_config.get("live_state", "live_state.json"))
+    live_paper = (live or {}).get("paper") if isinstance(live, dict) else None
+    return enrich_paper_summary_with_live(summary, live_paper)
 
 
 @app.get("/api/trades")
