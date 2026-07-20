@@ -204,6 +204,11 @@ class ShadowRunner:
         self._recorder = ChainRecorder(record_dir) if record_dir else None
         self._notifier = Notifier()
         self._settled: set[str] = set()
+        # Settlement is a required feed source for overall LIVE. Cache the last
+        # successful observation so we can report an honest age without hitting
+        # the provider on every tick.
+        self._settlement_obs_at: Optional[dt.datetime] = None
+        self._settlement_obs_date: Optional[str] = None
 
         # In-house paper trading: auto-executes TRADE tickets on SIMULATED fills
         # over the live chain, with stop-loss / target / trailing / EOD / RAS
@@ -356,6 +361,43 @@ class ShadowRunner:
         except Exception as exc:
             log.warning("heartbeat write error: %s", exc)
 
+    def _refresh_settlement_obs(self, now: dt.datetime) -> None:
+        """Observe settlement at most once per session date."""
+        session_date = now.astimezone(ET).date().isoformat()
+        if self._settlement_obs_date == session_date:
+            return
+        px = None
+        try:
+            px = self._feed.settlement_price(session_date)
+        except Exception:
+            px = None
+        if px is None:
+            prior = (now.astimezone(ET).date() - dt.timedelta(days=1)).isoformat()
+            try:
+                px = self._feed.settlement_price(prior)
+            except Exception:
+                px = None
+        if px is not None:
+            self._settlement_obs_date = session_date
+            self._settlement_obs_at = now
+
+    def _feed_ages_seconds(self, now: dt.datetime, result) -> dict[str, float]:
+        """Per-source ages for live.v1 feed badges on a successful tick.
+
+        A truthy provider name alone must not claim overall LIVE (age unknown
+        ⇒ DELAYED). Successful snapshots report age 0 for the sources that
+        just produced data; settlement uses the cached observation age.
+        """
+        ages: dict[str, float] = {"spot": 0.0, "bars": 0.0}
+        snap = getattr(result, "snapshot", None)
+        if snap is not None and getattr(snap, "chain", None) is not None:
+            ages["option_chain"] = 0.0
+        self._refresh_settlement_obs(now)
+        if self._settlement_obs_at is not None:
+            ages["settlement"] = max(
+                0.0, (now - self._settlement_obs_at).total_seconds())
+        return ages
+
     def _tick(self, now: dt.datetime) -> None:
         position_contexts = []
         for pos in self._paper.open_positions:
@@ -423,6 +465,7 @@ class ShadowRunner:
                     feed_source=getattr(self._feed, "last_source", None),
                     paper_summary=self._paper.report(now),
                     market_status=market_status(now),
+                    feed_ages_seconds=self._feed_ages_seconds(now, result),
                 ),
             )
         except Exception as exc:

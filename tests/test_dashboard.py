@@ -359,3 +359,75 @@ def test_api_gex_variants_and_predictions(monkeypatch, tmp_path):
     r = c.get("/api/predictions?snapshot_id=snap-2", headers=hdrs)
     assert r.status_code == 200
     assert r.json()["prediction"] is None
+
+
+def test_api_live_missing_file_returns_live_v1_heartbeat(monkeypatch, tmp_path):
+    """Absent live_state.json must still be a valid live.v1 envelope."""
+    monkeypatch.setenv("DASHBOARD_TOKEN", "test-secret-token")
+    live = str(tmp_path / "missing_live_state.json")
+    _configure(str(tmp_path / "shadow.db"), str(tmp_path / "paper.sqlite"), live)
+    c = TestClient(app)
+    r = c.get("/api/live", headers={"Authorization": "Bearer test-secret-token"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["schema_version"] == "live.v1"
+    assert body["system"]["status"] == "no_live_state"
+    assert "feeds" in body and "overall_status" in body["feeds"]
+    assert body["feeds"]["overall_status"] != "LIVE"
+
+
+def test_api_paper_merges_live_open_positions(monkeypatch, tmp_path):
+    """Closed-SQL paper summary must surface live open holdings/counts."""
+    from dashboard.queries import enrich_paper_summary_with_live, paper_summary
+    from paper_broker import PaperBroker, PaperConfig
+
+    monkeypatch.setenv("DASHBOARD_TOKEN", "test-secret-token")
+    paper_db = str(tmp_path / "paper.sqlite")
+    # Ensure the paper_trades table exists (empty closed book).
+    PaperBroker(db_path=paper_db, cfg=PaperConfig(starting_cash=10_000))
+
+    live = str(tmp_path / "live_state.json")
+    live_paper = {
+        "trades": 0,
+        "equity": 10_000.0,
+        "open_positions": 1,
+        "open": [{
+            "id": "pos1", "family": "PCS", "contracts": 2,
+            "unrealized_pnl_dollars": -52.34, "strikes": "590/585",
+        }],
+        "by_track": {
+            "legacy": {"trades": 0, "total_pnl": 0.0, "open_positions": 1,
+                       "equity": 9947.66, "win_rate": 0.0},
+            "v2": {"trades": 0, "total_pnl": 0.0, "open_positions": 0,
+                   "equity": 10000.0, "win_rate": 0.0},
+            "v3": {"trades": 0, "total_pnl": 0.0, "open_positions": 0,
+                   "equity": 10000.0, "win_rate": 0.0},
+        },
+    }
+    write_live_state(live, serialize_tick_result(
+        _tick_result(),
+        feed_source="Tradier",
+        paper_summary=live_paper,
+        market_status={"is_open": True},
+        feed_ages_seconds={
+            "spot": 0.5, "bars": 4.0, "option_chain": 1.0, "settlement": 20.0,
+        },
+    ))
+    _configure(str(tmp_path / "shadow.db"), paper_db, live)
+
+    closed_only = paper_summary(paper_db)
+    assert closed_only.get("open_positions", 0) == 0
+
+    merged = enrich_paper_summary_with_live(closed_only, live_paper)
+    assert merged["open_positions"] == 1
+    assert merged["open"][0]["id"] == "pos1"
+    assert merged["by_track"]["legacy"]["open_positions"] == 1
+
+    c = TestClient(app)
+    r = c.get("/api/paper", headers={"Authorization": "Bearer test-secret-token"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["open_positions"] == 1
+    assert body["open"][0]["unrealized_pnl_dollars"] == -52.34
+    assert body["by_track"]["legacy"]["open_positions"] == 1
+    assert body["source"] == "closed_sql+live_open"

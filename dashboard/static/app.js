@@ -195,6 +195,66 @@
     if ($("v3-decision-sub")) $("v3-decision-sub").textContent = sub;
     if ($("meta-feeds")) $("meta-feeds").textContent = "—";
     if ($("meta-feeds-detail")) $("meta-feeds-detail").innerHTML = "";
+    // Clear stateful panels so a missing/invalid live.v1 cannot leave yesterday's
+    // open positions, playbook, or chart looking current.
+    if ($("open-positions-panel")) $("open-positions-panel").classList.add("hidden");
+    if ($("open-positions-list")) $("open-positions-list").innerHTML = "";
+    if ($("v2-open-positions")) {
+      $("v2-open-positions").innerHTML = '<p class="empty">No open positions</p>';
+    }
+    if ($("v2-open-count")) $("v2-open-count").textContent = "—";
+    if ($("playbook-metrics")) {
+      $("playbook-metrics").innerHTML = '<p class="empty">No live.v1 payload</p>';
+    }
+    if ($("playbook-fam")) $("playbook-fam").textContent = "—";
+    if ($("playbook-diag")) $("playbook-diag").hidden = true;
+    if ($("edge-metrics")) {
+      $("edge-metrics").innerHTML = '<p class="empty">No live.v1 payload</p>';
+    }
+    if ($("paper-metrics")) {
+      $("paper-metrics").innerHTML =
+        '<div class="metric"><span class="k">status</span><span class="v sm">unavailable</span></div>';
+    }
+    lastChartData = null;
+  }
+
+  function fmtOpenPnl(pnl) {
+    const n = num(pnl);
+    if (n == null) return "—";
+    return (n >= 0 ? "+" : "") + money(n, 2);
+  }
+
+  function tickMatchesLive(tick, live) {
+    if (!tick || !live) return false;
+    const sid = live.snapshot && live.snapshot.snapshot_id;
+    if (sid && tick.snapshot_id) return String(tick.snapshot_id) === String(sid);
+    const lts = liveTs(live);
+    if (!lts || !tick.ts) return false;
+    const a = String(tick.ts);
+    const b = String(lts);
+    return a === b || a.slice(0, 19) === b.slice(0, 19);
+  }
+
+  function selectPlaybookCandidate(ticks, live) {
+    const list = ticks || [];
+    const latest = list.length ? list[list.length - 1] : null;
+    if (latest && latest.selected_family && tickMatchesLive(latest, live)) {
+      return { candidate: latest, stale: false };
+    }
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].selected_family && tickMatchesLive(list[i], live)) {
+        return { candidate: list[i], stale: false };
+      }
+    }
+    if (latest && latest.selected_family) {
+      return { candidate: latest, stale: !tickMatchesLive(latest, live) };
+    }
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].selected_family) {
+        return { candidate: list[i], stale: true };
+      }
+    }
+    return { candidate: latest, stale: false };
   }
 
   /* ---------------- top bar ---------------- */
@@ -341,7 +401,7 @@
   }
 
   /* ---------------- playbook (latest journaled tick) ---------------- */
-  function renderPlaybook(latest, live) {
+  function renderPlaybook(latest, live, stale) {
     const t = latest || {};
     const inp = liveInputs(live);
     const s = tickSignals(t) || {};
@@ -350,9 +410,15 @@
     // The candidate journaled on a NO_TRADE tick is the measurement loop's
     // would-be pick (kept so settlement can score its hypothetical P&L).
     // It can be a degenerate penny structure — flag it so it never reads
-    // as a trade recommendation.
-    const isDiagnostic = !!t.selected_family && t.decision !== "TRADE" && !num(t.was_traded);
-    $("playbook-diag").hidden = !isDiagnostic;
+    // as a trade recommendation. Stale fallbacks (older tick than live) get
+    // the same badge so they are never mistaken for the current signal.
+    const isDiagnostic = !!stale
+      || (!!t.selected_family && t.decision !== "TRADE" && !num(t.was_traded));
+    const diag = $("playbook-diag");
+    diag.hidden = !isDiagnostic;
+    diag.textContent = stale
+      ? ("last candidate · " + etTime(t.ts) + " ET")
+      : "would-be · not a signal";
 
     const evCls = num(t.ev) > 0 ? "pos" : num(t.ev) < 0 ? "neg" : "";
     const liveEv = num(s.phys_live_ev) != null ? num(s.phys_live_ev) : num(t.ev);
@@ -670,7 +736,7 @@
             <div class="op-strikes">${esc(p.strikes)}</div>
             <div class="op-family">${esc(p.family)} · x${esc(p.contracts)} · ${trackBadge(ctx)}</div>
           </div>
-          <div class="op-pnl ${pnlCls}">${pnl >= 0 ? "+" : ""}${money(pnl, 2)}</div>
+          <div class="op-pnl ${pnlCls}">${fmtOpenPnl(pnl)}</div>
         </div>
         <div class="op-metrics">
           <div><span class="k">Entry credit</span><span class="v">${fmt(p.entry_credit, 2)}</span></div>
@@ -949,13 +1015,30 @@
   function forecastFromSignals(tick, live) {
     const s = mergeV2Signals(tick, live);
     const liveFc = (live && live.forecast) || {};
-    const p = { ...liveFc };
+    // Only metric keys — never copy forecast metadata (source_type, summary,
+    // v2_signals, …) or an empty section looks "populated" with all dashes.
+    const p = {};
+    const summary = (liveFc.summary && typeof liveFc.summary === "object")
+      ? liveFc.summary : {};
+    Object.assign(p, summary);
+    const METRIC_KEYS = [
+      "p_up_30m", "p_up_close", "q05_30m", "q50_30m", "q95_30m",
+      "q05_close", "q50_close", "q95_close", "sigma_30m", "sigma_close",
+      "uncertainty", "rv_forecast",
+    ];
+    METRIC_KEYS.forEach((k) => {
+      if (p[k] == null && liveFc[k] != null) p[k] = liveFc[k];
+    });
     for (const [k, v] of Object.entries(s)) {
       if (k.startsWith("v2_fc_") && k !== "v2_fc_mode" && k !== "v2_fc_model_version") {
         p[k.slice(6)] = v;
       }
     }
     if (!Object.keys(p).length) return null;
+    if (liveFc.source_type === "unavailable" && !Object.keys(summary).length
+        && !METRIC_KEYS.some((k) => p[k] != null)) {
+      return null;
+    }
     return {
       mode: s.v2_fc_mode || liveFc.mode || "signals",
       model_group_version: s.v2_fc_model_version || liveFc.model_version || "",
@@ -1148,12 +1231,14 @@
     const inp = liveInputs(live);
     const spot = num(inp.spot);
     const zg = num(inp.zero_gamma_dist_pct);
-    const gexPos = num(inp.net_gex) >= 0;
+    const gexN = num(inp.net_gex);
     const rsi = num(inp.rsi);
     const rsiCls = rsi == null ? "" : rsi > 70 ? "neg" : rsi < 30 ? "pos" : "";
     const adx = num(inp.adx);
+    const cvd = num(inp.cvd_slope);
     const cards = [
-      metricCard("Net GEX", compact(inp.net_gex), gexPos ? "info" : "warn"),
+      metricCard("Net GEX", compact(inp.net_gex),
+        gexN == null ? "" : (gexN >= 0 ? "info" : "warn")),
       metricCard("GEX rank", inp.gex_pct_rank != null ? (num(inp.gex_pct_rank) * (num(inp.gex_pct_rank) <= 1 ? 100 : 1)).toFixed(0) + "%ile" : "—"),
       metricCard("Gamma flip", fmt(inp.gamma_flip, 2)),
       metricCard("Zero-γ dist", zg != null ? (zg * 100).toFixed(2) + "%" : "—", zg != null && Math.abs(zg) < 0.002 ? "warn" : ""),
@@ -1164,7 +1249,8 @@
       metricCard("ADX", fmt(adx, 1), adx != null && adx > 25 ? "warn" : ""),
       metricCard("RSI", fmt(rsi, 1), rsiCls),
       metricCard("BB width", fmt(inp.bb_width, 3)),
-      metricCard("CVD slope", fmt(inp.cvd_slope, 3), num(inp.cvd_slope) >= 0 ? "pos" : "neg"),
+      metricCard("CVD slope", fmt(inp.cvd_slope, 3),
+        cvd == null ? "" : (cvd >= 0 ? "pos" : "neg")),
     ];
     $("tech-metrics").innerHTML = cards.join("");
   }
@@ -1252,7 +1338,7 @@
             <div class="op-strikes">${esc(p.strikes)}</div>
             <div class="op-family">${esc(p.family)} · x${esc(p.contracts)}</div>
           </div>
-          <div class="op-pnl ${pnlCls}">${pnl >= 0 ? "+" : ""}${money(pnl, 2)}</div>
+          <div class="op-pnl ${pnlCls}">${fmtOpenPnl(pnl)}</div>
         </div>
         <div class="op-metrics">
           <div><span class="k">Entry credit</span><span class="v">${fmt(p.entry_credit, 2)}</span></div>
@@ -1299,12 +1385,14 @@
   function renderEdge(report) {
     const eff = (report && report.gate_effectiveness) || {};
     const taken = eff.trades_taken || {}, blocked = eff.blocked_by_gate || {};
+    // gate_effectiveness means are per-share option payoffs, not account $.
+    const meanSh = (m) => (num(m) == null ? "—" : (fmt(m, 4) + "/sh"));
     $("edge-metrics").innerHTML = [
       metricCard("Gate verdict", esc(eff.verdict || "insufficient data"),
         eff.verdict && /work|good|effective/i.test(eff.verdict) ? "pos" : ""),
-      metricCard("Trades taken", taken.n != null ? `${taken.n} · μ ${money(taken.mean, 0)}` : "—",
+      metricCard("Trades taken", taken.n != null ? `${taken.n} · μ ${meanSh(taken.mean)}` : "—",
         num(taken.mean) > 0 ? "pos" : ""),
-      metricCard("Blocked by gate", blocked.n != null ? `${blocked.n} · μ ${money(blocked.mean, 0)}` : "—",
+      metricCard("Blocked by gate", blocked.n != null ? `${blocked.n} · μ ${meanSh(blocked.mean)}` : "—",
         num(blocked.mean) < 0 ? "pos" : ""),
     ].join("");
   }
@@ -1494,21 +1582,32 @@
   function mergeV2Signals(tick, live) {
     const fromLive = liveV2Signals(live);
     const fromTick = tickSignals(tick) || {};
-    return { ...fromLive, ...fromTick };
+    // Live snapshot wins over journal history so a stand-down tick cannot keep
+    // showing an older V3 TRADE verdict from a prior observation.
+    return { ...fromTick, ...fromLive };
   }
 
-  function lastTickWithV2(ticks) {
-    for (let i = ticks.length - 1; i >= 0; i--) {
-      const s = tickSignals(ticks[i]);
-      if (!s) continue;
-      if (s.phys_v2_mean != null || s.v2_fc_p_up_30m != null
-          || s.v2_top_candidate_id != null || s.v2_rank_disagreement != null
-          || s.phys_density_mode != null || s.policy_mode != null
-          || s.v2_policy_structure != null || s.pin_active != null) {
-        return ticks[i];
+  function tickHasV2Signals(t) {
+    const s = tickSignals(t);
+    if (!s) return false;
+    return s.phys_v2_mean != null || s.v2_fc_p_up_30m != null
+      || s.v2_top_candidate_id != null || s.v2_rank_disagreement != null
+      || s.phys_density_mode != null || s.policy_mode != null
+      || s.v2_policy_structure != null || s.pin_active != null;
+  }
+
+  function lastTickWithV2(ticks, live) {
+    const list = ticks || [];
+    // Prefer the journal row that matches the current live snapshot.
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (tickMatchesLive(list[i], live) && tickHasV2Signals(list[i])) {
+        return list[i];
       }
     }
-    return ticks.length ? ticks[ticks.length - 1] : null;
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (tickHasV2Signals(list[i])) return list[i];
+    }
+    return list.length ? list[list.length - 1] : null;
   }
 
   // Direction bias in [-1, +1] (+1 bull). Prefers the continuous matrix bias
@@ -2972,23 +3071,20 @@
       }
       const ticks = history.ticks || [];
       const latest = ticks.length ? ticks[ticks.length - 1] : null;
-      // Playbook should show the live candidate: prefer the newest tick, but if it
-      // carries no structure, fall back to the most recent tick that proposed one.
-      let candidate = latest;
-      if (!candidate || !candidate.selected_family) {
-        for (let i = ticks.length - 1; i >= 0; i--) {
-          if (ticks[i].selected_family) { candidate = ticks[i]; break; }
-        }
-      }
+      // Playbook must match the live snapshot when possible; older structures
+      // are labeled stale so NO TRADE + yesterday's strikes never look live.
+      const pb = selectPlaybookCandidate(ticks, live);
+      const candidate = pb.candidate;
+      const candidateStale = !!pb.stale;
 
       renderMarketPill(market);
       renderTopbar(live, market, ticks);
       renderSignal(live);
       renderOpenPositions(live.paper);
-      renderPlaybook(candidate, live);
+      renderPlaybook(candidate, live, candidateStale);
       renderParallel(live, latest);
       renderPolicy(latest);
-      const v2Tick = lastTickWithV2(ticks) || latest;
+      const v2Tick = lastTickWithV2(ticks, live) || latest;
       renderV2Signal(live, v2Tick);
       renderPin(v2Tick, live);
       renderV2Why(live, v2Tick);
@@ -3005,9 +3101,8 @@
       renderTech(live);
       renderGexVariants(latest, report);
       renderDynamics(latest);
-      // Before any trade has closed, /api/paper's equity is null (it's derived
-      // from the last CLOSED trade's balance in SQL); the live broker snapshot
-      // embedded in /api/live already has the correct starting/current equity.
+      // /api/paper now merges live open positions; keep equity backfill for
+      // older servers that only return closed-SQL stats.
       if (paper.equity == null && live.paper && live.paper.equity != null) {
         paper = { ...paper, equity: live.paper.equity };
       }

@@ -51,13 +51,18 @@ def test_appjs_schema_gate_and_section_accessors():
         "requireLiveV1", "showLiveUnavailable", "liveTs", "liveStatus",
         "liveNote", "liveDoing", "liveWhy", "liveInputs", "liveParallel",
         "liveV2Signals", "livePart3", "liveSigmaCones", "liveFeedDown",
-        "liveIdle", "feedStatusCls",
+        "liveIdle", "feedStatusCls", "tickMatchesLive",
+        "selectPlaybookCandidate", "fmtOpenPnl",
     ):
         assert f"function {name}(" in js, name
     assert "LIVE_SCHEMA_VERSION" in js
     assert 'schema_version !== LIVE_SCHEMA_VERSION' in js
     assert "live = requireLiveV1(live)" in js
     assert len(re.findall(r"setInterval\(refresh\b", js)) == 1
+    # Live V2 signals must win over journal history (spread order).
+    assert "return { ...fromTick, ...fromLive };" in js
+    # Missing live.v1 must clear open-position panels, not leave stale cards.
+    assert '$("open-positions-panel").classList.add("hidden")' in js
 
 
 def test_appjs_feed_badge_from_feeds_not_truthy_chain():
@@ -114,3 +119,15 @@ def test_v1_panels_still_use_legacy_section():
     assert "liveWhy(live)" in js
     assert "function renderWhy(live)" in js
     assert "function renderRegime(live)" in js
+
+
+def test_appjs_edge_means_are_per_share_not_rounded_dollars():
+    js = _js()
+    assert 'fmt(m, 4) + "/sh"' in js or 'fmt(m, 4) + "/sh"' in js.replace(" ", "")
+    assert "μ ${money(taken.mean, 0)}" not in js
+
+
+def test_html_labels_entry_vs_paper_position():
+    html = _html()
+    assert "Entry signal" in html
+    assert "Paper position" in html

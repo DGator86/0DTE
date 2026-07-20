@@ -537,9 +537,48 @@ def paper_summary(paper_db_path: str) -> dict:
         "max_drawdown_pct": round(max_dd_frac, 4),
         "by_exit_reason": by_reason,
         "by_track": by_track,
+        "open_positions": 0,
+        "open": [],
         "recent_trades": [dict(r) for r in rows],
         "simulated": True,
+        "source": "closed_sql",
     }
+
+
+def enrich_paper_summary_with_live(summary: dict, live_paper: Optional[dict]) -> dict:
+    """Merge closed-trade SQL stats with the live broker open-position snapshot.
+
+    `/api/paper` historically only saw closed rows, so n/open counters stayed 0
+    while `live.paper.open` showed active holdings. Overlay open counts/equity
+    from the in-memory broker report embedded in live_state when present.
+    """
+    if not summary or not isinstance(live_paper, dict) or not live_paper:
+        return summary
+    out = dict(summary)
+    if live_paper.get("open") is not None:
+        open_list = list(live_paper.get("open") or [])
+        out["open"] = open_list
+        out["open_positions"] = int(
+            live_paper.get("open_positions", len(open_list)) or len(open_list))
+    if out.get("equity") is None and live_paper.get("equity") is not None:
+        out["equity"] = live_paper["equity"]
+    live_bt = live_paper.get("by_track") or {}
+    if isinstance(live_bt, dict) and live_bt:
+        merged_bt = {k: dict(v) for k, v in (out.get("by_track") or {}).items()}
+        for track, bt in live_bt.items():
+            if not isinstance(bt, dict):
+                continue
+            cur = dict(merged_bt.get(track) or {
+                "trades": 0, "total_pnl": 0.0, "win_rate": 0.0, "open_positions": 0,
+            })
+            if "open_positions" in bt:
+                cur["open_positions"] = int(bt.get("open_positions") or 0)
+            if cur.get("equity") is None and bt.get("equity") is not None:
+                cur["equity"] = bt["equity"]
+            merged_bt[str(track)] = cur
+        out["by_track"] = merged_bt
+    out["source"] = "closed_sql+live_open"
+    return out
 
 
 # --------------------------------------------------------------------------- #
