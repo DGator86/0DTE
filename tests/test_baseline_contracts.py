@@ -198,6 +198,7 @@ def test_dashboard_route_inventory():
         "/api/ticks",
         "/api/ticks/{row_id}",
         "/api/paper",
+        "/api/competition",
         "/api/trades",
         "/api/ras",
         "/api/report",
@@ -233,6 +234,7 @@ def test_appjs_render_and_refresh_inventory():
     assert found == {
         "refresh", "refreshJournal", "refreshLearning", "refreshPrediction",
         "refreshValidation",
+        "renderCompetition",
         "renderConeCoverage", "renderConeJournal", "renderDynamics",
         "renderEdge", "renderFeatureImpactDetail", "renderForecast",
         "renderFunnel", "renderGexVariants", "renderJournal",

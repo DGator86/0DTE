@@ -582,6 +582,65 @@ def enrich_paper_summary_with_live(summary: dict, live_paper: Optional[dict]) ->
 
 
 # --------------------------------------------------------------------------- #
+# 0DTE vs SPY-DER head-to-head — the deterministic system against the AI.      #
+# --------------------------------------------------------------------------- #
+# The two competitors on the dashboard. "0DTE" is the deterministic system
+# (its legacy / v2 / v3 paper tracks aggregated); "SPY-DER" is the external AI
+# service's own track. They are compared on return-on-capital so the different
+# number of tracks (and thus starting capital) does not tilt the scoreboard.
+ZERODTE_TRACKS: tuple[str, ...] = ("legacy", "v2", "v3")
+SPYDER_TRACKS: tuple[str, ...] = ("spy_der",)
+
+
+def competition_view(summary: Optional[dict], starting_cash: float = 1000.0) -> dict:
+    """Head-to-head 0DTE-vs-SPY-DER scoreboard built from a paper summary's
+    ``by_track`` block. Pure/read-only — safe on partial data."""
+    by = (summary or {}).get("by_track") or {}
+
+    def _side(name: str, tracks: tuple[str, ...]) -> dict:
+        trades = open_pos = 0
+        pnl = wins_weighted = equity = 0.0
+        for t in tracks:
+            bt = by.get(t) or {}
+            n = int(bt.get("trades") or 0)
+            tp = float(bt.get("total_pnl") or 0.0)
+            trades += n
+            pnl += tp
+            wins_weighted += float(bt.get("win_rate") or 0.0) * n
+            open_pos += int(bt.get("open_positions") or 0)
+            eq = bt.get("equity")
+            equity += float(eq) if eq is not None else (starting_cash + tp)
+        start = starting_cash * len(tracks)
+        return {
+            "name": name,
+            "tracks": list(tracks),
+            "starting_capital": round(start, 2),
+            "equity": round(equity, 2),
+            "total_pnl": round(pnl, 2),
+            "return_pct": round(pnl / start, 4) if start else 0.0,
+            "win_rate": round(wins_weighted / trades, 4) if trades else 0.0,
+            "trades": trades,
+            "open_positions": open_pos,
+        }
+
+    zerodte = _side("0DTE", ZERODTE_TRACKS)
+    spyder = _side("SPY-DER", SPYDER_TRACKS)
+    if zerodte["return_pct"] == spyder["return_pct"]:
+        leader, margin = "tie", 0.0
+    elif zerodte["return_pct"] > spyder["return_pct"]:
+        leader, margin = "0DTE", zerodte["return_pct"] - spyder["return_pct"]
+    else:
+        leader, margin = "SPY-DER", spyder["return_pct"] - zerodte["return_pct"]
+    return {
+        "metric": "return_pct",
+        "leader": leader,
+        "margin_pct": round(margin, 4),
+        "zerodte": zerodte,
+        "spyder": spyder,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Live-readiness checklist -- objective, numbers-based criteria for whether   #
 # the paper/shadow track record has earned the right to touch real capital.  #
 # Every threshold below is a starting policy, not a guarantee; tune to taste. #

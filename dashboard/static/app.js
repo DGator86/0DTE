@@ -1418,6 +1418,76 @@
     return e ? `${e[0]} (${e[1]})` : "—";
   }
 
+  /* ---------------- 0DTE vs SPY-DER competition ---------------- */
+  // Mirrors dashboard.queries.competition_view: the deterministic system
+  // (legacy+v2+v3) against the AI (spy_der), scored on return-on-capital.
+  const COMP_ZERODTE_TRACKS = ["legacy", "v2", "v3"];
+  const COMP_SPYDER_TRACKS = ["spy_der"];
+  const COMP_START_CASH = 1000;
+
+  function competitionSide(name, by, tracks) {
+    let trades = 0, openPos = 0, pnl = 0, winsW = 0, equity = 0;
+    tracks.forEach((t) => {
+      const bt = by[t] || {};
+      const n = num(bt.trades) || 0;
+      const tp = num(bt.total_pnl) || 0;
+      trades += n; pnl += tp;
+      winsW += (num(bt.win_rate) || 0) * n;
+      openPos += num(bt.open_positions) || 0;
+      equity += bt.equity != null ? num(bt.equity) : (COMP_START_CASH + tp);
+    });
+    const start = COMP_START_CASH * tracks.length;
+    return {
+      name, start, equity, pnl, trades, openPos,
+      returnPct: start ? pnl / start : 0,
+      winRate: trades ? winsW / trades : 0,
+    };
+  }
+
+  function renderCompetition(paper) {
+    const el = $("competition-board");
+    if (!el) return;
+    const by = (paper && paper.by_track) || {};
+    const z = competitionSide("0DTE", by, COMP_ZERODTE_TRACKS);
+    const s = competitionSide("SPY-DER", by, COMP_SPYDER_TRACKS);
+    let leader = "tie";
+    if (z.returnPct > s.returnPct) leader = "0DTE";
+    else if (s.returnPct > z.returnPct) leader = "SPY-DER";
+    const winnerEl = $("competition-leader");
+    if (winnerEl) {
+      if (leader === "tie") {
+        winnerEl.textContent = "dead heat";
+        winnerEl.className = "h2-right";
+      } else {
+        const margin = Math.abs(z.returnPct - s.returnPct);
+        winnerEl.textContent = `${leader} leads +${pct(margin)}`;
+        winnerEl.className = "h2-right " + (leader === "SPY-DER" ? "spyder" : "info");
+      }
+    }
+    el.innerHTML = [competitorCard(z, leader === "0DTE", "0dte"),
+                    competitorCard(s, leader === "SPY-DER", "spyder")].join("");
+  }
+
+  function competitorCard(side, isLeader, cls) {
+    const retCls = side.returnPct > 0 ? "pos" : side.returnPct < 0 ? "neg" : "";
+    return `
+      <div class="compet-card compet-${cls}${isLeader ? " compet-lead" : ""}">
+        <div class="compet-head">
+          <span class="compet-name">${esc(side.name)}</span>
+          ${isLeader ? '<span class="compet-crown">▲ leading</span>' : ""}
+        </div>
+        <div class="compet-return ${retCls}">${pct(side.returnPct)}</div>
+        <div class="compet-grid">
+          <div><span class="k">Equity</span><span class="v">${money(side.equity, 0)}</span></div>
+          <div><span class="k">P&amp;L</span><span class="v ${retCls}">${money(side.pnl, 0)}</span></div>
+          <div><span class="k">Win rate</span><span class="v">${pct(side.winRate)}</span></div>
+          <div><span class="k">Trades</span><span class="v">${side.trades}</span></div>
+          <div><span class="k">Open</span><span class="v">${side.openPos}</span></div>
+          <div><span class="k">Start</span><span class="v">${money(side.start, 0)}</span></div>
+        </div>
+      </div>`;
+  }
+
   /* ---------------- system edge ---------------- */
   function renderEdge(report) {
     const eff = (report && report.gate_effectiveness) || {};
@@ -3145,6 +3215,7 @@
       }
       renderPaper(paper);
       renderV2Paper(paper);
+      renderCompetition(paper);
       renderEdge(report);
       renderFunnel(report, ticks);
       renderV2Funnel(ticks);
