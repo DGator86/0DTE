@@ -48,6 +48,9 @@
     <nav class="tabbar">
       <button class="tab active" id="tab-legacy" type="button">Legacy</button>
       <button class="tab" id="tab-v3" type="button">V3</button>
+      <button class="tab tab-spyder" id="tab-spyder" type="button">SPY&#8209;DER
+        <span class="tab-dot" id="tab-spyder-dot"></span>
+      </button>
       <button class="tab" id="tab-prediction" type="button">Prediction</button>
       <button class="tab" id="tab-journal" type="button">Trade Journal</button>
       <button class="tab" id="tab-validation" type="button">Validation
@@ -491,6 +494,63 @@
 
         <h2 style="margin-top:18px">Feature stability <span class="h2-right" id="lrn-feat-sub">—</span></h2>
         <div id="lrn-features"><p class="empty">No feature scores yet</p></div>
+      </section>
+    </div>
+
+    <!-- ===================== SPY-DER ===================== -->
+    <div class="spyder-view hidden" id="view-spyder">
+      <section class="panel spyder-hero" id="spyder-hero-panel">
+        <div class="spyder-hero-main">
+          <div class="spyder-brand">
+            <span class="spyder-logo">SPY&#8209;DER</span>
+            <span class="spyder-tag">Grok-driven 0DTE agent · shadow paper</span>
+          </div>
+          <div class="spyder-verdict" id="spyder-verdict">
+            <div class="sv-word" id="spyder-action">—</div>
+            <div class="sv-sub" id="spyder-action-sub">waiting for first decision</div>
+          </div>
+          <div class="spyder-idcol" id="spyder-identity"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="spyder-decision-panel">
+        <h2>Live decision <span class="h2-right" id="spyder-decision-sub">—</span></h2>
+        <div class="metrics" id="spyder-decision-metrics"></div>
+        <div class="spyder-gauges" id="spyder-gauges"></div>
+        <div class="spyder-rationale" id="spyder-rationale"></div>
+        <div class="chips" id="spyder-reason-codes" style="margin-top:10px"></div>
+      </section>
+
+      <section class="panel" id="spyder-vs-panel">
+        <h2>0DTE vs SPY-DER <span class="h2-right" id="spyder-vs-leader">—</span></h2>
+        <p class="panel-sub">Deterministic system (legacy+v2+v3) against the SPY-DER AI — return on capital. Simulated paper.</p>
+        <div class="competition-board" id="spyder-vs-board"></div>
+      </section>
+
+      <section class="panel" id="spyder-ledger-panel">
+        <h2>SPY-DER ledger <span class="h2-right">simulated</span></h2>
+        <div class="metrics" id="spyder-ledger-metrics"></div>
+      </section>
+
+      <section class="panel" id="spyder-open-panel">
+        <h2>Open positions <span class="h2-right" id="spyder-open-count">—</span></h2>
+        <div id="spyder-open"><p class="empty">No open SPY-DER positions</p></div>
+      </section>
+
+      <section class="panel spyder-wide" id="spyder-trades-panel">
+        <h2>Recent SPY-DER trades <span class="h2-right" id="spyder-trades-count">—</span></h2>
+        <div class="tj-scroll">
+          <table class="tj-table" id="spyder-trades-table">
+            <thead>
+              <tr>
+                <th>Opened</th><th>Structure</th><th>Qty</th><th>Conf</th>
+                <th>P&amp;L</th><th>Exit</th><th>Rationale</th>
+              </tr>
+            </thead>
+            <tbody id="spyder-trades-body"></tbody>
+          </table>
+        </div>
+        <p class="empty hidden" id="spyder-trades-empty">No closed SPY-DER trades yet</p>
       </section>
     </div>
 

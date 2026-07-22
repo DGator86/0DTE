@@ -1488,6 +1488,176 @@
       </div>`;
   }
 
+  /* ---------------- SPY-DER tab ---------------- */
+  const SPYDER_ACTION_META = {
+    TRADE:            { word: "TRADE",   cls: "go",   sub: "AI selected a candidate to paper" },
+    SELECT_CANDIDATE: { word: "TRADE",   cls: "go",   sub: "AI selected a candidate to paper" },
+    NO_EDGE:          { word: "NO EDGE", cls: "wait", sub: "no candidate cleared the AI's bar" },
+    ABSTAIN:          { word: "ABSTAIN", cls: "wait", sub: "AI stood down this tick" },
+    UNAVAILABLE:      { word: "OFFLINE", cls: "off",  sub: "SPY-DER package not reporting on the VPS" },
+  };
+
+  function spyderDecision(live) {
+    return (liveParallel(live) || {}).spy_der || {};
+  }
+  function providerLabel(p) {
+    const s = String(p || "").toLowerCase();
+    if (s === "grok") return "Grok (xAI)";
+    if (s === "deterministic") return "Deterministic";
+    if (!s || s === "none") return "—";
+    return p;
+  }
+  function isSpyderTrack(t) {
+    return String(t || "").toLowerCase() === "spy_der";
+  }
+  function updateSpyderTabDot(live) {
+    const dot = $("tab-spyder-dot");
+    if (!dot) return;
+    const sd = spyderDecision(live);
+    const act = String(sd.action || "").toUpperCase();
+    const offline = sd.available === false || act === "UNAVAILABLE" || !act;
+    const trading = act === "TRADE" || act === "SELECT_CANDIDATE";
+    dot.className = "tab-dot " + (offline ? "off" : trading ? "live" : "idle");
+  }
+  function spyderGauge(label, val, color) {
+    const v = num(val);
+    const pctW = v == null ? 0 : Math.max(0, Math.min(1, v)) * 100;
+    return `
+      <div class="sg-row">
+        <div class="sg-head"><span>${esc(label)}</span><span class="mono">${v == null ? "—" : fmt(v, 2)}</span></div>
+        <div class="sg-track"><span class="sg-fill sg-${color}" style="width:${pctW}%"></span></div>
+      </div>`;
+  }
+
+  function renderSpyder(live, paper, trades) {
+    if (!$("view-spyder")) return;
+    const sd = spyderDecision(live);
+    const act = String(sd.action || "").toUpperCase();
+    const meta = SPYDER_ACTION_META[act] ||
+      { word: act || "—", cls: "off", sub: "waiting for first decision" };
+    const offline = sd.available === false || act === "UNAVAILABLE" || !act;
+
+    // Hero verdict + identity
+    $("spyder-action").textContent = meta.word;
+    $("spyder-action-sub").textContent = meta.sub;   // crisp one-liner; full rationale sits in its own panel
+    $("spyder-verdict").className = "spyder-verdict sv-" + (offline ? "off" : meta.cls);
+    const provider = sd.source || sd.provider || (offline ? "none" : "grok");
+    $("spyder-identity").innerHTML = [
+      `<div class="sid-row"><span class="sid-k">Provider</span><span class="sid-v">${esc(providerLabel(provider))}</span></div>`,
+      `<div class="sid-row"><span class="sid-k">Model</span><span class="sid-v mono">${esc(sd.model_id || "—")}</span></div>`,
+      `<div class="sid-row"><span class="sid-k">Mode</span><span class="sid-v">${esc(sd.mode || "shadow")}</span></div>`,
+      `<div class="sid-status ${offline ? "off" : "live"}">${offline ? "OFFLINE" : "LIVE"}</div>`,
+    ].join("");
+
+    // Live decision
+    $("spyder-decision-sub").textContent = act || "—";
+    $("spyder-decision-metrics").innerHTML = [
+      metricCard("Structure", esc(sd.structure || "—")),
+      metricCard("Direction", esc(sd.direction || "—")),
+      metricCard("Size cap", sd.size_cap != null ? fmt(sd.size_cap, 2) : "—"),
+      metricCard("Candidate", sd.candidate_id ? esc(String(sd.candidate_id).slice(0, 14)) : "—"),
+    ].join("");
+    $("spyder-gauges").innerHTML = [
+      spyderGauge("Confidence", sd.confidence, "green"),
+      spyderGauge("Uncertainty", sd.uncertainty, "amber"),
+    ].join("");
+    $("spyder-rationale").innerHTML = (!offline && sd.rationale)
+      ? `<span class="sr-quote">${esc(sd.rationale)}</span>` : "";
+    const codes = arr(sd.reason_codes);
+    $("spyder-reason-codes").innerHTML = codes.length
+      ? codes.map((c) => `<span class="chip reason-code">${esc(c)}</span>`).join("")
+      : (offline ? "" : '<span class="chip ok">no flags</span>');
+
+    // Head-to-head, ledger, positions, trades
+    renderSpyderVs(paper);
+    const by = (paper && paper.by_track) || {};
+    const bt = by.spy_der || {};
+    const s = competitionSide("SPY-DER", by, COMP_SPYDER_TRACKS);
+    const pnlCls = num(bt.total_pnl) > 0 ? "pos" : num(bt.total_pnl) < 0 ? "neg" : "";
+    $("spyder-ledger-metrics").innerHTML = [
+      metricCard("Equity", money(s.equity, 0), "info"),
+      metricCard("Return", pct(s.returnPct), s.returnPct > 0 ? "pos" : s.returnPct < 0 ? "neg" : ""),
+      metricCard("Total P&L", money(bt.total_pnl, 0), pnlCls),
+      metricCard("Win rate", pct(bt.win_rate)),
+      metricCard("Closed trades", bt.trades != null ? bt.trades : 0),
+      metricCard("Open", bt.open_positions != null ? bt.open_positions : 0),
+    ].join("");
+    renderSpyderOpen(live);
+    renderSpyderTrades(trades);
+  }
+
+  function renderSpyderVs(paper) {
+    const el = $("spyder-vs-board");
+    if (!el) return;
+    const by = (paper && paper.by_track) || {};
+    const z = competitionSide("0DTE", by, COMP_ZERODTE_TRACKS);
+    const s = competitionSide("SPY-DER", by, COMP_SPYDER_TRACKS);
+    let leader = "tie";
+    if (z.returnPct > s.returnPct) leader = "0DTE";
+    else if (s.returnPct > z.returnPct) leader = "SPY-DER";
+    const lead = $("spyder-vs-leader");
+    if (lead) {
+      if (leader === "tie") { lead.textContent = "dead heat"; lead.className = "h2-right"; }
+      else {
+        lead.textContent = `${leader} leads +${pct(Math.abs(z.returnPct - s.returnPct))}`;
+        lead.className = "h2-right " + (leader === "SPY-DER" ? "spyder" : "info");
+      }
+    }
+    el.innerHTML = [competitorCard(z, leader === "0DTE", "0dte"),
+                    competitorCard(s, leader === "SPY-DER", "spyder")].join("");
+  }
+
+  function renderSpyderOpen(live) {
+    const open = ((live && live.paper && live.paper.open) || []).filter((p) =>
+      isSpyderTrack(p.fill_track || (p.entry_ctx && p.entry_ctx.fill_track)));
+    $("spyder-open-count").textContent = open.length ? String(open.length) : "—";
+    if (!open.length) {
+      $("spyder-open").innerHTML = '<p class="empty">No open SPY-DER positions</p>';
+      return;
+    }
+    $("spyder-open").innerHTML = open.map((p) => {
+      const ctx = p.entry_ctx || {};
+      const pnl = num(p.unrealized_pnl_dollars);
+      const cls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
+      const conf = ctx.spy_der_confidence;
+      return `<div class="op-card">
+        <div class="op-family">${esc(p.family || "—")} · <span class="mono">${esc(p.strikes || "")}</span> · x${esc(p.contracts != null ? p.contracts : "—")}</div>
+        <div class="op-meta">${esc(ctx.structure || "—")}${ctx.direction ? " · " + esc(ctx.direction) : ""}${conf != null ? " · conf " + fmt(conf, 2) : ""}${p.hold_min != null ? " · " + esc(p.hold_min) + "m" : ""}</div>
+        <div class="op-pnl ${cls}">${pnl != null ? money(pnl, 0) : "—"}</div>
+      </div>`;
+    }).join("");
+  }
+
+  function renderSpyderTrades(trades) {
+    const closed = ((trades && trades.closed) || []).filter((t) =>
+      isSpyderTrack((t.entry_ctx || {}).fill_track));
+    $("spyder-trades-count").textContent = closed.length ? String(closed.length) : "—";
+    const empty = $("spyder-trades-empty");
+    if (!closed.length) {
+      $("spyder-trades-body").innerHTML = "";
+      if (empty) empty.classList.remove("hidden");
+      return;
+    }
+    if (empty) empty.classList.add("hidden");
+    $("spyder-trades-body").innerHTML = closed.slice(0, 40).map((t) => {
+      const ctx = t.entry_ctx || {};
+      const pnl = num(t.pnl_dollars);
+      const cls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
+      const conf = ctx.spy_der_confidence;
+      const rationale = ctx.intent_reason === "spy_der_ai" ? "AI select"
+        : (ctx.intent_reason || "—");
+      return `<tr>
+        <td>${etTime(t.opened_at)}</td>
+        <td>${esc(ctx.structure || t.family || "—")}</td>
+        <td>${esc(t.contracts != null ? t.contracts : "—")}</td>
+        <td>${conf != null ? fmt(conf, 2) : "—"}</td>
+        <td class="${cls}">${pnl != null ? money(pnl, 0) : "—"}</td>
+        <td>${esc(t.exit_reason || "—")}</td>
+        <td class="sr-cell">${esc(rationale)}</td>
+      </tr>`;
+    }).join("");
+  }
+
   /* ---------------- system edge ---------------- */
   function renderEdge(report) {
     const eff = (report && report.gate_effectiveness) || {};
@@ -2507,21 +2677,27 @@
   }
 
   let activeTab = "legacy";
+  // Cache the latest payloads so the SPY-DER tab can render on switch without
+  // waiting for the next poll.
+  let lastLive = null, lastPaper = null, lastTrades = null;
 
   function switchTab(tab) {
     activeTab = tab;
     $("tab-legacy").classList.toggle("active", tab === "legacy");
     $("tab-v3").classList.toggle("active", tab === "v3");
+    $("tab-spyder").classList.toggle("active", tab === "spyder");
     $("tab-prediction").classList.toggle("active", tab === "prediction");
     $("tab-journal").classList.toggle("active", tab === "journal");
     $("tab-validation").classList.toggle("active", tab === "validation");
     $("tab-learning").classList.toggle("active", tab === "learning");
     $("view-legacy").classList.toggle("hidden", tab !== "legacy");
     $("view-v3").classList.toggle("hidden", tab !== "v3");
+    $("view-spyder").classList.toggle("hidden", tab !== "spyder");
     $("view-prediction").classList.toggle("hidden", tab !== "prediction");
     $("view-journal").classList.toggle("hidden", tab !== "journal");
     $("view-validation").classList.toggle("hidden", tab !== "validation");
     $("view-learning").classList.toggle("hidden", tab !== "learning");
+    if (tab === "spyder") renderSpyder(lastLive, lastPaper, lastTrades);
     if (tab === "prediction") refreshPrediction();
     if (tab === "journal") refreshJournal();
     if (tab === "validation") refreshValidation();
@@ -3216,6 +3392,9 @@
       renderPaper(paper);
       renderV2Paper(paper);
       renderCompetition(paper);
+      lastLive = live; lastPaper = paper; lastTrades = trades;
+      updateSpyderTabDot(live);
+      if (activeTab === "spyder") renderSpyder(live, paper, trades);
       renderEdge(report);
       renderFunnel(report, ticks);
       renderV2Funnel(ticks);
@@ -3407,6 +3586,7 @@
     showApp();
     $("tab-legacy").addEventListener("click", () => switchTab("legacy"));
     $("tab-v3").addEventListener("click", () => switchTab("v3"));
+    $("tab-spyder").addEventListener("click", () => switchTab("spyder"));
     $("tab-prediction").addEventListener("click", () => switchTab("prediction"));
     $("tab-journal").addEventListener("click", () => switchTab("journal"));
     $("tab-validation").addEventListener("click", () => switchTab("validation"));

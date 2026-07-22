@@ -536,6 +536,11 @@ class PaperBroker:
                 .get("decision_summary", {}) or {}).get("action"),
             "v3_selected_candidate_id": meta.get("candidate_id"),
             "intent_reason": meta.get("reason"),
+            # SPY-DER AI provenance — present only on the spy_der track so the
+            # dashboard can show the agent's action and confidence per trade.
+            "spy_der_action": meta.get("spy_der_action"),
+            "spy_der_confidence": meta.get("confidence"),
+            "spy_der_uncertainty": meta.get("uncertainty"),
         }
 
         pos = PaperPosition(
