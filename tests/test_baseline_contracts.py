@@ -198,6 +198,7 @@ def test_dashboard_route_inventory():
         "/api/ticks",
         "/api/ticks/{row_id}",
         "/api/paper",
+        "/api/competition",
         "/api/trades",
         "/api/ras",
         "/api/report",
@@ -233,6 +234,7 @@ def test_appjs_render_and_refresh_inventory():
     assert found == {
         "refresh", "refreshJournal", "refreshLearning", "refreshPrediction",
         "refreshValidation",
+        "renderCompetition",
         "renderConeCoverage", "renderConeJournal", "renderDynamics",
         "renderEdge", "renderFeatureImpactDetail", "renderForecast",
         "renderFunnel", "renderGexVariants", "renderJournal",
@@ -306,7 +308,7 @@ def test_appjs_consumes_feeds_section():
 # --------------------------------------------------------------------------- #
 def test_paper_tracks_inventory():
     from paper_broker import PAPER_TRACKS, PaperBroker, PaperConfig
-    assert PAPER_TRACKS == ("legacy", "v2", "v3")
+    assert PAPER_TRACKS == ("legacy", "v2", "v3", "spy_der")
     with tempfile.TemporaryDirectory() as tmp:
         broker = PaperBroker(db_path=os.path.join(tmp, "paper.sqlite"),
                              cfg=PaperConfig())

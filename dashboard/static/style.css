@@ -756,7 +756,7 @@ html, body {
 /* ---- V3 policy / GEX / forecast panels ---- */
 .policy-compare {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 8px;
   margin-bottom: 10px;
 }
@@ -807,6 +807,51 @@ html, body {
   text-transform: uppercase;
   font-size: 10px;
 }
+.chip.track-spy_der {
+  color: #f0a35e;
+  border-color: rgba(240,163,94,0.5);
+  background: rgba(240,163,94,0.10);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+.policy-side.unavailable {
+  opacity: 0.55;
+}
+
+/* ---------------- 0DTE vs SPY-DER competition ---------------- */
+.panel-sub { color: var(--muted); font-size: 11px; margin: -2px 0 10px; letter-spacing: 0.02em; }
+.panel > h2 .h2-right.spyder { color: #f0a35e; }
+.panel > h2 .h2-right.info   { color: var(--blue); }
+.competition-board {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+@media (max-width: 520px) { .competition-board { grid-template-columns: 1fr; } }
+.compet-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 13px;
+  background: rgba(255,255,255,0.015);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.compet-0dte   { border-top: 2px solid var(--blue); }
+.compet-spyder { border-top: 2px solid #f0a35e; }
+.compet-0dte.compet-lead   { border-color: var(--blue); box-shadow: 0 0 22px rgba(74,168,255,0.12); }
+.compet-spyder.compet-lead { border-color: #f0a35e; box-shadow: 0 0 22px rgba(240,163,94,0.14); }
+.compet-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.compet-name { font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; font-size: 13px; }
+.compet-crown { font-size: 10px; color: var(--green); font-family: var(--mono); letter-spacing: 0.04em; }
+.compet-return { font-family: var(--mono); font-size: 30px; font-weight: 700; line-height: 1.1; margin: 2px 0 10px; }
+.compet-return.pos { color: var(--green); }
+.compet-return.neg { color: var(--red); }
+.compet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+.compet-grid > div { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.compet-grid .k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.compet-grid .v { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+.compet-grid .v.pos { color: var(--green); }
+.compet-grid .v.neg { color: var(--red); }
 .chip.track-disagree {
   color: var(--amber);
   border-color: var(--amber);

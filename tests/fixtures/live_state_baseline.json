@@ -1,5 +1,5 @@
 {
-  "_comment": "live.v1 /api/live payload shape lock (PR D). Flat aliases removed; dashboard consumes sections only. Regenerate when serializer changes intentionally. Values synthetic; only recursive key/type structure is asserted.",
+  "_comment": "live.v1 /api/live payload shape lock. Includes forecast.parallel_tracks (legacy/v2/v3/spy_der). Regenerate when serializer changes intentionally.",
   "schema_version": "live.v1",
   "baseline_tree": "3ada4db (post PR #122 / PR C; PR D removes compat_flat_keys)",
   "payload": {
@@ -149,7 +149,8 @@
         "size_mult": 1.0,
         "gate_pass": false,
         "gate_score": 0.0,
-        "decision": "NO_TRADE"
+        "decision": "NO_TRADE",
+        "label": "Legacy"
       }
     },
     "forecast": {
@@ -168,7 +169,52 @@
         "source": null,
         "mode": null,
         "disagreement": null,
-        "fallback_used": null
+        "fallback_used": null,
+        "label": "V2"
+      },
+      "parallel_tracks": {
+        "legacy": {
+          "structure": "IC",
+          "direction": "both",
+          "size_mult": 1.0,
+          "gate_pass": false,
+          "gate_score": 0.0,
+          "decision": "NO_TRADE",
+          "label": "Legacy"
+        },
+        "v2": {
+          "structure": null,
+          "direction": null,
+          "action": null,
+          "confidence": null,
+          "uncertainty": null,
+          "size_cap": null,
+          "source": null,
+          "mode": null,
+          "disagreement": null,
+          "fallback_used": null,
+          "label": "V2"
+        },
+        "v3": {
+          "label": "V3",
+          "structure": null,
+          "direction": null,
+          "action": null,
+          "confidence": null,
+          "uncertainty": null,
+          "size_cap": null,
+          "candidate_id": null,
+          "mode": "shadow",
+          "source": "part3"
+        },
+        "spy_der": {
+          "track": "spy_der",
+          "label": "SPY-DER",
+          "source": "spy_der",
+          "mode": "shadow",
+          "action": "UNAVAILABLE",
+          "available": false
+        }
       }
     },
     "v3": {

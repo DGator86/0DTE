@@ -22,6 +22,11 @@ ENV_FILE=/etc/zerodte/zerodte.env
 DATA_DIR=/var/lib/zerodte
 SVC=zerodte-shadow
 SVC_USER=zerodte
+# SPY-DER System B — parallel paper/dashboard track (paper/shadow only).
+SPY_DER_REPO_URL="${SPY_DER_REPO_URL:-https://github.com/DGator86/SPY-DER.git}"
+SPY_DER_DIR="${SPY_DER_DIR:-/opt/spy-der}"
+SPY_DER_REF="${SPY_DER_REF:-origin/main}"
+SPY_DER_ENABLED="${SPY_DER_ENABLED:-1}"
 
 log() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 
@@ -64,6 +69,26 @@ if [ ! -x "$APP_DIR/venv/bin/python" ]; then
 fi
 "$APP_DIR/venv/bin/pip" install --quiet --upgrade pip
 "$APP_DIR/venv/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
+
+if [ "$SPY_DER_ENABLED" = "1" ]; then
+    log "SPY-DER parallel track -> $SPY_DER_REF"
+    if [ ! -d "$SPY_DER_DIR/.git" ]; then
+        git clone "$SPY_DER_REPO_URL" "$SPY_DER_DIR"
+    fi
+    git -C "$SPY_DER_DIR" remote set-url origin "$SPY_DER_REPO_URL"
+    git -C "$SPY_DER_DIR" fetch --prune origin
+    # Same ref resolution as 0DTE: branch name -> origin/<branch>, else SHA.
+    if git -C "$SPY_DER_DIR" rev-parse --verify -q "origin/${SPY_DER_REF#origin/}^{commit}" >/dev/null; then
+        SPY_TARGET="origin/${SPY_DER_REF#origin/}"
+    else
+        SPY_TARGET="$SPY_DER_REF"
+    fi
+    git -C "$SPY_DER_DIR" reset --hard "$SPY_TARGET"
+    echo "SPY-DER commit: $(git -C "$SPY_DER_DIR" rev-parse --short HEAD)"
+    "$APP_DIR/venv/bin/pip" install --quiet -e "$SPY_DER_DIR"
+else
+    log "SPY-DER parallel track disabled (SPY_DER_ENABLED=$SPY_DER_ENABLED)"
+fi
 
 log "systemd unit"
 install -m 644 "$APP_DIR/deploy/$SVC.service" "/etc/systemd/system/$SVC.service"

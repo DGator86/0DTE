@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from dashboard.auth import AuthMiddleware, ReadOnlyMiddleware, get_dashboard_token
 from dashboard.queries import (
     candidate_configs,
+    competition_view,
     enrich_paper_summary_with_live,
     feature_scores,
     fetch_prediction_for_snapshot,
@@ -126,6 +127,16 @@ async def api_paper():
     live = read_live_state(_config.get("live_state", "live_state.json"))
     live_paper = (live or {}).get("paper") if isinstance(live, dict) else None
     return enrich_paper_summary_with_live(summary, live_paper)
+
+
+@app.get("/api/competition")
+async def api_competition():
+    """0DTE (deterministic system) vs SPY-DER (AI) head-to-head scoreboard."""
+    summary = paper_summary(_config.get("paper_db", "paper.sqlite"))
+    live = read_live_state(_config.get("live_state", "live_state.json"))
+    live_paper = (live or {}).get("paper") if isinstance(live, dict) else None
+    enriched = enrich_paper_summary_with_live(summary, live_paper)
+    return competition_view(enriched)
 
 
 @app.get("/api/trades")

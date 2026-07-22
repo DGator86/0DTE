@@ -194,8 +194,8 @@ def serialize_tick_result(
         if k.startswith("v2_fc_")
     }
 
-    # Parallel decision summary for Legacy vs V3 tabs.
-    # V3 side uses only v2_policy_* — never fall back to policy_* (legacy).
+    # Parallel decision summary for Legacy / V2 / V3 / SPY-DER panels.
+    # V2 side uses only v2_policy_* — never fall back to policy_* (legacy).
     parallel = {
         "legacy": {
             "structure": intent.decision.structure,
@@ -204,6 +204,7 @@ def serialize_tick_result(
             "gate_pass": doing.get("gate_pass"),
             "gate_score": doing.get("gate_score"),
             "decision": doing.get("decision"),
+            "label": "Legacy",
         },
         "v2": {
             "structure": raw_signals.get("v2_policy_structure"),
@@ -216,8 +217,40 @@ def serialize_tick_result(
             "mode": raw_signals.get("policy_mode"),
             "disagreement": raw_signals.get("policy_disagreement"),
             "fallback_used": raw_signals.get("policy_fallback_used"),
+            "label": "V2",
         },
     }
+    # V3 from Part 3 decision summary (statistical action preferred).
+    part3_for_parallel = part3
+    if part3_for_parallel is None:
+        part3_for_parallel = getattr(result, "part3", None) or {}
+    ds_p3 = (part3_for_parallel or {}).get("decision_summary") or {}
+    parallel["v3"] = {
+        "label": "V3",
+        "structure": ds_p3.get("family"),
+        "direction": ds_p3.get("direction"),
+        "action": ds_p3.get("statistical_action") or ds_p3.get("action"),
+        "confidence": ds_p3.get("p_positive_utility"),
+        "uncertainty": ds_p3.get("uncertainty"),
+        "size_cap": None,
+        "candidate_id": ds_p3.get("selected_candidate_id"),
+        "mode": (part3_for_parallel or {}).get("mode", "shadow"),
+        "source": "part3",
+    }
+    spy_der_payload = getattr(result, "spy_der", None)
+    if isinstance(spy_der_payload, dict) and spy_der_payload:
+        parallel["spy_der"] = dict(spy_der_payload)
+        parallel["spy_der"].setdefault("label", "SPY-DER")
+        parallel["spy_der"].setdefault("track", "spy_der")
+    else:
+        parallel["spy_der"] = {
+            "track": "spy_der",
+            "label": "SPY-DER",
+            "source": "spy_der",
+            "mode": "shadow",
+            "action": "UNAVAILABLE",
+            "available": False,
+        }
 
     # MTF sigma cones (live panes) — prefer orchestrator cache via result attr.
     sigma_cones = getattr(result, "sigma_cones", None)
@@ -279,6 +312,8 @@ def serialize_tick_result(
     }
 
     # live.v1 forecast: summary + shadow signals; never source_version=v3.
+    # parallel keeps the historical V2 object; parallel_tracks is the
+    # multi-system comparison map (legacy / v2 / v3 / spy_der).
     forecast_section: dict[str, Any] = {
         "source_version": "v2",
         "source_type": (
@@ -289,6 +324,7 @@ def serialize_tick_result(
         "v2_signals": v2_signals,
         "sigma_cones": sigma_cones,
         "parallel": parallel.get("v2"),
+        "parallel_tracks": parallel,
     }
     if forecast_summary:
         forecast_section.update(forecast_summary)
