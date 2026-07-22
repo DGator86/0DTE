@@ -503,7 +503,7 @@ def paper_summary(paper_db_path: str) -> dict:
     by_reason: dict[str, int] = {}
     by_track: dict[str, dict] = {
         t: {"trades": 0, "total_pnl": 0.0, "wins": 0, "open_positions": 0}
-        for t in ("legacy", "v2", "v3")
+        for t in ("legacy", "v2", "v3", "spy_der")
     }
     for r in all_rows:
         reason = r[1] or "unknown"

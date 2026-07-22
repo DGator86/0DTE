@@ -98,8 +98,10 @@ class TickResult:
     sigma_cones: Optional[dict] = None
     # Part 3 shadow decision payload for live_state / dashboard assessment.
     part3: Optional[dict] = None
+    # SPY-DER AI parallel-track decision for live_state / dashboard panel.
+    spy_der: Optional[dict] = None
     # Parallel paper fills: list of {track, candidate, size_mult, ...} for
-    # legacy / v2 / v3. PaperBroker opens each track independently.
+    # legacy / v2 / v3 / spy_der. PaperBroker opens each track independently.
     paper_intents: list = field(default_factory=list)
 
 
@@ -645,17 +647,19 @@ class UnifiedOrchestrator:
             final_size_mult: float,
             matrix_stand_down: bool) -> list:
         """
-        Build parallel paper intents for legacy / V2 / V3.
+        Build parallel paper intents for legacy / V2 / V3 / SPY-DER.
 
         - legacy: matrix intent → Track A decide (independent of champion override)
         - v2: PredictionPolicy TRADE → decide with V2 structure/direction
         - v3: Part 3 TRADE → selected shadow candidate
+        - spy_der: SPY-DER AI decision over shadow candidates (paper/shadow only)
 
         Session warmup is enforced in PaperBroker. Regime stand-down blocks
-        legacy only — V2/V3 still fill when their engines say TRADE so the
-        tracks can be compared.
+        legacy only — V2/V3/SPY-DER still fill when their engines say TRADE so
+        the tracks can be compared.
         """
         intents: list = []
+        self._tick_spy_der = None
         if snap is None or snap.chain is None:
             return intents
 
@@ -758,6 +762,101 @@ class UnifiedOrchestrator:
                     "v3_action": v3_action,
                     "reason": "part3_meta",
                 })
+
+        # ---- SPY-DER (AI decision maker) ----
+        try:
+            from types import SimpleNamespace
+
+            from spy_der_bridge import PARALLEL_TRACK_ID, decide_spy_der_tick
+
+            market = getattr(snap, "market", None)
+            spot = float(getattr(market, "spot", 0.0) or 0.0)
+            tick_now = getattr(market, "now", None)
+            if tick_now is None:
+                import datetime as _dt
+                from zoneinfo import ZoneInfo
+                tick_now = _dt.datetime.now(ZoneInfo("America/New_York"))
+            session_date = tick_now.date()
+            shadow_cands = list(getattr(self, "_tick_shadow_cands", None) or [])
+            annotated = []
+            for i, c in enumerate(shadow_cands):
+                cid0 = getattr(c, "candidate_id", None) or getattr(c, "id", None)
+                if cid0 is None:
+                    annotated.append(SimpleNamespace(
+                        candidate_id=f"shadow-{i}-{getattr(c, 'family', 'x')}",
+                        family=getattr(c, "family", "unknown"),
+                        direction=getattr(c, "direction", "both"),
+                        max_loss=getattr(c, "max_loss", 1.0),
+                        capital_required=getattr(c, "capital_required", None),
+                        geometry_hash=getattr(c, "geometry_hash", None),
+                        expiration=getattr(c, "expiration", session_date),
+                        credit=getattr(c, "credit", None),
+                        mid_price=getattr(c, "mid_price", None),
+                        ev=getattr(c, "ev", None),
+                        ev_per_risk=getattr(c, "ev_per_risk", None),
+                        _raw=c,
+                    ))
+                else:
+                    annotated.append(c)
+            if not annotated and v3_action == "TRADE":
+                cid = ds.get("selected_candidate_id")
+                v3_only = self._pick_shadow_candidate(
+                    candidate_id=cid,
+                    family=ds.get("family") or (part3.get("ranking") or {}).get("top_family"),
+                )
+                if v3_only is not None:
+                    annotated = [v3_only]
+            snap_id = str(signals.get("_snapshot_id") or signals.get("snapshot_id") or "")
+            sd = decide_spy_der_tick(
+                snapshot_id=snap_id or f"tick-{int(tick_now.timestamp())}",
+                symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
+                session_date=session_date,
+                underlying_price=spot,
+                shadow_candidates=annotated,
+                now=tick_now,
+                hard_vetoes=tuple(str(v) for v in (regime_state.vetoes or [])),
+            )
+            self._tick_spy_der = sd.as_parallel_payload()
+            if sd.action == "TRADE" and sd.candidate_id:
+                sd_cand = self._pick_shadow_candidate(
+                    candidate_id=sd.candidate_id,
+                    family=sd.structure,
+                )
+                if sd_cand is None:
+                    for c in annotated:
+                        cid2 = str(
+                            getattr(c, "candidate_id", None)
+                            or getattr(c, "id", None)
+                            or ""
+                        )
+                        if cid2 == sd.candidate_id:
+                            sd_cand = getattr(c, "_raw", c)
+                            break
+                if sd_cand is not None:
+                    intents.append({
+                        "track": PARALLEL_TRACK_ID,
+                        "candidate": sd_cand,
+                        "size_mult": float(sd.size_scalar or 1.0) or 1.0,
+                        "gate_kelly": None,
+                        "gate_score": None,
+                        "structure": sd.structure,
+                        "direction": sd.direction,
+                        "candidate_id": sd.candidate_id,
+                        "spy_der_action": sd.action,
+                        "confidence": sd.confidence,
+                        "uncertainty": sd.uncertainty,
+                        "reason": "spy_der_ai",
+                    })
+        except Exception as exc:
+            self._tick_spy_der = {
+                "track": "spy_der",
+                "label": "SPY-DER",
+                "source": "spy_der",
+                "mode": "shadow",
+                "action": "ABSTAIN",
+                "available": False,
+                "rationale": f"bridge_exception:{type(exc).__name__}",
+            }
 
         return intents
 
@@ -1354,6 +1453,7 @@ class UnifiedOrchestrator:
                 signals=pub_signals,
                 sigma_cones=getattr(self, "_tick_sigma_cones", None),
                 part3=getattr(self, "_tick_part3", None),
+                spy_der=getattr(self, "_tick_spy_der", None),
                 paper_intents=paper_intents,
             )
             if self.journal:
@@ -1533,6 +1633,7 @@ class UnifiedOrchestrator:
             signals=pub_signals,
             sigma_cones=getattr(self, "_tick_sigma_cones", None),
             part3=getattr(self, "_tick_part3", None),
+            spy_der=getattr(self, "_tick_spy_der", None),
             paper_intents=paper_intents,
         )
 

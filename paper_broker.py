@@ -52,8 +52,15 @@ ET = ZoneInfo("America/New_York")
 log = logging.getLogger("paper_broker")
 
 # Parallel paper tracks — each gets its own virtual cash ledger so legacy /
-# V2 prediction-policy / V3 Part-3 decisions can be compared side-by-side.
-PAPER_TRACKS = ("legacy", "v2", "v3")
+# V2 prediction-policy / V3 Part-3 / SPY-DER AI decisions can be compared
+# side-by-side on the dashboard.
+PAPER_TRACKS = ("legacy", "v2", "v3", "spy_der")
+PAPER_TRACK_LABELS = {
+    "legacy": "Legacy",
+    "v2": "V2",
+    "v3": "V3",
+    "spy_der": "SPY-DER",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -65,8 +72,8 @@ class PaperConfig:
     multiplier: int = 100                 # option contract multiplier
     max_open_positions: int = 1           # per-track cap (0DTE: one structure each)
     # When True (default), open independent positions for each paper_intent
-    # track on the tick (legacy / v2 / v3). When False, only the legacy
-    # authoritative TradeDecision is filled (pre-triple-paper behavior).
+    # track on the tick (legacy / v2 / v3 / spy_der). When False, only the
+    # legacy authoritative TradeDecision is filled.
     parallel_tracks: bool = True
     # Risk fractions apply to CURRENT equity, not starting cash: the budget
     # compounds as the account grows and shrinks in a drawdown. Anchoring to

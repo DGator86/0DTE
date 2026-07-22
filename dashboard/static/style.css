@@ -756,7 +756,7 @@ html, body {
 /* ---- V3 policy / GEX / forecast panels ---- */
 .policy-compare {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 8px;
   margin-bottom: 10px;
 }
@@ -806,6 +806,17 @@ html, body {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   font-size: 10px;
+}
+.chip.track-spy_der {
+  color: #f0a35e;
+  border-color: rgba(240,163,94,0.5);
+  background: rgba(240,163,94,0.10);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+.policy-side.unavailable {
+  opacity: 0.55;
 }
 .chip.track-disagree {
   color: var(--amber);

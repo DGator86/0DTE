@@ -67,6 +67,7 @@ def test_parallel_tracks_open_three_independent_positions(tmp_path):
     tracks = sorted(p.entry_ctx["fill_track"] for p in b.open_positions)
     assert tracks == ["legacy", "v2", "v3"]
     assert all(t in PAPER_TRACKS for t in tracks)
+    assert "spy_der" in PAPER_TRACKS
     # Independent ledgers — none spent cash on open (credit structures)
     for t in PAPER_TRACKS:
         assert b.ledgers[t] == pytest.approx(1000.0)

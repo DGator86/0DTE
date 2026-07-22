@@ -7,3 +7,4 @@ tickets.jsonl
 public/
 # real secrets file — only the .example template is tracked
 zerodte.env
+.coverage

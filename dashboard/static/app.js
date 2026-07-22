@@ -148,10 +148,26 @@
   function liveInputs(live) {
     return (live && live.market && live.market.inputs) || {};
   }
+  const PARALLEL_TRACK_ORDER = ["legacy", "v2", "v3", "spy_der"];
+  const PARALLEL_TRACK_LABELS = {
+    legacy: "Legacy",
+    v2: "V2",
+    v3: "V3",
+    spy_der: "SPY-DER",
+  };
+  const PAPER_TRACKS = ["legacy", "v2", "v3", "spy_der"];
+
   function liveParallel(live) {
+    const tracks = (live && live.forecast && live.forecast.parallel_tracks) || null;
+    if (tracks && typeof tracks === "object") {
+      return tracks;
+    }
+    // Compatibility fallback when parallel_tracks is absent.
     return {
       legacy: (live && live.legacy && live.legacy.parallel) || {},
       v2: (live && live.forecast && live.forecast.parallel) || {},
+      v3: {},
+      spy_der: { action: "UNAVAILABLE", available: false, label: "SPY-DER" },
     };
   }
   function liveV2Signals(live) {
@@ -458,46 +474,66 @@
     $("playbook-metrics").innerHTML = cards.join("");
   }
 
-  /* ---------------- parallel Legacy vs V3 ---------------- */
+  /* ---------------- parallel Legacy / V2 / V3 / SPY-DER ---------------- */
   function renderParallel(live, latest) {
     const p = liveParallel(live);
     const leg = p.legacy || {};
     const v2 = p.v2 || {};
-    // Journal signals only for dual-run metadata; V3 structure/action from
-    // live.forecast.parallel (never fall back to legacy policy_*).
+    const v3 = p.v3 || {};
+    const sd = p.spy_der || {};
     const s = tickSignals(latest) || liveV2Signals(live);
-    const mode = v2.mode || s.policy_mode || "—";
+    const mode = sd.mode || v3.mode || v2.mode || s.policy_mode || "shadow";
     $("parallel-mode").textContent = mode;
-    const disagree = num(v2.disagreement) === 1 || num(s.policy_disagreement) === 1;
+
+    const actions = [
+      leg.decision || leg.action,
+      v2.action,
+      v3.action,
+      sd.action,
+    ].map((a) => String(a || "").toUpperCase());
+    const active = actions.filter((a) => a && a !== "—" && a !== "UNAVAILABLE");
+    const disagree = active.length >= 2 && new Set(active).size > 1;
     const fallback = num(v2.fallback_used) === 1 || num(s.policy_fallback_used) === 1;
 
-    $("parallel-compare").innerHTML = `
-      <div class="policy-side${disagree ? " disagree" : ""}">
-        <div class="ps-label">Legacy (matrix)</div>
-        <div class="ps-struct">${esc(leg.structure || "NT")}</div>
-        <div class="ps-meta">${esc(leg.decision || "—")}${leg.direction ? " · " + esc(leg.direction) : ""}</div>
-      </div>
-      <div class="policy-side${disagree ? " disagree" : ""}">
-        <div class="ps-label">V3 policy</div>
-        <div class="ps-struct">${esc(v2.structure || "—")}</div>
-        <div class="ps-meta">${esc(v2.action || "—")}${v2.direction ? " · " + esc(v2.direction) : ""}</div>
+    function sideCard(trackId, row, primary, secondary) {
+      const label = PARALLEL_TRACK_LABELS[trackId] || trackId;
+      const struct = row.structure || (trackId === "legacy" ? "NT" : "—");
+      const metaBits = [];
+      if (primary) metaBits.push(primary);
+      if (secondary) metaBits.push(secondary);
+      const unavailable = row.available === false || String(row.action || "").toUpperCase() === "UNAVAILABLE";
+      return `
+      <div class="policy-side${disagree ? " disagree" : ""}${unavailable ? " unavailable" : ""}">
+        <div class="ps-label">${esc(label)}</div>
+        <div class="ps-struct">${esc(struct)}</div>
+        <div class="ps-meta">${esc(metaBits.join(" · ") || "—")}</div>
       </div>`;
+    }
+
+    $("parallel-compare").innerHTML = [
+      sideCard("legacy", leg, leg.decision || "—", leg.direction),
+      sideCard("v2", v2, v2.action || "—", v2.direction),
+      sideCard("v3", v3, v3.action || "—", v3.direction),
+      sideCard("spy_der", sd, sd.action || "—", sd.direction || sd.provider || sd.source),
+    ].join("");
 
     $("parallel-metrics").innerHTML = [
       metricCard("Legacy gate", leg.gate_pass == null ? "—" : (leg.gate_pass ? "PASS" : "FAIL"),
         leg.gate_pass ? "pos" : (leg.gate_pass === false ? "warn" : "")),
       metricCard("Legacy size", fmt(leg.size_mult, 2)),
-      metricCard("V3 size cap", fmt(v2.size_cap != null ? v2.size_cap : s.policy_size_cap, 2)),
-      metricCard("V3 conf.", fmt(v2.confidence, 2)),
-      metricCard("V3 unc.", fmt(v2.uncertainty, 2),
-        num(v2.uncertainty) > 0.5 ? "warn" : ""),
-      metricCard("Source", esc(v2.source || "—")),
+      metricCard("V2 size cap", fmt(v2.size_cap != null ? v2.size_cap : s.policy_size_cap, 2)),
+      metricCard("V3 action", esc(v3.action || "—")),
+      metricCard("SPY-DER", esc(sd.action || "—"),
+        String(sd.action || "").toUpperCase() === "TRADE" ? "pos" : ""),
+      metricCard("SPY-DER conf.", fmt(sd.confidence, 2)),
     ].join("");
 
     const chips = [];
     if (disagree) chips.push('<span class="chip disagree">disagreement</span>');
     if (fallback) chips.push('<span class="chip fallback">fallback legacy</span>');
-    if (!chips.length) chips.push('<span class="chip ok">aligned / dual-run</span>');
+    if (sd.available === false) chips.push('<span class="chip fallback">SPY-DER offline</span>');
+    else chips.push('<span class="chip track-spy_der">SPY-DER live</span>');
+    if (!disagree && !fallback) chips.push('<span class="chip ok">aligned / multi-run</span>');
     $("parallel-chips").innerHTML = chips.join("");
   }
 
@@ -754,7 +790,7 @@
       return;
     }
     const by = paper.by_track || {};
-    const tracks = ["legacy", "v2", "v3"];
+    const tracks = PAPER_TRACKS.slice();
     const cards = [
       metricCard("Equity (legacy)", money(paper.equity, 0), "info"),
       metricCard("Total P&L", money(paper.total_pnl, 0),
@@ -851,8 +887,8 @@
   /* ---------------- track helpers (Legacy vs V3) ---------------- */
   function fillTrack(ctx) {
     ctx = ctx || {};
-    if (ctx.fill_track === "v2" || ctx.fill_track === "legacy"
-        || ctx.fill_track === "v3") return ctx.fill_track;
+    const t = String(ctx.fill_track || "").toLowerCase();
+    if (PAPER_TRACKS.indexOf(t) >= 0) return t;
     const mode = String(ctx.policy_mode || "").toLowerCase();
     if (mode === "champion") return "v2";
     return "legacy";
@@ -1366,10 +1402,11 @@
       metricCard("Closed trades", paper.trades),
       metricCard("Best exit", topReason(paper.by_exit_reason)),
     ];
-    ["legacy", "v2", "v3"].forEach((t) => {
+    PAPER_TRACKS.forEach((t) => {
       const bt = by[t] || {};
       const p = num(bt.total_pnl);
-      cards.push(metricCard(t.toUpperCase() + " P&L",
+      const label = (PARALLEL_TRACK_LABELS[t] || t).toUpperCase() + " P&L";
+      cards.push(metricCard(label,
         money(bt.total_pnl != null ? bt.total_pnl : 0, 0),
         p > 0 ? "pos" : p < 0 ? "neg" : ""));
     });
