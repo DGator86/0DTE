@@ -826,6 +826,15 @@ class UnifiedOrchestrator:
                     self._tick_spy_der["prediction"] = pred
             except Exception as exc:
                 log.warning("spy_der prediction failed: %s", exc)
+            # Grok token/cost usage for the dashboard usage bar (soft — only when
+            # the SPY-DER package exposes the meter).
+            try:
+                from spy_der.integrations.zerodte import usage_snapshot
+                usage = usage_snapshot()
+                if usage:
+                    self._tick_spy_der["usage"] = usage
+            except Exception:
+                pass
             if sd.action == "TRADE" and sd.candidate_id:
                 sd_cand = self._pick_shadow_candidate(
                     candidate_id=sd.candidate_id,

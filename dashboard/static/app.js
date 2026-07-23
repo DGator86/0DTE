@@ -1553,6 +1553,8 @@
     renderSpyderPrediction(sd, offline);
     // Market context — the trader data SPY-DER reads
     renderSpyderContext(live);
+    // Grok model usage / cost
+    renderSpyderUsage(live);
 
     // Live decision
     $("spyder-decision-sub").textContent = act || "—";
@@ -1701,6 +1703,53 @@
       const src = pred.source === "grok" ? "Grok forecast" : "trader model";
       note.textContent = `SPY-DER (${src}) projects ${bias} to ${tgt != null ? tgt.toFixed(2) : "—"} by close.`;
     }
+  }
+
+  function renderSpyderUsage(live) {
+    const u = spyderDecision(live).usage || null;
+    const costEl = $("spyder-usage-cost");
+    const budgetWrap = $("spyder-usage-budget");
+    if (!u) {
+      if (costEl) { costEl.textContent = "no data"; costEl.className = "h2-right"; }
+      if (budgetWrap) budgetWrap.classList.add("hidden");
+      $("spyder-usage-metrics").innerHTML =
+        '<div class="metric"><span class="k">status</span><span class="v sm">usage not reported</span></div>';
+      $("spyder-usage-models").innerHTML = "";
+      $("spyder-usage-note").textContent = "";
+      return;
+    }
+    const cost = num(u.est_cost_usd), frac = num(u.budget_used_frac);
+    let costCls = "h2-right";
+    if (frac != null) costCls += frac >= 0.9 ? " neg" : frac >= 0.7 ? " warn" : " pos";
+    if (costEl) { costEl.textContent = "~" + money(cost, 2) + " today"; costEl.className = costCls; }
+    if (budgetWrap) {
+      if (u.daily_budget_usd != null && frac != null) {
+        budgetWrap.classList.remove("hidden");
+        const p = Math.max(0, Math.min(1, frac)) * 100;
+        const fill = $("spyder-usage-budget-fill");
+        fill.style.width = p.toFixed(0) + "%";
+        fill.className = "ub-fill " + (frac >= 0.9 ? "ub-red" : frac >= 0.7 ? "ub-amber" : "ub-green");
+        $("spyder-usage-budget-label").textContent =
+          money(cost, 2) + " / " + money(u.daily_budget_usd, 2);
+        $("spyder-usage-budget-pct").textContent = p.toFixed(0) + "%";
+      } else {
+        budgetWrap.classList.add("hidden");
+      }
+    }
+    $("spyder-usage-metrics").innerHTML = [
+      metricCard("Calls today", u.calls != null ? u.calls : 0),
+      metricCard("Total tokens", compact(u.total_tokens)),
+      metricCard("Prompt", compact(u.prompt_tokens)),
+      metricCard("Completion", compact(u.completion_tokens)),
+    ].join("");
+    const by = u.by_model || {};
+    const rows = Object.entries(by)
+      .sort((a, b) => (num(b[1].est_cost_usd) || 0) - (num(a[1].est_cost_usd) || 0));
+    $("spyder-usage-models").innerHTML = rows.map(([mid, m]) =>
+      `<div class="um-row"><span class="um-name mono">${esc(mid)}</span>` +
+      `<span class="um-stat">${esc(m.calls)} calls</span>` +
+      `<span class="um-cost mono">~${money(m.est_cost_usd, 2)}</span></div>`).join("");
+    $("spyder-usage-note").textContent = "Estimated from token usage · resets daily (UTC)";
   }
 
   function renderSpyderContext(live) {
