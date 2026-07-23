@@ -417,6 +417,19 @@
         <h2>Equity curve <span class="h2-right" id="tj-equity-now">—</span></h2>
         <div class="chart-wrap tj-eq-wrap"><canvas id="tj-equity"></canvas></div>
       </section>
+      <section class="panel" id="tj-validation-panel">
+        <h2>Prediction validation <span class="h2-right" id="tj-val-n">—</span></h2>
+        <p class="panel-sub">Entry math (EV · PoP · gate score) held against what each closed trade actually realized.</p>
+        <div id="tj-val-verdicts"><p class="empty">No closed trades to validate yet</p></div>
+        <div class="metrics" id="tj-val-metrics"></div>
+        <div id="tj-val-calibration" style="margin-top:10px"></div>
+      </section>
+      <section class="panel" id="tj-lessons-panel">
+        <h2>Lessons <span class="h2-right" id="tj-lessons-n">—</span></h2>
+        <p class="panel-sub">Where the journal says the money is made and lost — segments with too few trades don't qualify.</p>
+        <div id="tj-lessons"><p class="empty">No lessons yet — need more closed trades</p></div>
+        <div class="metrics" id="tj-discipline-metrics" style="margin-top:10px"></div>
+      </section>
       <section class="panel">
         <h2>Closed trades <span class="h2-right" id="tj-closed-count">—</span></h2>
         <div class="val-filters" id="tj-filters" style="margin-bottom:10px">

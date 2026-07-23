@@ -431,6 +431,13 @@ def paper_trades_journal(paper_db_path: str, live_state_path: str = "",
     return {"open": open_positions, "closed": closed}
 
 
+def trade_insights(paper_db_path: str, limit: int = 500) -> dict:
+    """Trade-journal learning + validation review (journal_insights) over HTTP.
+    Read-only; degrades to an annotated empty payload on missing DB/table."""
+    from journal_insights import journal_review
+    return journal_review(paper_db_path, limit=limit)
+
+
 def paper_summary(paper_db_path: str) -> dict:
     if not paper_db_path:
         return {"note": "no paper database configured"}

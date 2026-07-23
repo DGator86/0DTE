@@ -3030,20 +3030,24 @@
                       : t.exit_reason === "stop" ? "bad"
                       : t.exit_reason === "ras_invalidate" ? "warn" : "";
       const ctx = t.entry_ctx || {};
+      const evp = num(ctx.ev), rps = num(t.pnl_ps);
+      const evMark = evp != null && rps != null
+        ? `<div class="tj-sub tj-ev ${rps >= evp ? "pos" : "neg"}">EV ${sign(evp)} → ${sign(rps)}/sh</div>`
+        : "";
       return `<tr>
-        <td class="mono">${esc((t.opened_at || "").slice(0, 10))} ${opened}</td>
-        <td class="tj-track-cell">${trackBadge(ctx)}</td>
-        <td><b>${esc(t.family)}</b> <span class="mono tj-dim">${esc(t.strikes)}</span>
+        <td class="mono" data-label="opened">${esc((t.opened_at || "").slice(0, 10))} ${opened}</td>
+        <td class="tj-track-cell" data-label="track">${trackBadge(ctx)}</td>
+        <td class="tj-struct-cell" data-label=""><b>${esc(t.family)}</b> <span class="mono tj-dim">${esc(t.strikes)}</span>
             <div class="tj-sub">${entryLogicLine(ctx)}</div></td>
-        <td class="mono">×${t.contracts}</td>
-        <td class="mono">${fmt(t.entry_credit, 2)}</td>
-        <td class="mono">${fmt(t.exit_value, 2)}</td>
-        <td class="mono">${fmt(t.hold_min, 0)}m</td>
-        <td class="mono ${cls}">${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : "—"}</td>
-        <td><span class="tj-reason ${reasonCls}">${esc(t.exit_reason || "—")}</span>
+        <td class="mono" data-label="qty">×${t.contracts}</td>
+        <td class="mono" data-label="entry">${fmt(t.entry_credit, 2)}</td>
+        <td class="mono" data-label="exit">${fmt(t.exit_value, 2)}</td>
+        <td class="mono" data-label="hold">${fmt(t.hold_min, 0)}m</td>
+        <td class="mono ${cls}" data-label="P&amp;L">${pnl != null ? (pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2) : "—"}${evMark}</td>
+        <td data-label="exit logic"><span class="tj-reason ${reasonCls}">${esc(t.exit_reason || "—")}</span>
             <div class="tj-sub">${exitLogicLine(t)}</div>
             ${rasExitLine(ctx)}</td>
-        <td class="mono">$${fmt(t.equity_after, 2)}</td>
+        <td class="mono" data-label="equity">$${fmt(t.equity_after, 2)}</td>
       </tr>`;
     }).join("");
   }
@@ -3096,11 +3100,102 @@
     ctx.stroke();
   }
 
+  /* ---- trade-journal learning + validation (journal_insights) ---- */
+  function verdictClass(text) {
+    if (!text) return "";
+    if (/insufficient|unmeasurable|no variance/i.test(text)) return "warn";
+    if (/OVERSTATED|NO information|NOT earning|too late|round-tripping/i.test(text)) return "bad";
+    return "good";
+  }
+
+  function renderTradeInsights(data) {
+    const val = (data && data.validation) || {};
+    const les = (data && data.lessons) || {};
+    const n = num(data && data.n_trades) || 0;
+    $("tj-val-n").textContent = n ? `${n} closed trades` : "—";
+    $("tj-lessons-n").textContent = String((les.lessons || []).length || "—");
+
+    const ev = val.ev || {}, pop = val.prob_profit || {}, gate = val.gate_score || {};
+    const verdicts = [
+      ["EV", ev.verdict], ["PoP", pop.verdict], ["Gate", gate.verdict],
+    ].filter((v) => v[1]);
+    $("tj-val-verdicts").innerHTML = verdicts.length
+      ? verdicts.map(([k, v]) =>
+          `<div class="tj-verdict ${verdictClass(v)}"><b>${k}</b> ${esc(v)}</div>`).join("")
+      : '<p class="empty">No closed trades to validate yet</p>';
+
+    const cards = [];
+    if (ev.n) {
+      cards.push(metricCard("EV bias $/sh", sign(ev.ev_bias), num(ev.ev_bias) < -0.05 ? "neg" : ""));
+      cards.push(metricCard("predicted → realized",
+        `${sign(ev.mean_predicted_ev)} → ${sign(ev.mean_realized_pnl_ps)}`));
+      cards.push(metricCard("≥ EV realized", pct(ev.frac_realized_at_least_ev, 0)));
+      if (ev.corr_ev_vs_realized != null)
+        cards.push(metricCard("EV↔P&L corr", sign(ev.corr_ev_vs_realized)));
+    }
+    if (pop.n) {
+      cards.push(metricCard("win rate", pct(pop.base_rate, 0)));
+      cards.push(metricCard("Brier skill",
+        pop.brier_skill == null ? "—" : sign(pop.brier_skill),
+        num(pop.brier_skill) <= 0 ? "neg" : "pos"));
+    }
+    if (gate.n && gate.corr_gate_vs_pnl != null) {
+      cards.push(metricCard("gate↔P&L corr", sign(gate.corr_gate_vs_pnl),
+        num(gate.corr_gate_vs_pnl) <= 0 ? "neg" : "pos"));
+    }
+    $("tj-val-metrics").innerHTML = cards.join("");
+
+    const bins = pop.bins || [];
+    $("tj-val-calibration").innerHTML = bins.length
+      ? '<div class="tj-cal-head">PoP said → trades won</div>' + bins.map((b) => {
+          const off = Math.abs((b.mean_predicted || 0) - (b.realized_rate || 0));
+          return `<div class="tj-cal-row">
+            <span class="mono tj-dim">${esc(b.bin)}</span>
+            <span class="tj-cal-track"><i style="width:${(b.mean_predicted * 100).toFixed(0)}%"></i></span>
+            <span class="mono">${pct(b.mean_predicted, 0)} → ${pct(b.realized_rate, 0)}</span>
+            <span class="mono ${off > 0.15 ? "neg" : "tj-dim"}">n=${b.n}</span>
+          </div>`;
+        }).join("")
+      : "";
+
+    const lessons = les.lessons || [];
+    if (!lessons.length) {
+      $("tj-lessons").innerHTML =
+        '<p class="empty">No lessons yet — need at least ' +
+        `${les.min_lesson_n || 5} closed trades per segment</p>`;
+    } else {
+      // Worst bleeds (and discipline flags) lead; close with the best earners.
+      const head = lessons.slice(0, 7);
+      const tail = lessons.filter((l) => l.kind === "edge").slice(-3)
+        .filter((l) => !head.includes(l));
+      $("tj-lessons").innerHTML = head.concat(tail).map((l) => {
+        const cls = l.kind === "bleed" ? "bad" : l.kind === "edge" ? "good" : "warn";
+        return `<div class="tj-lesson ${cls}">${esc(l.text)}</div>`;
+      }).join("");
+    }
+
+    const disc = les.exit_discipline || {};
+    const dcards = [];
+    if (disc.round_trips != null)
+      dcards.push(metricCard("round-tripped winners", String(disc.round_trips),
+        disc.round_trips > 0 ? "neg" : ""));
+    if (disc.avg_winner_giveback != null)
+      dcards.push(metricCard("avg winner giveback", pct(disc.avg_winner_giveback, 0)));
+    if (disc.stops_total)
+      dcards.push(metricCard("stops near max loss",
+        `${disc.stops_near_max_loss}/${disc.stops_total}`));
+    $("tj-discipline-metrics").innerHTML = dcards.join("");
+  }
+
   async function refreshJournal() {
     try {
-      const data = await api("/api/trades?limit=200");
+      const [data, insights] = await Promise.all([
+        api("/api/trades?limit=200"),
+        api("/api/trade-insights").catch(() => null),
+      ]);
       renderJournal(data);
       drawEquityCurve(data.closed || []);
+      if (insights) renderTradeInsights(insights);
     } catch (e) {
       if (e.message !== "Unauthorized") console.warn("journal", e);
     }
