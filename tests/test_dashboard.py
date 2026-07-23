@@ -146,6 +146,22 @@ def test_api_market_status(client):
     assert "seconds_until_open" in data or "seconds_until_close" in data
 
 
+def test_api_trade_insights(client):
+    """Trade-journal learning + validation endpoint: full payload shape even
+    on a fresh install with no paper database yet."""
+    r = client.get("/api/trade-insights",
+                   headers={"Authorization": "Bearer test-secret-token"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["n_trades"] == 0
+    assert "note" in data
+    for panel in ("ev", "prob_profit", "gate_score"):
+        assert panel in data["validation"]
+    assert "lessons" in data["lessons"]
+    assert "exit_discipline" in data["lessons"]
+    assert "segments" in data["lessons"]
+
+
 def test_post_returns_405(client):
     r = client.post("/api/live", headers={"Authorization": "Bearer test-secret-token"})
     assert r.status_code == 405

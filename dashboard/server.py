@@ -36,6 +36,7 @@ from dashboard.queries import (
     ras_history,
     readiness_summary,
     report_summary,
+    trade_insights,
     validation_report_by_id,
     validation_reports,
 )
@@ -146,6 +147,14 @@ async def api_trades(limit: int = 200):
         _config.get("live_state", "live_state.json"),
         limit=max(1, min(limit, 500)),
     )
+
+
+@app.get("/api/trade-insights")
+async def api_trade_insights(limit: int = Query(500, ge=1, le=2000)):
+    """Trade-journal learning + validation: entry predictions (EV / PoP /
+    gate score) held against realized outcomes, segment P&L attribution,
+    exit-discipline audit, and ranked plain-language lessons."""
+    return trade_insights(_config.get("paper_db", "paper.sqlite"), limit=limit)
 
 
 @app.get("/api/ras")
