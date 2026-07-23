@@ -189,6 +189,7 @@ class ShadowRunner:
             ras_cfg=self._ras_cfg,
             regime_overrides=regime_overrides,
             symbol=symbol,
+            paper_db_path=paper_db or "paper.sqlite",
             policy_mode=policy_mode,
             prediction_store=self._prediction_store,
             prediction_bundle_provider=bundle_provider,

@@ -144,6 +144,11 @@ class UnifiedOrchestrator:
     # Observation-only; a failed write never breaks a tick.
     prediction_store: Optional[object] = None
     symbol: str = "SPY"
+    # Paper-trades SQLite (PaperBroker's db). When set, each SPY-DER tick is
+    # given the spy_der track's own realized record (journal_insights.
+    # track_feedback) so the AI decides WITH memory of its past outcomes —
+    # the learning feedback loop. Read-only here; refreshed on a short cache.
+    paper_db_path: str = ""
     # Physical-density migration (Prediction Engine V2, PR 5 / §12.5).
     # True (default): keep the legacy dir_drift_frac tilt of the realized-vol
     # density when the router emits a directional debit — the pre-V2 path.
@@ -568,6 +573,32 @@ class UnifiedOrchestrator:
             log.warning("V2 candidate shadow ranking failed: %s", exc)
             return decision
 
+    def _spy_der_track_record(self, now) -> Optional[dict]:
+        """spy_der track's realized paper record for the AI's decision packet.
+
+        Reads journal_insights.track_feedback off the paper DB on a 5-minute
+        cache — the record only changes when a trade closes, and a stale-by-
+        minutes record is still infinitely more informative than the amnesia
+        it replaces. Never raises: feedback must not break a tick.
+        """
+        if not self.paper_db_path:
+            return None
+        try:
+            ts = now.timestamp()
+        except (AttributeError, OSError, ValueError):
+            ts = 0.0
+        cached = getattr(self, "_spy_der_feedback_cache", None)
+        if cached is not None and ts and (ts - cached[0]) < 300.0:
+            return cached[1]
+        record = None
+        try:
+            from journal_insights import track_feedback
+            record = track_feedback(self.paper_db_path, track="spy_der")
+        except Exception as exc:
+            log.debug("spy_der track feedback unavailable: %s", exc)
+        self._spy_der_feedback_cache = (ts, record)
+        return record
+
     def _pick_shadow_candidate(self, candidate_id: Optional[str] = None,
                                family: Optional[str] = None,
                                structure_code: Optional[str] = None):
@@ -826,6 +857,7 @@ class UnifiedOrchestrator:
                 shadow_candidates=annotated,
                 now=tick_now,
                 hard_vetoes=(),
+                track_record=self._spy_der_track_record(tick_now),
             )
             self._tick_spy_der = sd.as_parallel_payload()
             # SPY-DER reads the chart/market context and draws a prediction.

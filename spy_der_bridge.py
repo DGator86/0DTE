@@ -71,8 +71,15 @@ def decide_spy_der_tick(
     shadow_candidates: list[Any],
     now: datetime,
     hard_vetoes: tuple[str, ...] = (),
+    track_record: Optional[dict] = None,
 ) -> BridgeDecision:
-    """Ask SPY-DER AI for a shadow decision; fail closed to ABSTAIN."""
+    """Ask SPY-DER AI for a shadow decision; fail closed to ABSTAIN.
+
+    ``track_record`` is the spy_der paper track's own realized history
+    (journal_insights.track_feedback) — the learning feedback loop. It is
+    forwarded only when the installed spy_der package supports it, so old
+    package versions keep working.
+    """
     if not spy_der_available():
         return BridgeDecision(
             action="UNAVAILABLE",
@@ -150,6 +157,15 @@ def decide_spy_der_tick(
         except Exception as exc:
             log.debug("skip shadow candidate %s: %s", i, exc)
 
+    kwargs: dict[str, Any] = {}
+    if track_record:
+        import inspect
+        try:
+            if "track_record" in inspect.signature(decide_shadow_tick).parameters:
+                kwargs["track_record"] = track_record
+        except (TypeError, ValueError):
+            pass
+
     try:
         decision = decide_shadow_tick(
             snapshot_id=snapshot_id or "snap-unknown",
@@ -159,6 +175,7 @@ def decide_spy_der_tick(
             candidates=views,
             now=now,
             hard_vetoes=hard_vetoes,
+            **kwargs,
         )
         return BridgeDecision(
             action=decision.action,

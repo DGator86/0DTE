@@ -360,6 +360,63 @@ def trade_lessons(trades: list[dict], min_n: int = MIN_LESSON_N) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# per-track feedback for decision agents (the SPY-DER learning loop)          #
+# --------------------------------------------------------------------------- #
+def track_feedback(paper_db_path: str, track: str = "spy_der",
+                   limit: int = 200, max_lessons: int = 6) -> Optional[dict]:
+    """
+    Compact realized-performance summary of ONE paper track, shaped for a
+    decision agent's context (SPY-DER's TrackRecordSummary): n_trades,
+    win_rate, total_pnl, ev_bias_per_share, by_family, lessons. Returns None
+    when the track has no closed trades (or the DB is unavailable) so callers
+    can simply omit the feedback block.
+    """
+    if not paper_db_path:
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{paper_db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT * FROM paper_trades ORDER BY closed_at DESC LIMIT ?",
+            (limit,)).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    trades = [t for t in (dict(r) for r in rows)
+              if str(_ctx(t).get("fill_track") or "legacy").lower() == track]
+    if not trades:
+        return None
+
+    stats = _seg_stats(trades)
+    val = validate_trades(trades)
+    lessons_full = trade_lessons(trades)
+    # Keep only agent-actionable dimensions: the track is already fixed, and
+    # regime/cell wording is meaningless without the classifier's context.
+    keep = ("family", "exit_reason", "direction")
+    texts = [l["text"] for l in lessons_full["lessons"]
+             if l["kind"] == "discipline"
+             or any(l["text"].startswith(f"{d}=") for d in keep)]
+    ev = val["ev"]
+    return {
+        "n_trades": stats["n"],
+        "win_rate": stats["win_rate"] or 0.0,
+        "total_pnl": stats["total_pnl"],
+        "ev_bias_per_share": ev.get("ev_bias"),
+        "by_family": [
+            {"family": s["key"], "n_trades": s["n"],
+             "total_pnl": s["total_pnl"], "win_rate": s["win_rate"] or 0.0}
+            for s in lessons_full["segments"]["family"]
+        ],
+        "lessons": texts[:max_lessons],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # entry point over the paper DB                                               #
 # --------------------------------------------------------------------------- #
 def journal_review(paper_db_path: str, limit: int = 500) -> dict:

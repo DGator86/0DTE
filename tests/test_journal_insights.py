@@ -6,6 +6,7 @@ import pytest
 
 from journal_insights import (
     journal_review,
+    track_feedback,
     trade_lessons,
     validate_trades,
 )
@@ -189,6 +190,54 @@ def test_journal_review_end_to_end(tmp_path):
     assert out["validation"]["ev"]["n"] == 12
     assert any("bleeding" in l["text"] for l in out["lessons"]["lessons"])
     assert out["note"] is None
+
+
+def test_track_feedback_filters_to_track(tmp_path):
+    db = str(tmp_path / "paper.sqlite")
+    trades = ([_trade(-40.0, -0.40, ev=0.5, family="long_put_spread",
+                      track="spy_der") for _ in range(6)]
+              + [_trade(25.0, 0.25, family="iron_fly", track="spy_der")
+                 for _ in range(6)]
+              # legacy trades must NOT leak into spy_der's record
+              + [_trade(999.0, 9.99, family="iron_fly", track="legacy")
+                 for _ in range(3)])
+    _make_paper_db(db, trades)
+    fb = track_feedback(db, track="spy_der")
+    assert fb is not None
+    assert fb["n_trades"] == 12
+    assert fb["total_pnl"] == pytest.approx(-90.0)
+    fams = {f["family"]: f for f in fb["by_family"]}
+    assert fams["long_put_spread"]["total_pnl"] == pytest.approx(-240.0)
+    assert "iron_fly" in fams
+    assert fb["ev_bias_per_share"] is not None
+    assert any("long_put_spread is bleeding" in t for t in fb["lessons"])
+    # regime/cell lessons are filtered out — only agent-actionable dimensions
+    assert not any(t.startswith(("regime=", "cell=", "track=", "conviction="))
+                   for t in fb["lessons"])
+
+
+def test_track_feedback_none_when_track_empty(tmp_path):
+    db = str(tmp_path / "paper.sqlite")
+    _make_paper_db(db, [_trade(10.0, 0.1, track="legacy")])
+    assert track_feedback(db, track="spy_der") is None
+    assert track_feedback("", track="spy_der") is None
+    assert track_feedback(str(tmp_path / "missing.sqlite")) is None
+
+
+def test_bridge_accepts_track_record_without_package():
+    """decide_spy_der_tick must tolerate the new kwarg when the spy_der
+    package is absent (returns UNAVAILABLE, never raises)."""
+    import spy_der_bridge as b
+    if b.spy_der_available():
+        pytest.skip("spy_der package installed; unavailable path not testable")
+    import datetime as dt
+    out = b.decide_spy_der_tick(
+        snapshot_id="s1", symbol="SPY",
+        session_date=dt.date(2026, 7, 23), underlying_price=600.0,
+        shadow_candidates=[], now=dt.datetime(2026, 7, 23, 15, 0),
+        track_record={"n_trades": 3, "win_rate": 0.33, "total_pnl": -20.0},
+    )
+    assert out.action == "UNAVAILABLE"
 
 
 def test_journal_review_degrades_gracefully(tmp_path):
