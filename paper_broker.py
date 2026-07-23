@@ -90,6 +90,18 @@ class PaperConfig:
     stop_cooldown_min: float = 30.0       # ... doubled cool-off after a stop-loss exit
     max_trades_per_day: int = 10          # hard cap on entries per session
 
+    # --- fill-quality guards: don't paper a lottery ticket ---
+    # A track can hand the broker a candidate its own playbook flags as junk
+    # (e.g. a $0.03 deep-OTM long put, 0.3% prob-profit). The selector vetoes
+    # candidate GENERATION, but the broker fills whatever intent it's given, so
+    # these are the final gate before a paper position is opened — applied to
+    # every track (legacy / v2 / v3 / spy_der).
+    min_prob_profit: float = 0.05         # skip fills with win-prob below this
+    min_debit_max_loss: float = 0.10      # $/share; skip debit fills cheaper than this
+    # Sanity ceiling on contracts: sizing divides the risk budget by per-contract
+    # max-loss, so a near-worthless option would otherwise balloon the count.
+    max_contracts: int = 50               # per-position hard cap (0 = uncapped)
+
     # Conviction scales size: the gate already maps its score to a Kelly
     # fraction (score_floor -> kelly_frac_min ... 100 -> kelly_frac_max), but
     # the broker used to ignore it and deploy the FULL risk budget on any
@@ -446,6 +458,20 @@ class PaperBroker:
         if ml <= 0:
             return None
 
+        # --- fill-quality veto: never paper a lottery ticket ---
+        pp = getattr(cand, "prob_profit", None)
+        if (self.cfg.min_prob_profit > 0.0 and isinstance(pp, (int, float))
+                and pp < self.cfg.min_prob_profit):
+            log.info("paper entry skipped [%s]: prob_profit %.3f < %.3f (%s)",
+                     track, pp, self.cfg.min_prob_profit, cand.family)
+            return None
+        is_debit = entry_credit < 0.0
+        if (self.cfg.min_debit_max_loss > 0.0 and is_debit
+                and ml < self.cfg.min_debit_max_loss):
+            log.info("paper entry skipped [%s]: debit max_loss %.3f < %.3f (%s)",
+                     track, ml, self.cfg.min_debit_max_loss, cand.family)
+            return None
+
         kelly = 1.0
         if self.cfg.use_gate_kelly:
             k = gate_kelly
@@ -455,6 +481,9 @@ class PaperBroker:
         per_contract_risk = ml * self.cfg.multiplier
         contracts = int(np.floor((risk_budget * size_mult * kelly) / per_contract_risk))
         contracts = min(contracts, int(np.floor(track_cash / per_contract_risk)))
+        # Sanity ceiling so a tiny-max-loss structure can't balloon the count.
+        if self.cfg.max_contracts > 0:
+            contracts = min(contracts, self.cfg.max_contracts)
         if contracts < 1:
             return None
 

@@ -1626,10 +1626,10 @@
       const pnl = num(p.unrealized_pnl_dollars);
       const cls = pnl > 0 ? "pos" : pnl < 0 ? "neg" : "";
       const conf = ctx.spy_der_confidence;
-      return `<div class="op-card">
-        <div class="op-family">${esc(p.family || "—")} · <span class="mono">${esc(p.strikes || "")}</span> · x${esc(p.contracts != null ? p.contracts : "—")}</div>
-        <div class="op-meta">${esc(ctx.structure || "—")}${ctx.direction ? " · " + esc(ctx.direction) : ""}${conf != null ? " · conf " + fmt(conf, 2) : ""}${p.hold_min != null ? " · " + esc(p.hold_min) + "m" : ""}</div>
-        <div class="op-pnl ${cls}">${pnl != null ? money(pnl, 0) : "—"}</div>
+      return `<div class="sd-op-card">
+        <div class="sd-op-family">${esc(p.family || "—")} · <span class="mono">${esc(p.strikes || "")}</span> · x${esc(p.contracts != null ? p.contracts : "—")}</div>
+        <div class="sd-op-meta">${esc(ctx.structure || "—")}${ctx.direction ? " · " + esc(ctx.direction) : ""}${conf != null ? " · conf " + fmt(conf, 2) : ""}${p.hold_min != null ? " · " + esc(p.hold_min) + "m" : ""}</div>
+        <div class="sd-op-pnl ${cls}">${pnl != null ? money(pnl, 0) : "—"}</div>
       </div>`;
     }).join("");
   }
