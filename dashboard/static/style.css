@@ -920,9 +920,21 @@ html, body {
 /* ============================================================
    SPY-DER tab — the AI agent's own dashboard
    ============================================================ */
-/* SPY-DER tab reuses the legacy .grid (3 columns); the trades panel spans it. */
-#view-spyder .spyder-wide { grid-column: 1 / -1; }
+/* SPY-DER tab reuses the legacy .grid (3 columns); the trades panel spans it.
+   min-width:0 is essential: as a direct grid item (the .col wrappers already
+   set it) this panel would otherwise floor the single mobile `1fr` track at its
+   table's min-content (~500px), pushing every SPY-DER tile ~120px past a phone
+   viewport. With min-width:0 the track collapses to the viewport and the table
+   scrolls inside its own .tj-scroll. */
+#view-spyder .spyder-wide { grid-column: 1 / -1; min-width: 0; }
 #spyder-chart-panel .chart-wrap { height: 340px; }
+/* Pin the canvas to its wrapper. Without an explicit CSS height the canvas
+   element's rendered height falls back to its `height` content attribute, and
+   drawSpyderChart() sets that attribute to clientHeight*dpr on every frame — so
+   each redraw doubled the canvas height, letting it balloon far past the panel
+   and smear its level labels across the tiles below. Legacy #chart avoids this
+   by sizing the canvas directly (see #chart); do the same here. */
+#spyder-chart { width: 100%; height: 100%; display: block; }
 /* Head-to-head sits in the narrow right column — stack the two cards. */
 #spyder-vs-board { grid-template-columns: 1fr; }
 
