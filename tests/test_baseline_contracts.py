@@ -200,6 +200,7 @@ def test_dashboard_route_inventory():
         "/api/paper",
         "/api/competition",
         "/api/trades",
+        "/api/trade-insights",
         "/api/ras",
         "/api/report",
         "/api/gex-variants",
@@ -249,7 +250,7 @@ def test_appjs_render_and_refresh_inventory():
         "renderSignal", "renderSpyder", "renderSpyderContext", "renderSpyderOpen",
         "renderSpyderPrediction", "renderSpyderTrades",
         "renderSpyderUsage", "renderSpyderVs", "renderTech", "renderTimeline",
-        "renderTopbar",
+        "renderTopbar", "renderTradeInsights",
         "renderV2Funnel", "renderV2OpenPositions", "renderV2Paper",
         "renderV2Playbook", "renderV2Regime", "renderV2Signal",
         "renderV2Timeline", "renderV2Why", "renderValDetail", "renderValList",
@@ -264,7 +265,7 @@ def test_appjs_api_endpoint_inventory():
         "/api/learning", "/api/live", "/api/market-status", "/api/paper",
         "/api/predictions", "/api/promotions", "/api/readiness",
         "/api/report", "/api/sigma-cones", "/api/ticks", "/api/trades",
-        "/api/validation",
+        "/api/trade-insights", "/api/validation",
     }
 
 
