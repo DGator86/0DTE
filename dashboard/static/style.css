@@ -964,13 +964,14 @@ html, body {
 .sr-quote { display: block; font-size: 13px; line-height: 1.5; color: var(--ink); border-left: 2px solid #f0a35e; padding: 4px 0 4px 12px; background: rgba(240,163,94,0.04); }
 .chip.reason-code { color: #f0a35e; border-color: rgba(240,163,94,0.40); background: rgba(240,163,94,0.08); font-family: var(--mono); font-size: 10px; }
 
-/* open positions */
+/* open positions (SPY-DER tab — scoped so they don't collide with the legacy
+   .op-card in the Legacy/V2 tabs) */
 #spyder-open { display: flex; flex-direction: column; gap: 8px; }
-.op-card { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: rgba(255,255,255,0.015); }
-.op-family { font-size: 13px; font-weight: 600; }
-.op-meta { font-size: 11px; color: var(--muted); grid-column: 1; }
-.op-pnl { grid-row: 1 / 3; align-self: center; font-family: var(--mono); font-weight: 700; font-size: 15px; }
-.op-pnl.pos { color: var(--green); } .op-pnl.neg { color: var(--red); }
+.sd-op-card { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: rgba(255,255,255,0.015); }
+.sd-op-family { font-size: 13px; font-weight: 600; }
+.sd-op-meta { font-size: 11px; color: var(--muted); grid-column: 1; }
+.sd-op-pnl { grid-row: 1 / 3; align-self: center; font-family: var(--mono); font-weight: 700; font-size: 15px; }
+.sd-op-pnl.pos { color: var(--green); } .sd-op-pnl.neg { color: var(--red); }
 #spyder-trades-table .sr-cell { color: var(--muted); font-size: 11px; }
 
 /* model usage / cost bar */
