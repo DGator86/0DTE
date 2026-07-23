@@ -973,6 +973,22 @@ html, body {
 .op-pnl.pos { color: var(--green); } .op-pnl.neg { color: var(--red); }
 #spyder-trades-table .sr-cell { color: var(--muted); font-size: 11px; }
 
+/* model usage / cost bar */
+.panel > h2 .h2-right.warn { color: var(--amber); }
+.usage-budget { margin-bottom: 12px; }
+.ub-head { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); font-family: var(--mono); margin-bottom: 4px; }
+.ub-track { height: 9px; border-radius: 6px; background: var(--bg-2); overflow: hidden; }
+.ub-fill { display: block; height: 100%; border-radius: 6px; transition: width 0.4s ease; }
+.ub-green { background: linear-gradient(90deg, var(--green-dim), var(--green)); }
+.ub-amber { background: linear-gradient(90deg, var(--amber-dim), var(--amber)); }
+.ub-red   { background: linear-gradient(90deg, var(--red-dim), var(--red)); }
+.usage-models { margin-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+.um-row { display: flex; align-items: baseline; gap: 8px; font-size: 11px; }
+.um-name { flex: 1 1 auto; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.um-stat { color: var(--muted); }
+.um-cost { color: #f0a35e; font-weight: 600; }
+.usage-note { margin: 10px 0 0; font-size: 10px; color: var(--muted-2); }
+
 /* tab status dot */
 .tab-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-left: 6px; vertical-align: middle; background: var(--muted-2); }
 .tab-dot.live { background: #f0a35e; box-shadow: 0 0 0 3px rgba(240,163,94,0.18); }
