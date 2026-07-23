@@ -817,6 +817,15 @@ class UnifiedOrchestrator:
                 hard_vetoes=tuple(str(v) for v in (regime_state.vetoes or [])),
             )
             self._tick_spy_der = sd.as_parallel_payload()
+            # SPY-DER reads the chart/market context and draws a prediction.
+            try:
+                from spy_der_predict import predict_spy_der_tick
+                pred = predict_spy_der_tick(
+                    market, now_iso=tick_now.isoformat(), decision=sd)
+                if pred:
+                    self._tick_spy_der["prediction"] = pred
+            except Exception as exc:
+                log.warning("spy_der prediction failed: %s", exc)
             if sd.action == "TRADE" and sd.candidate_id:
                 sd_cand = self._pick_shadow_candidate(
                     candidate_id=sd.candidate_id,

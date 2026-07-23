@@ -1549,6 +1549,11 @@
       `<div class="sid-status ${offline ? "off" : "live"}">${offline ? "OFFLINE" : "LIVE"}</div>`,
     ].join("");
 
+    // Prediction (what SPY-DER forecasts + confidence)
+    renderSpyderPrediction(sd, offline);
+    // Market context — the trader data SPY-DER reads
+    renderSpyderContext(live);
+
     // Live decision
     $("spyder-decision-sub").textContent = act || "—";
     $("spyder-decision-metrics").innerHTML = [
@@ -1557,16 +1562,15 @@
       metricCard("Size cap", sd.size_cap != null ? fmt(sd.size_cap, 2) : "—"),
       metricCard("Candidate", sd.candidate_id ? esc(String(sd.candidate_id).slice(0, 14)) : "—"),
     ].join("");
-    $("spyder-gauges").innerHTML = [
-      spyderGauge("Confidence", sd.confidence, "green"),
-      spyderGauge("Uncertainty", sd.uncertainty, "amber"),
-    ].join("");
-    $("spyder-rationale").innerHTML = (!offline && sd.rationale)
+    $("spyder-decision-rationale").innerHTML = (!offline && sd.rationale)
       ? `<span class="sr-quote">${esc(sd.rationale)}</span>` : "";
     const codes = arr(sd.reason_codes);
     $("spyder-reason-codes").innerHTML = codes.length
       ? codes.map((c) => `<span class="chip reason-code">${esc(c)}</span>`).join("")
       : (offline ? "" : '<span class="chip ok">no flags</span>');
+
+    // Chart with prediction overlay
+    drawSpyderChart();
 
     // Head-to-head, ledger, positions, trades
     renderSpyderVs(paper);
@@ -1656,6 +1660,200 @@
         <td class="sr-cell">${esc(rationale)}</td>
       </tr>`;
     }).join("");
+  }
+
+  function renderSpyderPrediction(sd, offline) {
+    const pred = sd.prediction || null;
+    const biasEl = $("spyder-pred-bias");
+    if (!pred) {
+      if (biasEl) { biasEl.textContent = offline ? "offline" : "pending"; biasEl.className = "h2-right"; }
+      $("spyder-pred-metrics").innerHTML =
+        `<div class="metric"><span class="k">status</span><span class="v sm">${offline ? "SPY-DER offline" : "awaiting prediction"}</span></div>`;
+      $("spyder-gauges").innerHTML = "";
+      $("spyder-pred-rationale").innerHTML = "";
+      const note = $("spyder-chart-note");
+      if (note) note.textContent = offline ? "SPY-DER offline — no prediction." : "Awaiting SPY-DER prediction…";
+      return;
+    }
+    const bias = String(pred.bias || "neutral").toLowerCase();
+    if (biasEl) {
+      biasEl.textContent = bias.toUpperCase();
+      biasEl.className = "h2-right " + (bias === "bullish" ? "pos" : bias === "bearish" ? "neg" : "");
+    }
+    const spotP = num(pred.spot_at_pred), tgt = num(pred.target);
+    const drift = (spotP != null && tgt != null) ? (tgt - spotP) : null;
+    $("spyder-pred-metrics").innerHTML = [
+      metricCard("Target", tgt != null ? fmt(tgt, 2) : "—", drift > 0 ? "pos" : drift < 0 ? "neg" : ""),
+      metricCard("Range", (pred.target_low != null && pred.target_high != null)
+        ? fmt(pred.target_low, 1) + "–" + fmt(pred.target_high, 1) : "—"),
+      metricCard("Drift", drift != null ? sign(drift, 2) : "—", drift > 0 ? "pos" : drift < 0 ? "neg" : ""),
+      metricCard("Horizon", esc(pred.horizon || "eod")),
+    ].join("");
+    $("spyder-gauges").innerHTML = [
+      spyderGauge("Confidence", pred.confidence, "green"),
+      spyderGauge("Uncertainty", sd.uncertainty != null ? sd.uncertainty
+        : (pred.confidence != null ? 1 - pred.confidence : null), "amber"),
+    ].join("");
+    $("spyder-pred-rationale").innerHTML = pred.rationale
+      ? `<span class="sr-quote">${esc(pred.rationale)}</span>` : "";
+    const note = $("spyder-chart-note");
+    if (note) {
+      const src = pred.source === "grok" ? "Grok forecast" : "trader model";
+      note.textContent = `SPY-DER (${src}) projects ${bias} to ${tgt != null ? tgt.toFixed(2) : "—"} by close.`;
+    }
+  }
+
+  function renderSpyderContext(live) {
+    const inp = liveInputs(live);
+    const gexCls = num(inp.net_gex) > 0 ? "pos" : num(inp.net_gex) < 0 ? "neg" : "";
+    $("spyder-context-metrics").innerHTML = [
+      metricCard("Spot", fmt(inp.spot, 2), "info"),
+      metricCard("VWAP", fmt(inp.vwap, 2)),
+      metricCard("Call wall", fmt(inp.call_wall, 1)),
+      metricCard("Put wall", fmt(inp.put_wall, 1)),
+      metricCard("γ-flip", fmt(inp.gamma_flip, 1)),
+      metricCard("Net GEX", compact(inp.net_gex), gexCls),
+      metricCard("Exp. range", inp.expected_range != null ? "±" + fmt(inp.expected_range, 2) : "—"),
+      metricCard("VIX", fmt(inp.vix, 1)),
+      metricCard("RSI", fmt(inp.rsi, 0)),
+      metricCard("ADX", fmt(inp.adx, 0)),
+    ].join("");
+  }
+
+  // Self-contained chart for the SPY-DER tab: the legacy visual language
+  // (spot line, walls, VWAP, γ-flip, now-divider, close projection) plus
+  // SPY-DER's own prediction drawn into the projection region — an orange
+  // confidence cone, a directional path, and the target marker.
+  function drawSpyderChart() {
+    const cv = $("spyder-chart");
+    if (!cv || !lastChartData) return;
+    const { ticks, live, market } = lastChartData;
+    const inp = liveInputs(live);
+    const pred = spyderDecision(live).prediction || null;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = cv.clientHeight;
+    if (!W || !H) return;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const ctx = cv.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const padL = 8, padR = 62, padT = 12, padB = 22;
+    const plotW = W - padL - padR, plotH = H - padT - padB;
+    const pts = ticks.map((t) => ({ ts: new Date(t.ts).getTime(), spot: num(t.spot) }))
+      .filter((p) => p.spot != null && isFinite(p.ts));
+    if (!pts.length) {
+      ctx.fillStyle = "#5b6a86"; ctx.font = "13px ui-monospace, monospace";
+      ctx.textAlign = "center"; ctx.fillText("Waiting for intraday ticks…", W / 2, H / 2);
+      return;
+    }
+
+    const spot = num(inp.spot) != null ? num(inp.spot) : pts[pts.length - 1].spot;
+    const vwap = num(inp.vwap), callWall = num(inp.call_wall),
+          putWall = num(inp.put_wall), gammaFlip = num(inp.gamma_flip);
+    let band = num(inp.expected_range);
+    if (!band || band <= 0) { const be = num(inp.straddle_breakeven); if (be) band = Math.abs(be - spot); }
+    if (!band || band <= 0) band = spot * 0.004;
+    band = Math.min(band, spot * 0.05);
+
+    const t0 = pts[0].ts, tLast = pts[pts.length - 1].ts;
+    let tEnd = tLast;
+    if (market && market.is_open && market.next_close) {
+      const nc = new Date(market.next_close).getTime();
+      if (nc > tLast) tEnd = nc;
+    }
+    if (tEnd <= tLast) tEnd = tLast + Math.max((tLast - t0) * 0.25, 20 * 60 * 1000);
+    const xNow = padL + plotW * 0.68;
+    const X = (ts) => {
+      if (ts <= tLast) { const f = tLast > t0 ? (ts - t0) / (tLast - t0) : 1; return padL + f * (xNow - padL); }
+      const f = tEnd > tLast ? (ts - tLast) / (tEnd - tLast) : 0;
+      return xNow + f * (padL + plotW - xNow);
+    };
+
+    const lows = [spot - band], highs = [spot + band];
+    pts.forEach((p) => { lows.push(p.spot); highs.push(p.spot); });
+    [vwap, callWall, putWall, gammaFlip].forEach((v) => { if (v != null) { lows.push(v); highs.push(v); } });
+    if (pred) [pred.target, pred.target_low, pred.target_high].forEach((v) => {
+      const n = num(v); if (n != null) { lows.push(n); highs.push(n); }
+    });
+    let lo = Math.min(...lows), hi = Math.max(...highs);
+    const pad = (hi - lo) * 0.08 || 1; lo -= pad; hi += pad;
+    const Y = (p) => padT + (1 - (p - lo) / (hi - lo)) * plotH;
+
+    ctx.font = "10px ui-monospace, monospace"; ctx.textAlign = "left";
+    for (let i = 0; i <= 5; i++) {
+      const p = lo + (i / 5) * (hi - lo), y = Y(p);
+      ctx.strokeStyle = "rgba(255,255,255,0.045)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+      ctx.fillStyle = "#5b6a86"; ctx.fillText(p.toFixed(1), padL + plotW + 6, y + 3);
+    }
+    ctx.textAlign = "center"; ctx.fillStyle = "#5b6a86";
+    for (let i = 0; i <= 4; i++) {
+      const x = padL + (i / 4) * plotW;
+      const ts = x <= xNow
+        ? t0 + ((x - padL) / Math.max(xNow - padL, 1e-9)) * (tLast - t0)
+        : tLast + ((x - xNow) / Math.max(padL + plotW - xNow, 1e-9)) * (tEnd - tLast);
+      ctx.fillText(new Date(ts).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" }), x, H - 6);
+    }
+
+    ctx.save(); ctx.beginPath(); ctx.rect(padL, padT, plotW, plotH); ctx.clip();
+
+    ctx.strokeStyle = "rgba(157,123,255,0.35)"; ctx.setLineDash([3, 4]);
+    ctx.beginPath(); ctx.moveTo(xNow, padT); ctx.lineTo(xNow, padT + plotH); ctx.stroke();
+    ctx.setLineDash([]); ctx.fillStyle = "#9d7bff"; ctx.textAlign = "center";
+    ctx.fillText("now", xNow, padT + 9);
+
+    const level = (v, color, label, dash) => {
+      if (v == null) return;
+      const y = Y(v);
+      ctx.strokeStyle = color; ctx.lineWidth = 1.25; ctx.setLineDash(dash ? [5, 4] : []);
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+      ctx.setLineDash([]); ctx.fillStyle = color; ctx.textAlign = "left";
+      ctx.font = "9px ui-monospace, monospace"; ctx.fillText(label, padL + 2, y - 3);
+    };
+    level(callWall, "#ff5470", "CALL WALL", false);
+    level(putWall, "#2ec785", "PUT WALL", false);
+    level(gammaFlip, "#ffb648", "γ-FLIP", true);
+    level(vwap, "#4aa8ff", "VWAP", true);
+
+    // --- SPY-DER prediction overlay (orange) ---
+    if (pred) {
+      const tgt = num(pred.target), tlo = num(pred.target_low), thi = num(pred.target_high);
+      const xEnd = X(tEnd);
+      if (tlo != null && thi != null) {
+        const grad = ctx.createLinearGradient(xNow, 0, xEnd, 0);
+        grad.addColorStop(0, "rgba(240,163,94,0.03)"); grad.addColorStop(1, "rgba(240,163,94,0.22)");
+        ctx.fillStyle = grad;
+        ctx.beginPath(); ctx.moveTo(xNow, Y(spot)); ctx.lineTo(xEnd, Y(thi)); ctx.lineTo(xEnd, Y(tlo)); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = "rgba(240,163,94,0.55)"; ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.moveTo(xNow, Y(spot)); ctx.lineTo(xEnd, Y(thi)); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(xNow, Y(spot)); ctx.lineTo(xEnd, Y(tlo)); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#f0a35e"; ctx.textAlign = "right"; ctx.font = "9px ui-monospace, monospace";
+        ctx.fillText(thi.toFixed(1), xEnd - 2, Y(thi) + 10);
+        ctx.fillText(tlo.toFixed(1), xEnd - 2, Y(tlo) - 3);
+      }
+      if (tgt != null) {
+        ctx.strokeStyle = "#f0a35e"; ctx.lineWidth = 1.75;
+        ctx.beginPath(); ctx.moveTo(xNow, Y(spot)); ctx.lineTo(xEnd, Y(tgt)); ctx.stroke();
+        ctx.fillStyle = "#f0a35e";
+        ctx.beginPath(); ctx.arc(xEnd, Y(tgt), 4, 0, Math.PI * 2); ctx.fill();
+        ctx.textAlign = "right"; ctx.font = "10px ui-monospace, monospace";
+        ctx.fillText("⊙ " + tgt.toFixed(2), xEnd - 8, Y(tgt) - 6);
+      }
+    }
+
+    const areaGrad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+    areaGrad.addColorStop(0, "rgba(230,237,247,0.14)"); areaGrad.addColorStop(1, "rgba(230,237,247,0)");
+    ctx.beginPath(); pts.forEach((p, i) => { const x = X(p.ts), y = Y(p.spot); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.lineTo(X(pts[pts.length - 1].ts), padT + plotH); ctx.lineTo(X(pts[0].ts), padT + plotH); ctx.closePath();
+    ctx.fillStyle = areaGrad; ctx.fill();
+    ctx.beginPath(); pts.forEach((p, i) => { const x = X(p.ts), y = Y(p.spot); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.strokeStyle = "#e6edf7"; ctx.lineWidth = 1.75; ctx.stroke();
+    const lastP = pts[pts.length - 1];
+    ctx.fillStyle = "#e6edf7"; ctx.beginPath(); ctx.arc(X(lastP.ts), Y(lastP.spot), 3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
   }
 
   /* ---------------- system edge ---------------- */
@@ -3604,7 +3802,7 @@
   let resizeRAF = null;
   window.addEventListener("resize", () => {
     if (resizeRAF) cancelAnimationFrame(resizeRAF);
-    resizeRAF = requestAnimationFrame(() => { drawChart(); drawQuadrant(); });
+    resizeRAF = requestAnimationFrame(() => { drawChart(); drawQuadrant(); if (activeTab === "spyder") drawSpyderChart(); });
   });
 
   async function init() {

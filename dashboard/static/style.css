@@ -920,34 +920,29 @@ html, body {
 /* ============================================================
    SPY-DER tab — the AI agent's own dashboard
    ============================================================ */
-.spyder-view {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 14px;
-  padding: 14px 18px 28px;
-  max-width: 1600px; margin: 0 auto;
-  align-items: start;
-}
-.spyder-view .panel { min-width: 0; }
-.spyder-hero, .spyder-wide, #spyder-vs-panel { grid-column: 1 / -1; }
-@media (max-width: 860px) { .spyder-view { grid-template-columns: 1fr; } }
+/* SPY-DER tab reuses the legacy .grid (3 columns); the trades panel spans it. */
+#view-spyder .spyder-wide { grid-column: 1 / -1; }
+#spyder-chart-panel .chart-wrap { height: 340px; }
+/* Head-to-head sits in the narrow right column — stack the two cards. */
+#spyder-vs-board { grid-template-columns: 1fr; }
 
 /* hero */
 .spyder-hero {
   background: linear-gradient(135deg, rgba(240,163,94,0.10), rgba(157,123,255,0.05)), var(--panel);
   border-color: rgba(240,163,94,0.30);
+  display: flex; flex-direction: column; gap: 12px;
 }
-.spyder-hero-main { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
-.spyder-brand { display: flex; flex-direction: column; gap: 4px; min-width: 150px; }
-.spyder-logo { font-family: var(--mono); font-weight: 800; font-size: 22px; letter-spacing: 0.14em; color: #f0a35e; }
+.spyder-brand { display: flex; flex-direction: column; gap: 3px; }
+.spyder-logo { font-family: var(--mono); font-weight: 800; font-size: 20px; letter-spacing: 0.14em; color: #f0a35e; }
 .spyder-tag { font-size: 11px; color: var(--muted); letter-spacing: 0.03em; }
-.spyder-verdict { flex: 1 1 260px; text-align: center; }
-.spyder-verdict .sv-word { font-family: var(--mono); font-size: 40px; font-weight: 800; letter-spacing: 0.04em; line-height: 1; }
-.spyder-verdict .sv-sub { margin: 8px auto 0; color: var(--muted); font-size: 12px; max-width: 520px; line-height: 1.4; }
+.spyder-verdict { text-align: center; padding: 4px 0; }
+.spyder-verdict .sv-word { font-family: var(--mono); font-size: 38px; font-weight: 800; letter-spacing: 0.04em; line-height: 1; }
+.spyder-verdict .sv-sub { margin: 8px auto 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
 .spyder-verdict.sv-go .sv-word { color: var(--green); text-shadow: 0 0 26px rgba(46,199,133,0.40); }
 .spyder-verdict.sv-wait .sv-word { color: var(--amber); }
 .spyder-verdict.sv-off .sv-word { color: var(--muted-2); }
-.spyder-idcol { display: flex; flex-direction: column; gap: 6px; min-width: 190px; }
+.spyder-idcol { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); padding-top: 10px; }
+.swatch-spyder { display: inline-block; width: 16px; height: 9px; border-radius: 2px; background: linear-gradient(90deg, rgba(240,163,94,0.15), rgba(240,163,94,0.5)); vertical-align: middle; }
 .sid-row { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
 .sid-k { color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; }
 .sid-v { font-weight: 600; font-size: 13px; }
