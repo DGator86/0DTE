@@ -807,6 +807,17 @@ class UnifiedOrchestrator:
                 if v3_only is not None:
                     annotated = [v3_only]
             snap_id = str(signals.get("_snapshot_id") or signals.get("snapshot_id") or "")
+            # NOTE: do NOT forward regime vetoes as SPY-DER hard vetoes. In the
+            # package a hard veto absolutely blocks candidate selection (raises
+            # "hard veto blocks candidate selection"), so passing the regime's
+            # structural vetoes — short-gamma, catalyst, etc., which are almost
+            # always present on a directional tick and which legacy trades
+            # through — made SPY-DER ABSTAIN on every tick and never trade.
+            # SPY-DER only chooses among already-vetted shadow candidates, and
+            # the paper broker (warmup, cooldowns, prob/size guards) plus
+            # SPY-DER's own authority handle risk. A genuine no-trade regime
+            # yields no candidates, so `annotated` is empty and the bridge
+            # returns NO_EDGE before any model call.
             sd = decide_spy_der_tick(
                 snapshot_id=snap_id or f"tick-{int(tick_now.timestamp())}",
                 symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
@@ -814,7 +825,7 @@ class UnifiedOrchestrator:
                 underlying_price=spot,
                 shadow_candidates=annotated,
                 now=tick_now,
-                hard_vetoes=tuple(str(v) for v in (regime_state.vetoes or [])),
+                hard_vetoes=(),
             )
             self._tick_spy_der = sd.as_parallel_payload()
             # SPY-DER reads the chart/market context and draws a prediction.
