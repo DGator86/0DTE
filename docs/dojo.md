@@ -88,6 +88,19 @@ market archetypes (day-scale chain)
 Reports persist to `journal.validation_reports` (`report_type='dojo'`,
 served at `/api/dojo`) and as JSON under `reports/dojo/`.
 
+### Reproducibility
+
+Every report's `universe` phase carries the **complete** generative model in
+`simulator` (both transition matrices, the variable tables, the breakout
+table, and all price/gap/chain/snapshot/initial-regime/jitter constants via
+`gen_params`) plus a `simulator_hash` (SHA256 of its canonical JSON) and the
+run's `git_commit`. `matrix_universe._GEN_PARAMS` is the single source of
+truth the generation code reads from, so the serialized config can never
+silently diverge from the worlds it produced. A universe is exactly
+reproducible from its `UniverseSpec` (`seed, archetype, tilt, vol, jitter,
+generation`) plus that config block; two reports with the same
+`simulator_hash` were generated under identical constants.
+
 ## Honest limits (read this)
 
 - The universe simulator is built from the system's **own thesis** (dealer

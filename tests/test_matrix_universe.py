@@ -280,7 +280,8 @@ def test_skew_ou_target_follows_override_fast():
     val2 = mid
     for _ in range(15):
         val2 = ch2.step("breakout", "low")  # sustained up-breakout
-    assert val2 < mid                        # moved toward the call bid
+    # symmetric assertion: >50% of the way toward the call-heavy target
+    assert (mid - val2) / (mid - lo) > 0.5
 
 
 def test_override_does_not_change_non_overridden_vars():
@@ -303,3 +304,41 @@ def test_simulator_config_is_self_describing():
     assert cfg["breakout_p_up"]["squeeze_melt_up"] > 0.5
     assert set(cfg["var_targets"]) == {"gex", "rv", "vrp", "skew", "drift"}
     assert cfg["var_ou_theta"]["skew"] >= 0.08      # responsiveness pinned
+
+
+def test_simulator_config_is_complete():
+    """The config must carry EVERY generative layer, not just the recently
+    touched params — the transition matrices, var preference, and all the
+    inline price/gap/chain/snapshot params via gen_params."""
+    from matrix_universe import (simulator_config, _ARCH_TRANSITION,
+                                 _REGIME_TRANSITION, _GEN_PARAMS)
+    cfg = simulator_config()
+    assert cfg["arch_transition"] == _ARCH_TRANSITION
+    assert cfg["regime_transition"] == _REGIME_TRANSITION
+    gp = cfg["gen_params"]
+    for block in ("session", "gap", "price_process", "dealer_map", "bars",
+                  "chain", "snapshot_map", "initial_regime", "jitter", "floors"):
+        assert block in gp, block
+    # key price-path coefficients are present
+    assert gp["price_process"]["breakout_drift"] == 0.12
+    assert gp["chain"]["strike_span"] == 25.0
+    assert gp["gap"]["gap_shock_p_down"] == 0.6
+    # returned config is a copy — mutating it must not corrupt the module state
+    gp["price_process"]["breakout_drift"] = 999.0
+    assert _GEN_PARAMS["price_process"]["breakout_drift"] == 0.12
+
+
+def test_simulator_config_hash_is_stable_and_content_sensitive():
+    """Same constants -> same hash across calls; a changed constant -> a
+    different hash (so a forgotten version bump can't hide a model change)."""
+    from matrix_universe import simulator_config_hash, _GEN_PARAMS
+    h1 = simulator_config_hash()
+    assert h1 == simulator_config_hash()
+    assert len(h1) == 64                            # sha256 hex
+    saved = _GEN_PARAMS["price_process"]["breakout_drift"]
+    _GEN_PARAMS["price_process"]["breakout_drift"] = saved + 0.01
+    try:
+        assert simulator_config_hash() != h1
+    finally:
+        _GEN_PARAMS["price_process"]["breakout_drift"] = saved
+    assert simulator_config_hash() == h1            # restored

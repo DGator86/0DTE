@@ -48,9 +48,11 @@ NOT financial advice.
 """
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import hashlib
 import itertools
+import json
 import math
 from dataclasses import dataclass, field, replace
 from typing import Optional
@@ -242,30 +244,107 @@ def _breakout_direction(archetype: str, rng: np.random.Generator) -> float:
     return 1.0 if rng.random() < p_up else -1.0
 
 
-# Bump when any generative constant below changes (breakout probabilities,
-# skew/OU parameters, targets, transition matrices). A stored dojo report
-# records this + the tables via simulator_config(), so a universe result is
-# reproducible without pinning the exact commit.
-_SIMULATOR_VERSION = "2026.07.24"
+# Human-readable tag; bump on any generative change. It is a label, NOT the
+# source of truth — simulator_config_hash() fingerprints the actual constants,
+# so a forgotten version bump can't hide a changed model.
+_SIMULATOR_VERSION = "2026.07.25"
+
+# Every material generative constant in ONE place: the single source of truth
+# read by the generation code (_generate / _chain / snapshot / _initial_regime
+# / lattice) AND serialized by simulator_config(). Changing a value here moves
+# both the generated worlds and the config hash together, so a stored report
+# can never silently diverge from the code that produced it.
+_GEN_PARAMS: dict = {
+    "session": {
+        "start_date": "2026-06-01",
+        "lookback_minutes": 2340,
+        "pin_overnight_drift_lo": -2,
+        "pin_overnight_drift_hi": 3,
+    },
+    "floors": {"rv": 0.04, "vrp": 0.75},
+    "gap": {
+        "base_vol": 0.003,
+        "mu_by_archetype": {"crash": -0.008, "squeeze_melt_up": 0.005},
+        "gap_shock_mu": 0.012,
+        "gap_shock_p_down": 0.6,
+    },
+    "price_process": {
+        "pin_pull": 0.012,
+        "compression_pull": 0.006,
+        "compression_noise": 0.6,
+        "drift_base": 0.06,
+        "drift_noise": 1.0,
+        "breakout_drift": 0.12,
+        "breakout_noise": 1.4,
+    },
+    "dealer_map": {
+        "flip_long_offset": -4.0,   # pin + offset when net gamma > 0
+        "flip_short_offset": 2.0,   # spot + offset when net gamma <= 0
+        "call_wall_offset": 5.0,
+        "put_wall_offset": 5.0,
+    },
+    "bars": {"spread_sigma": 0.0004, "volume_low": 2000, "volume_high": 30000},
+    "chain": {
+        "strike_span": 25.0, "strike_step": 1.0, "rate": 0.05,
+        "min_vol": 0.0006, "spread_base": 0.012, "spread_factor": 0.002,
+    },
+    "snapshot_map": {
+        "iv_to_points": 100.0,
+        "vix9d_trend": 1.06, "vix9d_calm": 0.94,
+        "vix3m_trend": 0.95, "vix3m_calm": 1.12,
+        "vvix_stressed": 112.0, "vvix_trend": 103.0, "vvix_calm": 90.0,
+        "vvix_baseline": 95.0,
+        "tick_stressed": 820.0, "tick_trend": 700.0, "tick_calm": 450.0,
+        "stressed_archetypes": ["crash", "vol_expansion", "gap_shock"],
+    },
+    "initial_regime": {
+        "prefer": {
+            "calm_pin": "pin", "grind_up": "drift_up",
+            "grind_down": "drift_down", "range_chop": "pin",
+            "vol_expansion": "breakout", "squeeze_melt_up": "drift_up",
+            "crash": "drift_down", "gap_shock": "compression",
+        },
+        "prefer_prob": 0.7,
+    },
+    "jitter": {"per_generation": 0.02, "cap": 0.10},
+}
 
 
 def simulator_config() -> dict:
-    """Self-describing snapshot of the constants that shape generated worlds.
-    Serialized into every dojo report so `(seed, archetype, tilt, vol,
-    jitter, generation)` plus this block fully determine a universe — the
-    breakout-direction table and OU/skew parameters no longer live only in
-    the source at a given commit."""
+    """Complete, canonical snapshot of EVERY generative constant: both
+    transition matrices, the variable tables, the breakout-direction table,
+    and all the _GEN_PARAMS blocks (gap / price process / dealer map / chain
+    pricing / snapshot mapping / initial-regime rules / jitter schedule).
+    Together with a universe's (seed, archetype, tilt, vol, jitter, generation)
+    this determines the world for a given code version. simulator_config_hash()
+    fingerprints it, and the dojo report records the git commit alongside — so
+    a stored result is fully auditable without diffing source."""
     return {
         "version": _SIMULATOR_VERSION,
         "archetypes": list(ARCHETYPES),
         "regimes": list(REGIMES),
-        "breakout_p_up": dict(_BREAKOUT_P_UP),
+        "var_states": list(VAR_STATES),
+        "arch_transition": {k: dict(v) for k, v in _ARCH_TRANSITION.items()},
+        "regime_transition": {a: {s: dict(r) for s, r in rows.items()}
+                              for a, rows in _REGIME_TRANSITION.items()},
+        "var_preference": {k: dict(v) for k, v in _VAR_PREFERENCE.items()},
         "var_targets": {k: dict(v) for k, v in _VAR_TARGETS.items()},
         "var_ou_theta": dict(_VAR_OU_THETA),
         "var_ou_noise": dict(_VAR_OU_NOISE),
         "var_stay": _VAR_STAY,
         "var_pull": _VAR_PULL,
+        "breakout_p_up": dict(_BREAKOUT_P_UP),
+        "gen_params": copy.deepcopy(_GEN_PARAMS),
     }
+
+
+def simulator_config_hash() -> str:
+    """SHA256 over the canonical JSON of simulator_config() — a stable
+    fingerprint of the entire generative model. Two reports share a hash iff
+    they were generated under identical constants, regardless of version-string
+    hygiene."""
+    blob = json.dumps(simulator_config(), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
 
 # Numeric targets per variable state. GEX in $bn gamma notional, vols
 # annualized, drift as fraction of minute-vol, skew in smile-slope units.
@@ -402,7 +481,8 @@ class UniverseCatalog:
         # Generation 0 spars on the canonical matrices; later generations add
         # growing (capped) Dirichlet jitter so no two generations replay the
         # exact same dynamics.
-        jitter = min(0.02 * self.generation, 0.10)
+        _j = _GEN_PARAMS["jitter"]
+        jitter = min(_j["per_generation"] * self.generation, _j["cap"])
         for i, (arch, tilt, vol) in enumerate(
                 itertools.product(ARCHETYPES, self.tilts, self.vol_mults)):
             seed = self.seed + 1000 * self.generation + i
@@ -514,10 +594,16 @@ class MarkovWorldFeed:
             "drift": VariableChain("drift", np.random.default_rng(sp.seed + 99)),
         }
 
+        # bind generative constants once (single source of truth: _GEN_PARAMS)
+        gp = _GEN_PARAMS
+        sess, gapp, pp = gp["session"], gp["gap"], gp["price_process"]
+        dm, barp, flr = gp["dealer_map"], gp["bars"], gp["floors"]
+
         ts, close, gex, pins, ivs, flips, skews = [], [], [], [], [], [], []
         spot = sp.base_spot
         pin = round(spot)
-        start = dt.datetime(2026, 6, 1, 9, 30, tzinfo=ET)
+        sy, sm, sd = (int(x) for x in sess["start_date"].split("-"))
+        start = dt.datetime(sy, sm, sd, 9, 30, tzinfo=ET)
         day0 = start.date()
         archetype = sp.start_archetype
 
@@ -539,12 +625,14 @@ class MarkovWorldFeed:
 
             # overnight gap: archetype-conditioned. gap_shock gaps BOTH ways
             # (down-biased 60/40) — a shock archetype, not a crash rehearsal.
-            gap_vol = 0.003 * sp.gap_mult
-            gap_mu = {"crash": -0.008, "squeeze_melt_up": 0.005}.get(archetype, 0.0)
+            gap_vol = gapp["base_vol"] * sp.gap_mult
+            gap_mu = gapp["mu_by_archetype"].get(archetype, 0.0)
             if archetype == "gap_shock":
-                gap_mu = 0.012 * (-1.0 if rng_path.random() < 0.6 else 1.0)
+                gap_mu = gapp["gap_shock_mu"] * (
+                    -1.0 if rng_path.random() < gapp["gap_shock_p_down"] else 1.0)
             spot *= math.exp(rng_path.normal(gap_mu, gap_vol))
-            pin = round(pin + rng_path.integers(-2, 3))
+            pin = round(pin + rng_path.integers(
+                sess["pin_overnight_drift_lo"], sess["pin_overnight_drift_hi"]))
 
             regime = _initial_regime(archetype, rng_regime)
             open_dt = dt.datetime(date.year, date.month, date.day, 9, 30, tzinfo=ET)
@@ -560,23 +648,28 @@ class MarkovWorldFeed:
                 occupancy[regime] += 1
 
                 g = chains["gex"].step(regime)
-                rv = max(chains["rv"].step(regime), 0.04)
-                vrp = max(chains["vrp"].step(regime), 0.75)
+                rv = max(chains["rv"].step(regime), flr["rv"])
+                vrp = max(chains["vrp"].step(regime), flr["vrp"])
                 # skew tracks the intended/latent move direction (see _skew_state)
                 skew = chains["skew"].step(regime, _skew_state(regime, breakout_dir))
                 drift = chains["drift"].step(regime)
 
                 sig_min = rv / math.sqrt(MINUTES_PER_YEAR)
+                z = rng_micro.standard_normal()
                 if regime == "pin":
-                    step = 0.012 * (pin - spot) / spot + sig_min * rng_micro.standard_normal()
+                    step = pp["pin_pull"] * (pin - spot) / spot + sig_min * z
                 elif regime == "compression":
-                    step = 0.006 * (pin - spot) / spot + 0.6 * sig_min * rng_micro.standard_normal()
+                    step = pp["compression_pull"] * (pin - spot) / spot \
+                        + pp["compression_noise"] * sig_min * z
                 elif regime == "drift_up":
-                    step = (0.06 + max(drift, 0.0)) * sig_min + sig_min * rng_micro.standard_normal()
+                    step = (pp["drift_base"] + max(drift, 0.0)) * sig_min \
+                        + pp["drift_noise"] * sig_min * z
                 elif regime == "drift_down":
-                    step = -(0.06 + max(-drift, 0.0)) * sig_min + sig_min * rng_micro.standard_normal()
+                    step = -(pp["drift_base"] + max(-drift, 0.0)) * sig_min \
+                        + pp["drift_noise"] * sig_min * z
                 else:  # breakout
-                    step = breakout_dir * 0.12 * sig_min + 1.4 * sig_min * rng_micro.standard_normal()
+                    step = breakout_dir * pp["breakout_drift"] * sig_min \
+                        + pp["breakout_noise"] * sig_min * z
                 spot *= (1.0 + step)
 
                 ts.append(open_dt + dt.timedelta(minutes=m))
@@ -587,7 +680,8 @@ class MarkovWorldFeed:
                 skews.append(skew)
                 # flip sits below spot when dealers are long, chases from
                 # above when they are short — same convention as the live map
-                flips.append(pin - 4.0 if g > 0 else spot + 2.0)
+                flips.append(pin + dm["flip_long_offset"] if g > 0
+                             else spot + dm["flip_short_offset"])
                 self.situation_log.append(SituationLabel(iso, archetype, regime))
 
             self.day_close[iso] = spot
@@ -599,10 +693,11 @@ class MarkovWorldFeed:
         self._dt = ts
         self._close = close_a
         self._open = np.concatenate([[close_a[0]], close_a[:-1]])
-        spread = np.abs(rng_micro.normal(0.0, 0.0004, n)) * close_a
+        spread = np.abs(rng_micro.normal(0.0, barp["spread_sigma"], n)) * close_a
         self._high = np.maximum(self._open, close_a) + spread
         self._low = np.minimum(self._open, close_a) - spread
-        self._vol = rng_micro.integers(2_000, 30_000, n).astype(float)
+        self._vol = rng_micro.integers(
+            barp["volume_low"], barp["volume_high"], n).astype(float)
         self._gex = np.asarray(gex)
         self._pin = np.asarray(pins)
         self._iv = np.asarray(ivs)
@@ -614,24 +709,26 @@ class MarkovWorldFeed:
         spot = float(self._close[i])
         minute = i % MIN_PER_DAY
         minutes_left = max(MIN_PER_DAY - minute, 5)
+        cp = _GEN_PARAMS["chain"]
         t_years = minutes_left / (365.25 * 24 * 60)
-        r = 0.05
+        r = cp["rate"]
         DF = math.exp(-r * t_years)
         F = spot / DF
         s_atm = self._iv[i] * math.sqrt(minutes_left / MINUTES_PER_YEAR)
         smile_skew = float(self._skew[i])
 
         qs = []
-        lo = math.floor(spot - 25.0)
-        for K in np.arange(lo, spot + 26.0, 1.0):
+        span, stepK = cp["strike_span"], cp["strike_step"]
+        lo = math.floor(spot - span)
+        for K in np.arange(lo, spot + span + 1.0, stepK):
             if K <= 0:
                 continue
             k = math.log(K / F)
-            s = max(s_atm - smile_skew * k, 0.0006)
+            s = max(s_atm - smile_skew * k, cp["min_vol"])
             cm = _bs_call_fwd(F, K, s) * DF
             pm = max(cm - DF * (F - K), 0.0)
             cm = max(cm, 0.0)
-            h = 0.012 + 0.002 * max(cm, pm)
+            h = cp["spread_base"] + cp["spread_factor"] * max(cm, pm)
             qs.append(ChainQuote(float(K), max(cm - h, 0.0), cm + h,
                                  max(pm - h, 0.0), pm + h))
         return ChainSnapshot(qs, spot=spot, t_years=t_years, r=r)
@@ -646,7 +743,7 @@ class MarkovWorldFeed:
             return None
         self._idx += 1
 
-        lo = max(0, i + 1 - 2340)
+        lo = max(0, i + 1 - _GEN_PARAMS["session"]["lookback_minutes"])
         bars = RawBars(ts=self._ts[lo:i + 1], open=self._open[lo:i + 1],
                        high=self._high[lo:i + 1], low=self._low[lo:i + 1],
                        close=self._close[lo:i + 1], volume=self._vol[lo:i + 1])
@@ -665,25 +762,30 @@ class MarkovWorldFeed:
         iv = float(self._iv[i])
         expected_range = spot * iv * math.sqrt(minutes_left / MINUTES_PER_YEAR)
 
-        iv_pts = iv * 100.0
+        sm_ = _GEN_PARAMS["snapshot_map"]
+        dm_ = _GEN_PARAMS["dealer_map"]
+        iv_pts = iv * sm_["iv_to_points"]
         trending = g <= 0
         label = self.situation_log[i]
-        stressed = label.archetype in ("crash", "vol_expansion", "gap_shock")
+        stressed = label.archetype in tuple(sm_["stressed_archetypes"])
         market = MarketSnapshot(
             spot=spot, net_gex=g, gamma_flip=float(self._flip[i]),
-            call_wall=pin + 5.0, put_wall=pin - 5.0,
+            call_wall=pin + dm_["call_wall_offset"],
+            put_wall=pin - dm_["put_wall_offset"],
             gex_pct_rank=self._gex_rank.rank(g),
             gex_rank_warm=self._gex_rank.is_warm,
-            vix9d=iv_pts * (1.06 if trending else 0.94),
+            vix9d=iv_pts * (sm_["vix9d_trend"] if trending else sm_["vix9d_calm"]),
             vix=iv_pts,
-            vix3m=iv_pts * (0.95 if trending else 1.12),
-            vvix=112.0 if stressed else (103.0 if trending else 90.0),
-            vvix_baseline=95.0,
+            vix3m=iv_pts * (sm_["vix3m_trend"] if trending else sm_["vix3m_calm"]),
+            vvix=(sm_["vvix_stressed"] if stressed
+                  else (sm_["vvix_trend"] if trending else sm_["vvix_calm"])),
+            vvix_baseline=sm_["vvix_baseline"],
             straddle_breakeven=straddle, expected_range=expected_range,
             adx=tech["adx"], rsi=tech["rsi"],
             bb_width=tech["bb_width"], bb_width_baseline=tech["bb_width_baseline"],
             vwap=vwap, vwap_reversion_count=vwap_rev,
-            tick_abs_mean=820.0 if stressed else (700.0 if trending else 450.0),
+            tick_abs_mean=(sm_["tick_stressed"] if stressed
+                           else (sm_["tick_trend"] if trending else sm_["tick_calm"])),
             cvd_slope=tech["cvd_slope"],
             now=self._dt[i], has_catalyst=False,
         )
@@ -717,13 +819,9 @@ def _norm(row: dict[str, float]) -> list[float]:
 
 
 def _initial_regime(archetype: str, rng: np.random.Generator) -> str:
-    prefer = {
-        "calm_pin": "pin", "grind_up": "drift_up", "grind_down": "drift_down",
-        "range_chop": "pin", "vol_expansion": "breakout",
-        "squeeze_melt_up": "drift_up", "crash": "drift_down",
-        "gap_shock": "compression",
-    }[archetype]
-    return prefer if rng.random() < 0.7 else str(rng.choice(list(REGIMES)))
+    ir = _GEN_PARAMS["initial_regime"]
+    prefer = ir["prefer"][archetype]
+    return prefer if rng.random() < ir["prefer_prob"] else str(rng.choice(list(REGIMES)))
 
 
 def merge_coverage(feeds: list[MarkovWorldFeed],
