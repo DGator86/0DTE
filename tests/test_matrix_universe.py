@@ -211,3 +211,49 @@ def test_evaluated_coverage_counts_strided_ticks():
     merged = merge_coverage([feed], evaluated=True)
     assert sum(n for regs in merged.values() for n in regs.values()) == \
         len(feed.timestamps())
+
+
+# --------------------------------------------------------------------------- #
+# direction-dependent skew + archetype-biased breakout direction              #
+# --------------------------------------------------------------------------- #
+def test_skew_state_tracks_move_direction():
+    from matrix_universe import _skew_state
+    # up moves flatten toward the calls, down moves steepen the puts
+    assert _skew_state("drift_up", 0.0) == "low"
+    assert _skew_state("drift_down", 0.0) == "high"
+    assert _skew_state("breakout", 1.0) == "low"    # up breakout -> call bid
+    assert _skew_state("breakout", -1.0) == "high"  # down breakout -> put skew
+    assert _skew_state("pin", 1.0) == "mid"
+    assert _skew_state("compression", -1.0) == "mid"
+
+
+def test_breakout_direction_biased_by_archetype():
+    from matrix_universe import _breakout_direction
+    rng = np.random.default_rng(0)
+    crash_up = sum(_breakout_direction("crash", rng) > 0 for _ in range(2000))
+    squeeze_up = sum(_breakout_direction("squeeze_melt_up", rng) > 0
+                     for _ in range(2000))
+    calm_up = sum(_breakout_direction("calm_pin", rng) > 0 for _ in range(2000))
+    assert crash_up / 2000 < 0.2          # crash breaks down
+    assert squeeze_up / 2000 > 0.8        # squeeze breaks up
+    assert 0.4 < calm_up / 2000 < 0.6     # symmetric default
+
+
+def test_upside_archetype_is_call_skewed_downside_is_put_skewed():
+    """Coherence: a squeeze_melt_up world should carry a lower (more
+    call-heavy) mean smile slope than a crash world, since its moves resolve
+    up and skew follows direction."""
+    up = np.mean([MarkovWorldFeed(_spec(start_archetype="squeeze_melt_up",
+                                        days=1, seed=s))._skew.mean()
+                  for s in range(6)])
+    down = np.mean([MarkovWorldFeed(_spec(start_archetype="crash",
+                                          days=1, seed=s))._skew.mean()
+                    for s in range(6)])
+    assert up < down
+
+
+def test_breakout_skew_override_is_deterministic():
+    # the direction override must not break per-spec determinism
+    f1 = MarkovWorldFeed(_spec(start_archetype="vol_expansion", seed=3))
+    f2 = MarkovWorldFeed(_spec(start_archetype="vol_expansion", seed=3))
+    assert (f1._skew == f2._skew).all()

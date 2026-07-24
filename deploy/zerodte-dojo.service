@@ -2,8 +2,11 @@
 # Weekly "matrix training": recorded-tape walk-forward + adaptive learning
 # cycle + Markov-universe sparring (dojo.py). Persists a dojo report the
 # dashboard's Dojo tab (and the Vercel proxy) serves. Never auto-promotes.
+# Runs Saturday (see the timer), a day before the Sunday weekly learner —
+# they are independent scheduled jobs, so no After= ordering ties them
+# together (a boot-time After= would have been a no-op here and misleading).
 Description=0DTE dojo matrix-training run
-After=network-online.target zerodte-learn-weekly.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
