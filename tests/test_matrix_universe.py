@@ -342,3 +342,48 @@ def test_simulator_config_hash_is_stable_and_content_sensitive():
     finally:
         _GEN_PARAMS["price_process"]["breakout_drift"] = saved
     assert simulator_config_hash() == h1            # restored
+
+
+# --------------------------------------------------------------------------- #
+# Feature A: richer smile (wings + curvature)                                 #
+# --------------------------------------------------------------------------- #
+def test_smile_vol_is_convex_with_wings():
+    from matrix_universe import _smile_vol
+    s_atm, skew, curv, wing = 0.15, 0.03, 0.9, 0.20
+    v_atm = _smile_vol(s_atm, skew, curv, wing, 0.0, 0.0006)
+    v_up = _smile_vol(s_atm, skew, curv, wing, 0.05, 0.0006)
+    v_dn = _smile_vol(s_atm, skew, curv, wing, -0.05, 0.0006)
+    assert v_atm == pytest.approx(s_atm)          # ATM unchanged by shape terms
+    # both wings lift above ATM (convex + wing lift) despite the linear skew
+    assert v_up > v_atm and v_dn > v_atm
+    # convexity: the average of the two wings exceeds the linear interpolation
+    # (which for equal |k| is just s_atm) -> strictly convex
+    assert (v_up + v_dn) / 2 > v_atm
+    # skew still tilts: the put wing (negative k) is richer than the call wing
+    assert v_dn > v_up
+
+
+def test_smile_min_vol_floor():
+    from matrix_universe import _smile_vol
+    # a large negative skew could push vol below zero without the floor
+    assert _smile_vol(0.01, 5.0, 0.0, 0.0, 0.1, 0.0006) == 0.0006
+
+
+def test_stress_archetype_fattens_the_wings_at_equal_vol():
+    """Isolate SHAPE from vol level: force identical ATM iv on a stressed and a
+    calm chain, then the stressed wing must price richer purely from curvature
+    /wing multipliers."""
+    import math
+    calm = MarkovWorldFeed(_spec(start_archetype="calm_pin", days=1, seed=4))
+    stress = MarkovWorldFeed(_spec(start_archetype="crash", days=1, seed=4))
+    # pin the same iv and skew on both so only the stress multipliers differ
+    calm._iv = np.full_like(calm._iv, 0.18)
+    stress._iv = np.full_like(stress._iv, 0.18)
+    calm._skew = np.zeros_like(calm._skew)
+    stress._skew = np.zeros_like(stress._skew)
+    cc, sc = calm._chain(0), stress._chain(0)
+    spot = cc.spot
+    dist = 15.0
+    cp = min(cc.quotes, key=lambda q: abs(q.strike - (spot - dist)))
+    sp = min(sc.quotes, key=lambda q: abs(q.strike - (spot - dist)))
+    assert sp.put_mid > cp.put_mid                # stressed wing richer

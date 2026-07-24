@@ -244,10 +244,23 @@ def _breakout_direction(archetype: str, rng: np.random.Generator) -> float:
     return 1.0 if rng.random() < p_up else -1.0
 
 
+def _smile_vol(s_atm: float, skew: float, curv: float, wing: float,
+               k: float, min_vol: float) -> float:
+    """Per-strike implied vol from log-moneyness k = ln(K/F):
+
+        s(k) = s_atm - skew*k + curv*k^2 + wing*|k|
+
+    The linear term is the (direction-coherent) skew; the quadratic term is
+    smile convexity; the |k| term lifts both wings. Shape beyond a single
+    slope, so the gym can exercise convexity- and wing-sensitive structures,
+    not just the ATM skew."""
+    return max(s_atm - skew * k + curv * k * k + wing * abs(k), min_vol)
+
+
 # Human-readable tag; bump on any generative change. It is a label, NOT the
 # source of truth — simulator_config_hash() fingerprints the actual constants,
 # so a forgotten version bump can't hide a changed model.
-_SIMULATOR_VERSION = "2026.07.25"
+_SIMULATOR_VERSION = "2026.07.26"
 
 # Every material generative constant in ONE place: the single source of truth
 # read by the generation code (_generate / _chain / snapshot / _initial_regime
@@ -287,6 +300,13 @@ _GEN_PARAMS: dict = {
     "chain": {
         "strike_span": 25.0, "strike_step": 1.0, "rate": 0.05,
         "min_vol": 0.0006, "spread_base": 0.012, "spread_factor": 0.002,
+        # smile SHAPE beyond the single skew slope: a quadratic curvature term
+        # (both wings lift -> convex smile) and a linear wing lift on |k|.
+        # Stress archetypes (crash/vol_expansion/gap_shock) fatten both, so the
+        # gym can surface convexity- and wing-shaped failure modes, not just
+        # slope. s(k) = s_atm - skew*k + curv*k^2 + wing*|k|.
+        "smile_curvature": 0.9, "wing_lift": 0.20,
+        "stress_curv_mult": 2.2, "stress_wing_mult": 1.8,
     },
     "snapshot_map": {
         "iv_to_points": 100.0,
@@ -553,8 +573,15 @@ class MarkovWorldFeed:
     RNG stream per variable chain, per-tick (archetype, regime) labels in
     `situation_log`, day-level archetypes in `day_archetype`."""
 
-    def __init__(self, spec: UniverseSpec) -> None:
+    def __init__(self, spec: UniverseSpec,
+                 arch_transition: Optional[dict] = None,
+                 regime_transition: Optional[dict] = None) -> None:
+        # Optional CALIBRATED transition matrices (regime_calibration.py) that
+        # replace the canonical priors as the base layer; Dirichlet jitter, if
+        # any, is applied on top. None -> the built-in canonical matrices.
         self.spec = spec
+        self._arch_override = arch_transition
+        self._regime_override = regime_transition
         self._gex_rank = GexRankWindow()
         self._idx = 0
         self.situation_log: list[SituationLabel] = []
@@ -574,18 +601,21 @@ class MarkovWorldFeed:
         streams = master.spawn(9)
         rng_arch, rng_regime, rng_path, rng_micro = streams[:4]
 
-        # generation evolution: seeded Dirichlet perturbation of both
-        # transition layers (no-op at jitter=0 -> canonical matrices)
+        # base transition layers: calibrated overrides if supplied, else the
+        # canonical priors. Generation-evolution Dirichlet jitter (if any) is
+        # applied on top of whichever base is in force.
+        base_arch = self._arch_override or _ARCH_TRANSITION
+        base_regime = self._regime_override or _REGIME_TRANSITION
         if sp.transition_jitter > 0.0:
             rng_jit = streams[8]
-            self._arch_T = _dirichlet_rows(_ARCH_TRANSITION, rng_jit,
+            self._arch_T = _dirichlet_rows(base_arch, rng_jit,
                                            sp.transition_jitter)
             self._regime_T = {
                 arch: _dirichlet_rows(rows, rng_jit, sp.transition_jitter)
-                for arch, rows in _REGIME_TRANSITION.items()}
+                for arch, rows in base_regime.items()}
         else:
-            self._arch_T = _ARCH_TRANSITION
-            self._regime_T = _REGIME_TRANSITION
+            self._arch_T = base_arch
+            self._regime_T = base_regime
         chains = {
             "gex":   VariableChain("gex", streams[4]),
             "rv":    VariableChain("rv", streams[5], scale=sp.vol_mult),
@@ -717,6 +747,12 @@ class MarkovWorldFeed:
         s_atm = self._iv[i] * math.sqrt(minutes_left / MINUTES_PER_YEAR)
         smile_skew = float(self._skew[i])
 
+        # smile shape: convex curvature + wing lift, fattened in stress regimes
+        stressed = self.situation_log[i].archetype in tuple(
+            _GEN_PARAMS["snapshot_map"]["stressed_archetypes"])
+        curv = cp["smile_curvature"] * (cp["stress_curv_mult"] if stressed else 1.0)
+        wing = cp["wing_lift"] * (cp["stress_wing_mult"] if stressed else 1.0)
+
         qs = []
         span, stepK = cp["strike_span"], cp["strike_step"]
         lo = math.floor(spot - span)
@@ -724,7 +760,7 @@ class MarkovWorldFeed:
             if K <= 0:
                 continue
             k = math.log(K / F)
-            s = max(s_atm - smile_skew * k, cp["min_vol"])
+            s = _smile_vol(s_atm, smile_skew, curv, wing, k, cp["min_vol"])
             cm = _bs_call_fwd(F, K, s) * DF
             pm = max(cm - DF * (F - K), 0.0)
             cm = max(cm, 0.0)
