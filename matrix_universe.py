@@ -189,12 +189,16 @@ VAR_STATES = ("low", "mid", "high")
 # state so variables track regimes without being deterministic functions of
 # them (that residual randomness is what makes the matrix combinatoric).
 _VAR_PREFERENCE: dict[str, dict[str, str]] = {
+    # Skew convention: chain pricing uses s(K) = s_atm - skew*ln(K/F), so
+    # POSITIVE skew raises put-strike vol (put-heavy) and negative skew is a
+    # call bid. Hence drift_down/breakout steepen the put skew ("high") and
+    # drift_up flattens it toward the calls ("low").
     #             gex        rv       vrp      skew     drift
     "pin":         {"gex": "high", "rv": "low",  "vrp": "high", "skew": "mid",  "drift": "mid"},
-    "drift_up":    {"gex": "mid",  "rv": "mid",  "vrp": "mid",  "skew": "high", "drift": "high"},
-    "drift_down":  {"gex": "low",  "rv": "mid",  "vrp": "mid",  "skew": "low",  "drift": "low"},
+    "drift_up":    {"gex": "mid",  "rv": "mid",  "vrp": "mid",  "skew": "low",  "drift": "high"},
+    "drift_down":  {"gex": "low",  "rv": "mid",  "vrp": "mid",  "skew": "high", "drift": "low"},
     "compression": {"gex": "high", "rv": "low",  "vrp": "high", "skew": "mid",  "drift": "mid"},
-    "breakout":    {"gex": "low",  "rv": "high", "vrp": "low",  "skew": "low",  "drift": "mid"},
+    "breakout":    {"gex": "low",  "rv": "high", "vrp": "low",  "skew": "high", "drift": "mid"},
 }
 
 # Numeric targets per variable state. GEX in $bn gamma notional, vols
@@ -203,7 +207,7 @@ _VAR_TARGETS: dict[str, dict[str, float]] = {
     "gex":   {"low": -1.6e9, "mid": 0.4e9, "high": 3.2e9},
     "rv":    {"low": 0.08,   "mid": 0.14,  "high": 0.26},
     "vrp":   {"low": 0.92,   "mid": 1.10,  "high": 1.28},   # implied / realized
-    "skew":  {"low": -0.055, "mid": 0.028, "high": 0.075},  # put-heavy .. call-heavy
+    "skew":  {"low": -0.055, "mid": 0.028, "high": 0.075},  # call-heavy .. put-heavy
     "drift": {"low": -0.10,  "mid": 0.0,   "high": 0.10},   # frac of minute-vol
 }
 
@@ -261,6 +265,11 @@ class UniverseSpec:
     tick_stride: int = 1
     base_spot: float = 600.0
     generation: int = 0
+    # Seeded Dirichlet perturbation of BOTH transition layers (archetype and
+    # regime rows). 0 = the canonical matrices verbatim; >0 draws each row
+    # from Dirichlet(row / jitter), so later generations explore nearby
+    # dynamics deterministically per seed.
+    transition_jitter: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -269,12 +278,29 @@ class UniverseSpec:
             "persistence_tilt": self.persistence_tilt,
             "vol_mult": self.vol_mult, "gap_mult": self.gap_mult,
             "tick_stride": self.tick_stride, "generation": self.generation,
+            "transition_jitter": self.transition_jitter,
         }
 
 
 def _spec_id(seed: int, arch: str, tilt: float, vol: float, gen: int) -> str:
     raw = f"{seed}|{arch}|{tilt}|{vol}|{gen}"
     return hashlib.sha256(raw.encode()).hexdigest()[:10]
+
+
+def _dirichlet_rows(rows: dict[str, dict[str, float]],
+                    rng: np.random.Generator,
+                    jitter: float) -> dict[str, dict[str, float]]:
+    """Redraw each row from Dirichlet(row / jitter): the row stays a proper
+    distribution centered on the canonical one, with spread growing in
+    `jitter`. Deterministic given the caller's seeded generator."""
+    out: dict[str, dict[str, float]] = {}
+    kappa = 1.0 / max(jitter, 1e-6)
+    for state, row in rows.items():
+        keys = list(row)
+        alpha = np.array([max(row[k], 1e-4) for k in keys]) * kappa
+        sample = rng.dirichlet(alpha)
+        out[state] = {k: float(v) for k, v in zip(keys, sample)}
+    return out
 
 
 @dataclass
@@ -294,6 +320,10 @@ class UniverseCatalog:
     def lattice(self) -> list[UniverseSpec]:
         """The full combinatoric grid — every archetype × tilt × vol cell."""
         specs = []
+        # Generation 0 spars on the canonical matrices; later generations add
+        # growing (capped) Dirichlet jitter so no two generations replay the
+        # exact same dynamics.
+        jitter = min(0.02 * self.generation, 0.10)
         for i, (arch, tilt, vol) in enumerate(
                 itertools.product(ARCHETYPES, self.tilts, self.vol_mults)):
             seed = self.seed + 1000 * self.generation + i
@@ -302,7 +332,8 @@ class UniverseCatalog:
                 seed=seed, days=self.days, start_archetype=arch,
                 persistence_tilt=tilt, vol_mult=vol,
                 gap_mult=1.5 if arch in ("gap_shock", "crash") else 1.0,
-                tick_stride=self.tick_stride, generation=self.generation))
+                tick_stride=self.tick_stride, generation=self.generation,
+                transition_jitter=jitter))
         return specs
 
     def sample(self, n: int) -> list[UniverseSpec]:
@@ -378,9 +409,24 @@ class MarkovWorldFeed:
         sp = self.spec
         master = np.random.default_rng(sp.seed)
         # independent stream per layer + per variable — "a Markov chain RNG
-        # for each variable", literally
-        streams = master.spawn(8)
+        # for each variable", literally. (spawn is index-stable: the first 8
+        # children are identical whether 8 or 9 are drawn, so jitter=0 worlds
+        # match earlier generations exactly.)
+        streams = master.spawn(9)
         rng_arch, rng_regime, rng_path, rng_micro = streams[:4]
+
+        # generation evolution: seeded Dirichlet perturbation of both
+        # transition layers (no-op at jitter=0 -> canonical matrices)
+        if sp.transition_jitter > 0.0:
+            rng_jit = streams[8]
+            self._arch_T = _dirichlet_rows(_ARCH_TRANSITION, rng_jit,
+                                           sp.transition_jitter)
+            self._regime_T = {
+                arch: _dirichlet_rows(rows, rng_jit, sp.transition_jitter)
+                for arch, rows in _REGIME_TRANSITION.items()}
+        else:
+            self._arch_T = _ARCH_TRANSITION
+            self._regime_T = _REGIME_TRANSITION
         chains = {
             "gex":   VariableChain("gex", streams[4]),
             "rv":    VariableChain("rv", streams[5], scale=sp.vol_mult),
@@ -406,16 +452,18 @@ class MarkovWorldFeed:
             iso = date.isoformat()
 
             if made > 1:
-                row = _ARCH_TRANSITION[archetype]
+                row = self._arch_T[archetype]
                 archetype = str(rng_arch.choice(list(row), p=_norm(row)))
             self.day_archetype[iso] = archetype
             occupancy = self.regime_minutes.setdefault(
                 archetype, {r: 0 for r in REGIMES})
 
-            # overnight gap: archetype-conditioned
+            # overnight gap: archetype-conditioned. gap_shock gaps BOTH ways
+            # (down-biased 60/40) — a shock archetype, not a crash rehearsal.
             gap_vol = 0.003 * sp.gap_mult
-            gap_mu = {"gap_shock": -0.012, "crash": -0.008,
-                      "squeeze_melt_up": 0.005}.get(archetype, 0.0)
+            gap_mu = {"crash": -0.008, "squeeze_melt_up": 0.005}.get(archetype, 0.0)
+            if archetype == "gap_shock":
+                gap_mu = 0.012 * (-1.0 if rng_path.random() < 0.6 else 1.0)
             spot *= math.exp(rng_path.normal(gap_mu, gap_vol))
             pin = round(pin + rng_path.integers(-2, 3))
 
@@ -424,7 +472,7 @@ class MarkovWorldFeed:
             breakout_dir = 1.0 if rng_path.random() < 0.5 else -1.0
 
             for m in range(MIN_PER_DAY):
-                base_row = _REGIME_TRANSITION[archetype][regime]
+                base_row = self._regime_T[archetype][regime]
                 row = _tilt_row(base_row, regime, sp.persistence_tilt)
                 new_regime = str(rng_regime.choice(list(row), p=_norm(row)))
                 if new_regime == "breakout" and regime != "breakout":
@@ -566,8 +614,18 @@ class MarkovWorldFeed:
 
     # -- situation accounting ------------------------------------------------
     def coverage(self) -> dict[str, dict[str, int]]:
-        """Minutes spent in each (archetype × regime) cell of this universe."""
+        """GENERATED minutes spent in each (archetype × regime) cell — the
+        environment's occupancy, regardless of tick_stride."""
         return {a: dict(r) for a, r in self.regime_minutes.items()}
+
+    def evaluated_coverage(self) -> dict[str, dict[str, int]]:
+        """Ticks the pipeline actually evaluates per (archetype × regime)
+        cell — the strided subset of the generated minutes. This is the
+        honest 'situations sparred' count; coverage() is the environment."""
+        out: dict[str, dict[str, int]] = {}
+        for s in self.situation_log[:: self.spec.tick_stride]:
+            out.setdefault(s.archetype, {r: 0 for r in REGIMES})[s.regime] += 1
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -588,13 +646,17 @@ def _initial_regime(archetype: str, rng: np.random.Generator) -> str:
     return prefer if rng.random() < 0.7 else str(rng.choice(list(REGIMES)))
 
 
-def merge_coverage(feeds: list[MarkovWorldFeed]) -> dict[str, dict[str, int]]:
+def merge_coverage(feeds: list[MarkovWorldFeed],
+                   evaluated: bool = False) -> dict[str, dict[str, int]]:
     """Aggregate (archetype × regime) occupancy across many universes — the
     dojo's 'have we sparred everywhere' matrix. Cells at 0 are situations the
-    catalog has not yet generated."""
+    catalog has not yet generated. evaluated=True counts only the ticks the
+    pipeline actually evaluated (tick_stride subset) instead of every
+    generated minute."""
     out: dict[str, dict[str, int]] = {a: {r: 0 for r in REGIMES} for a in ARCHETYPES}
     for f in feeds:
-        for a, regs in f.coverage().items():
+        cov = f.evaluated_coverage() if evaluated else f.coverage()
+        for a, regs in cov.items():
             for r, n in regs.items():
                 out[a][r] += n
     return out

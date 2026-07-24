@@ -3745,29 +3745,40 @@
       <div class="dojo-scroll"><table class="tj-table dojo-matrix">
         <thead><tr><th>archetype</th><th>univ</th><th>sess</th><th>trades</th>
         <th>total P&amp;L</th><th>mean/sess</th><th>trade win</th>
-        <th>sess win</th><th>dir hit</th></tr></thead>
-        <tbody>${rows}</tbody></table></div>`;
+        <th>sess win</th>
+        <th title="Directional hit rate attributed to each universe's START archetype — it has no per-session decomposition, unlike the P&amp;L columns">dir hit*</th>
+        </tr></thead>
+        <tbody>${rows}</tbody></table></div>
+      <p class="tj-sub">* directional hit is charged to each universe's start
+      archetype; P&amp;L columns attribute per session-day.</p>`;
   }
 
   function renderDojoCoverage(uni) {
-    const cov = (uni && uni.coverage) || {};
+    // Prefer evaluated-tick coverage (what the pipeline actually decided on);
+    // older reports only carry generated-minute coverage.
+    const evaluated = !!(uni && uni.coverage_evaluated);
+    const cov = (uni && (uni.coverage_evaluated || uni.coverage)) || {};
     const archs = Object.keys(cov);
     if (!archs.length) return "";
     const regimes = Object.keys(cov[archs[0]] || {});
     const maxN = Math.max(1, ...archs.flatMap((a) => regimes.map((r) => cov[a][r] || 0)));
+    const unit = evaluated ? "pipeline evaluations" : "generated minutes";
     const rows = archs.map((a) => {
       const cells = regimes.map((r) => {
         const n = cov[a][r] || 0;
         const heat = n === 0 ? "dojo-cov-0"
           : n > maxN * 0.5 ? "dojo-cov-3"
           : n > maxN * 0.15 ? "dojo-cov-2" : "dojo-cov-1";
-        return `<td class="${heat}" title="${n} minutes">${n || "·"}</td>`;
+        return `<td class="${heat}" title="${n} ${unit}">${n || "·"}</td>`;
       }).join("");
       return `<tr><td class="mono">${esc(a)}</td>${cells}</tr>`;
     }).join("");
-    const visited = uni.coverage_cells_visited, total = uni.coverage_cells_total;
-    return `<h3 class="val-h3">Situation coverage <span class="tj-dim">(minutes sparred per
-      archetype × regime — ${visited ?? "?"}/${total ?? "?"} cells visited)</span></h3>
+    const visited = evaluated
+      ? (uni.coverage_cells_visited_evaluated ?? uni.coverage_cells_visited)
+      : uni.coverage_cells_visited;
+    const total = uni.coverage_cells_total;
+    return `<h3 class="val-h3">Situation coverage <span class="tj-dim">(${unit} per
+      archetype × regime — ${visited ?? "?"}/${total ?? "?"} cells)</span></h3>
       <div class="dojo-scroll"><table class="tj-table dojo-matrix">
         <thead><tr><th></th>${regimes.map((r) => `<th>${esc(r)}</th>`).join("")}</tr></thead>
         <tbody>${rows}</tbody></table></div>`;

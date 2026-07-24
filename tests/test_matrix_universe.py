@@ -133,3 +133,81 @@ def test_merge_coverage_counts_minutes():
     assert set(cov) == set(ARCHETYPES)
     total = sum(n for regs in cov.values() for n in regs.values())
     assert total == sum(len(f.situation_log) for f in feeds)
+
+
+# --------------------------------------------------------------------------- #
+# review fixes (skew convention, Dirichlet evolution, gaps, coverage)         #
+# --------------------------------------------------------------------------- #
+def test_skew_preferences_match_pricing_convention():
+    """Chain pricing is s(K) = s_atm - skew*ln(K/F): POSITIVE skew raises
+    put-strike vol. Down regimes must steepen the put skew; up regimes bid
+    the calls."""
+    assert _VAR_PREFERENCE["drift_down"]["skew"] == "high"   # put-heavy
+    assert _VAR_PREFERENCE["breakout"]["skew"] == "high"     # fear premium
+    assert _VAR_PREFERENCE["drift_up"]["skew"] == "low"      # call bid
+
+
+def test_positive_skew_prices_put_wing_richer():
+    feed = MarkovWorldFeed(_spec())
+    feed._skew = np.full_like(feed._skew, 0.075)             # force put-heavy
+    chain = feed._chain(0)
+    spot = chain.spot
+    low = min(chain.quotes, key=lambda q: q.strike)
+    high = max(chain.quotes, key=lambda q: q.strike)
+    # equidistant OTM wings: the put wing must carry more premium
+    dist = min(spot - low.strike, high.strike - spot) * 0.8
+    put = min(chain.quotes, key=lambda q: abs(q.strike - (spot - dist)))
+    call = min(chain.quotes, key=lambda q: abs(q.strike - (spot + dist)))
+    assert put.put_mid > call.call_mid
+
+
+def test_transition_jitter_is_deterministic_and_off_by_default():
+    base = MarkovWorldFeed(_spec())
+    assert base._arch_T is _ARCH_TRANSITION          # jitter=0 -> canonical
+    j1 = MarkovWorldFeed(_spec(transition_jitter=0.05))
+    j2 = MarkovWorldFeed(_spec(transition_jitter=0.05))
+    assert j1._arch_T == j2._arch_T                  # seeded determinism
+    assert j1._arch_T != _ARCH_TRANSITION            # actually perturbed
+    # perturbed rows stay proper distributions over the full state sets
+    for state, row in j1._arch_T.items():
+        assert set(row) == set(ARCHETYPES)
+        assert abs(sum(row.values()) - 1.0) < 1e-9
+    for arch, rows in j1._regime_T.items():
+        for state, row in rows.items():
+            assert set(row) == set(REGIMES)
+            assert abs(sum(row.values()) - 1.0) < 1e-9
+
+
+def test_lattice_applies_jitter_from_generation_one():
+    cat = UniverseCatalog(days=1)
+    assert all(s.transition_jitter == 0.0 for s in cat.lattice())
+    gen1 = cat.evolve({})
+    assert all(s.transition_jitter == pytest.approx(0.02)
+               for s in gen1.lattice())
+
+
+def test_gap_shock_gaps_in_both_directions():
+    signs = set()
+    for seed in range(24):
+        feed = MarkovWorldFeed(_spec(start_archetype="gap_shock", days=1,
+                                     seed=seed))
+        gap = np.log(feed._close[0] / feed.spec.base_spot)
+        signs.add(gap > 0)
+        if signs == {True, False}:
+            break
+    assert signs == {True, False}
+
+
+def test_evaluated_coverage_counts_strided_ticks():
+    feed = MarkovWorldFeed(_spec())
+    ev = feed.evaluated_coverage()
+    assert sum(n for regs in ev.values() for n in regs.values()) == \
+        len(feed.timestamps())
+    # generated-minute coverage is the superset
+    cov = feed.coverage()
+    for a, regs in ev.items():
+        for r, n in regs.items():
+            assert cov[a][r] >= n
+    merged = merge_coverage([feed], evaluated=True)
+    assert sum(n for regs in merged.values() for n in regs.values()) == \
+        len(feed.timestamps())

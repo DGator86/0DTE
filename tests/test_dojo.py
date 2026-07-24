@@ -45,12 +45,18 @@ def test_run_dojo_persists_report_and_degrades_honestly():
         sessions = sum(m["n_sessions"] for m in matrix.values())
         assert sessions == 2  # 2 universes x 1 day
 
-        # coverage map has the right shape
+        # coverage maps have the right shape; evaluated is the strided subset
         cov = phases["universe"]["coverage"]
+        cov_eval = phases["universe"]["coverage_evaluated"]
         assert phases["universe"]["coverage_cells_total"] == len(ARCHETYPES) * 5
         assert 0 < phases["universe"]["coverage_cells_visited"] <= \
             phases["universe"]["coverage_cells_total"]
+        assert 0 < phases["universe"]["coverage_cells_visited_evaluated"] <= \
+            phases["universe"]["coverage_cells_visited"]
         assert set(cov) == set(ARCHETYPES)
+        for a in cov_eval:
+            for r in cov_eval[a]:
+                assert cov_eval[a][r] <= cov[a][r]
 
         # persisted to validation_reports with report_type='dojo'
         jrn = Journal(os.path.join(tmp, "shadow.db"))
