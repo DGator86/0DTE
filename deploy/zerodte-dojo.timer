@@ -1,0 +1,12 @@
+[Unit]
+# Saturday afternoon — after the week's recordings settle, before the Sunday
+# weekly learning cycle, so both reports land ahead of Monday's open.
+Description=Run the 0DTE dojo matrix-training cycle weekly
+
+[Timer]
+OnCalendar=Sat 15:00 America/New_York
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

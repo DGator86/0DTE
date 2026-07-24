@@ -59,6 +59,9 @@
       <button class="tab" id="tab-learning" type="button">Learning
         <span class="val-alert-dot hidden" id="tab-learning-dot"></span>
       </button>
+      <button class="tab" id="tab-dojo" type="button">Dojo
+        <span class="val-alert-dot hidden" id="tab-dojo-dot"></span>
+      </button>
     </nav>
 
     <!-- ===================== LEGACY GRID ===================== -->
@@ -468,6 +471,24 @@
       <section class="panel" id="val-detail-panel">
         <h2>Report detail <span class="h2-right" id="val-detail-date">—</span></h2>
         <div id="val-detail"><p class="empty">Select a report</p></div>
+      </section>
+    </div>
+
+    <!-- ===================== DOJO VIEW (matrix training) ===================== -->
+    <div class="validation-view hidden" id="view-dojo">
+      <section class="panel" id="dojo-list-panel">
+        <h2>Dojo training runs <span class="h2-right" id="dojo-count">—</span></h2>
+        <p class="empty" id="dojo-intro" style="margin:0 0 10px">
+          Matrix-style training reports from <span class="mono">dojo.py</span>:
+          recorded-tape walk-forward, an adaptive-learning cycle, and sparring
+          across Markov-generated market universes.
+        </p>
+        <div class="val-list" id="dojo-list"><p class="empty">No dojo runs yet —
+          run <span class="mono">python3 dojo.py</span> on the VPS</p></div>
+      </section>
+      <section class="panel" id="dojo-detail-panel">
+        <h2>Training report <span class="h2-right" id="dojo-detail-date">—</span></h2>
+        <div id="dojo-detail"><p class="empty">Select a training run</p></div>
       </section>
     </div>
 

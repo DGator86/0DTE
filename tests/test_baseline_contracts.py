@@ -208,6 +208,8 @@ def test_dashboard_route_inventory():
         "/api/sigma-cones",
         "/api/validation",
         "/api/validation/{report_id}",
+        "/api/dojo",
+        "/api/dojo/{report_id}",
         "/api/learning",
         "/api/candidates",
         "/api/promotions",
@@ -233,10 +235,12 @@ def test_appjs_render_and_refresh_inventory():
     found = set(re.findall(r"function ((?:render|refresh)[A-Za-z0-9_]*)\(",
                            _appjs()))
     assert found == {
-        "refresh", "refreshJournal", "refreshLearning", "refreshPrediction",
-        "refreshValidation",
+        "refresh", "refreshDojo", "refreshJournal", "refreshLearning",
+        "refreshPrediction", "refreshValidation",
         "renderCompetition",
-        "renderConeCoverage", "renderConeJournal", "renderDynamics",
+        "renderConeCoverage", "renderConeJournal",
+        "renderDojoBadge", "renderDojoCoverage", "renderDojoDetail",
+        "renderDojoList", "renderDojoMatrix", "renderDynamics",
         "renderEdge", "renderFeatureImpactDetail", "renderForecast",
         "renderFunnel", "renderGexVariants", "renderJournal",
         "renderLearningBadge", "renderLearningCandidates",
@@ -261,7 +265,7 @@ def test_appjs_render_and_refresh_inventory():
 def test_appjs_api_endpoint_inventory():
     found = set(re.findall(r'api\("(/api/[a-z-]+)', _appjs()))
     assert found == {
-        "/api/candidates", "/api/drift", "/api/feature-scores",
+        "/api/candidates", "/api/dojo", "/api/drift", "/api/feature-scores",
         "/api/learning", "/api/live", "/api/market-status", "/api/paper",
         "/api/predictions", "/api/promotions", "/api/readiness",
         "/api/report", "/api/sigma-cones", "/api/ticks", "/api/trades",
