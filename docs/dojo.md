@@ -21,16 +21,39 @@ venv/bin/python dojo.py \
     --reports-dir /var/lib/zerodte/reports/dojo
 ```
 
-Scheduled weekly (Saturday 15:00 ET, before the Sunday learning cycle):
+### Scheduled cadence (three escalating timers)
+
+The `--recent-days N` flag windows the recorded-tape review + calibration to
+the last N session-dates; the synthetic universe depth is the independent
+`--days N`. Three systemd timers escalate scope:
+
+| Timer | When (ET) | Window | Universe sweep |
+|---|---|---|---|
+| `zerodte-dojo-daily`  | Mon–Fri 06:30 | last **3** days  | 6 universes × 1 gen, 3-day worlds |
+| `zerodte-dojo-recent` | Mon/Wed/Fri 07:00 | last **10** days | 8 universes × 2 gen, 10-day worlds |
+| `zerodte-dojo-weekly` | Sat 15:00 | **all** history | **full 72-cell lattice** × 2 gen + calibration |
+
+Install and enable all three:
 
 ```bash
-sudo cp deploy/zerodte-dojo.{service,timer} /etc/systemd/system/
+sudo cp deploy/zerodte-dojo-{daily,recent,weekly}.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now zerodte-dojo.timer
+sudo systemctl enable --now zerodte-dojo-daily.timer \
+                            zerodte-dojo-recent.timer \
+                            zerodte-dojo-weekly.timer
+# verify the schedule:
+systemctl list-timers 'zerodte-dojo-*'
 ```
 
-Open the dashboard (VPS or Vercel) → **Dojo** tab. The tab dot lights amber
-when the latest run flagged a weak archetype.
+Every run writes to the same `reports/dojo/` + journal, so all three appear in
+the **Dojo** tab, distinguished by timestamp and their `config` block
+(`recent_days`, `universes`, `generations`, `full_lattice`). The tab dot
+lights amber when the latest run flags a weak archetype.
+
+> The daily 3-day window is a recency health-check; with only ~3 sessions the
+> walk-forward folds are thin (that phase reports `insufficient_data` until
+> enough history accrues) — the universe sparring and learner review are the
+> daily signal. The weekly full-lattice run is the exhaustive robustness sweep.
 
 ## The three phases
 

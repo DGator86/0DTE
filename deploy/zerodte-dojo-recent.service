@@ -1,11 +1,8 @@
 [Unit]
-# Weekly "matrix training": recorded-tape walk-forward + adaptive learning
-# cycle + Markov-universe sparring (dojo.py). Persists a dojo report the
-# dashboard's Dojo tab (and the Vercel proxy) serves. Never auto-promotes.
-# Runs Saturday (see the timer), a day before the Sunday weekly learner —
-# they are independent scheduled jobs, so no After= ordering ties them
-# together (a boot-time After= would have been a no-op here and misleading).
-Description=0DTE dojo matrix-training run
+# Every ~2 trading days (Mon/Wed/Fri): review the last 10 recorded sessions +
+# a medium universe sparring pass (10-day worlds, 2 generations). Deeper than
+# the daily run; still not the full lattice. Never auto-promotes.
+Description=0DTE dojo — recent-10-day review (every ~2 days)
 After=network-online.target
 Wants=network-online.target
 
@@ -20,10 +17,10 @@ ExecStart=/opt/zerodte/venv/bin/python dojo.py \
     --record-dir /var/lib/zerodte/ticks \
     --configs-dir /var/lib/zerodte/configs \
     --reports-dir /var/lib/zerodte/reports/dojo \
+    --recent-days 10 \
+    --days 10 \
     --universes 8 \
     --generations 2 \
-    --days 8 \
-    --stride 5 \
     --trials 15
 
 NoNewPrivileges=true
@@ -34,6 +31,6 @@ ReadWritePaths=/var/lib/zerodte
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=zerodte-dojo
+SyslogIdentifier=zerodte-dojo-recent
 
 SuccessExitStatus=0

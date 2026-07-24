@@ -194,14 +194,38 @@ class RecordedFeed:
     reassembled from the incremental rows into a rolling lookback window.
     """
 
-    def __init__(self, directory: str, lookback_minutes: int = 7800) -> None:
+    def __init__(self, directory: str, lookback_minutes: int = 7800,
+                 recent_days: int = 0) -> None:
         self.directory = directory
         self.lookback = lookback_minutes
+        self.recent_days = recent_days
         self._ticks: list[dict] = []
         self._settles: dict[str, float] = {}
         self._bars_acc: list[list] = []            # accumulated [iso,o,h,l,c,v]
         self._idx = 0
         self._load()
+        if recent_days and recent_days > 0:
+            self._window_recent(recent_days)
+
+    @staticmethod
+    def _session_date(iso_ts: str) -> str:
+        """ET calendar date of a recorded tick ts (== the session date for
+        intraday recordings). Robust to naive timestamps."""
+        from zoneinfo import ZoneInfo
+        t = dt.datetime.fromisoformat(iso_ts)
+        et = ZoneInfo("America/New_York")
+        t = t.astimezone(et) if t.tzinfo else t.replace(tzinfo=et)
+        return t.date().isoformat()
+
+    def _window_recent(self, n: int) -> None:
+        """Keep only the last `n` distinct session-dates of recordings — the
+        'review the past N days' window. No-op path when unset (recent_days=0)
+        so all existing replay is byte-identical."""
+        dates = sorted({self._session_date(o["ts"]) for o in self._ticks})
+        keep = set(dates[-n:])
+        self._ticks = [o for o in self._ticks
+                       if self._session_date(o["ts"]) in keep]
+        self._settles = {d: p for d, p in self._settles.items() if d in keep}
 
     # -- loading ---------------------------------------------------------------
     def _load(self) -> None:

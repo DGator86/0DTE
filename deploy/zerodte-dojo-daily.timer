@@ -1,0 +1,12 @@
+[Unit]
+# Every trading morning, ~06:30 ET (before the open). Weekdays only — the
+# recorded tape only grows on trading days.
+Description=Run the daily 0DTE dojo (recent-3-day review)
+
+[Timer]
+OnCalendar=Mon..Fri 06:30 America/New_York
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

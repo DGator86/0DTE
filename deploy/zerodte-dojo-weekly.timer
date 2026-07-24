@@ -1,0 +1,12 @@
+[Unit]
+# Saturday 15:00 ET — the week's recordings have settled and the full-lattice
+# sweep has all weekend to run before Monday's open.
+Description=Run the weekly 0DTE dojo (full 72-universe lattice)
+
+[Timer]
+OnCalendar=Sat 15:00 America/New_York
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

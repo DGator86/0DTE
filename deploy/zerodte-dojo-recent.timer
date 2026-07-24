@@ -1,0 +1,12 @@
+[Unit]
+# Mon/Wed/Fri ~07:00 ET — "every ~2 days" over the trading week, after the
+# daily run has kicked off. A 10-session window reviewed three times a week.
+Description=Run the every-~2-days 0DTE dojo (recent-10-day review)
+
+[Timer]
+OnCalendar=Mon,Wed,Fri 07:00 America/New_York
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

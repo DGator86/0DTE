@@ -81,15 +81,17 @@ def _build_calibration(cfg: "DojoConfig"):
     try:
         from chain_store import RecordedFeed
         from regime_calibration import calibrate_from_feed
-        probe = RecordedFeed(cfg.record_dir)
+        rd = cfg.recent_days or 0
+        feed_factory = lambda: RecordedFeed(cfg.record_dir, recent_days=rd)
+        probe = feed_factory()
         ticks = probe.timestamps()
         sessions = {t.date() for t in ticks}
         if len(ticks) < cfg.min_ticks or len(sessions) < cfg.min_sessions:
             return None, (f"{len(ticks)} ticks / {len(sessions)} sessions "
-                          f"recorded (< {cfg.min_ticks}/{cfg.min_sessions}) — "
+                          f"{'in last %d days ' % rd if rd else ''}recorded "
+                          f"(< {cfg.min_ticks}/{cfg.min_sessions}) — "
                           f"canonical priors")
-        cal = calibrate_from_feed(lambda: RecordedFeed(cfg.record_dir), ticks,
-                                  source=cfg.record_dir)
+        cal = calibrate_from_feed(feed_factory, ticks, source=cfg.record_dir)
         return cal, (f"calibrated from {cal.n_sessions} sessions / "
                      f"{cal.n_minutes} minutes of recorded tape")
     except Exception as exc:   # never let calibration sink the universe phase
@@ -115,6 +117,9 @@ class DojoConfig:
     wf_train_frac: float = 0.6
     min_ticks: int = 100
     min_sessions: int = 3
+    # window the recorded-tape review + calibration to the last N session-dates
+    # (0 = all recorded history). The universe depth is --days, independent.
+    recent_days: int = 0
     # learner phase
     learn_trials: int = 15
     learn_holdout: float = 0.25
@@ -143,29 +148,33 @@ def _phase_recorded(cfg: DojoConfig) -> dict:
                         "let shadow mode record sessions first"}
 
     from chain_store import RecordedFeed
-    probe = RecordedFeed(cfg.record_dir)
+    rd = cfg.recent_days or 0
+    feed_factory = lambda: RecordedFeed(cfg.record_dir, recent_days=rd)
+    probe = feed_factory()
     ticks = probe.timestamps()
     sessions = sorted({t.date().isoformat() for t in ticks})
     if len(ticks) < cfg.min_ticks or len(sessions) < cfg.min_sessions:
         return {"status": "insufficient_data",
                 "n_ticks": len(ticks), "n_sessions": len(sessions),
+                "recent_days": rd,
                 "note": f"{len(ticks)} ticks / {len(sessions)} sessions "
-                        f"recorded (need >= {cfg.min_ticks} / "
-                        f">= {cfg.min_sessions})"}
+                        f"{'in the last %d days ' % rd if rd else ''}recorded "
+                        f"(need >= {cfg.min_ticks} / >= {cfg.min_sessions})"}
 
     print(f"  [dojo] phase 1 — recorded tape: {len(ticks):,} ticks / "
-          f"{len(sessions)} sessions", flush=True)
+          f"{len(sessions)} sessions"
+          f"{f' (last {rd} days)' if rd else ''}", flush=True)
     wf = run_walk_forward(
-        feed_factory=lambda: RecordedFeed(cfg.record_dir),
+        feed_factory=feed_factory,
         timestamps=ticks,
         wf_cfg=WalkForwardConfig(mode="expanding", n_folds=cfg.wf_folds,
                                  train_frac=cfg.wf_train_frac),
     )
     jrn = Journal(":memory:")
-    run_backtest(RecordedFeed(cfg.record_dir), ticks, journal=jrn)
+    run_backtest(feed_factory(), ticks, journal=jrn)
     calibration = jrn.calibration()
     jrn.close()
-    return {"status": "ok", "n_ticks": len(ticks),
+    return {"status": "ok", "n_ticks": len(ticks), "recent_days": rd,
             "n_sessions": len(sessions), "sessions": sessions,
             "walk_forward": wf.to_dict(), "calibration": calibration}
 
@@ -490,6 +499,8 @@ def run_dojo(cfg: Optional[DojoConfig] = None) -> dict:
             "universe_days": cfg.universe_days,
             "tick_stride": cfg.tick_stride,
             "catalog_seed": cfg.catalog_seed,
+            "recent_days": cfg.recent_days,
+            "calibrate_from_recorded": cfg.calibrate_from_recorded,
         },
     }
 
@@ -537,6 +548,10 @@ def main() -> None:
     ap.add_argument("--stride", type=int, default=5,
                     help="serve every Nth minute of each universe")
     ap.add_argument("--seed", type=int, default=20260723)
+    ap.add_argument("--recent-days", type=int, default=0,
+                    help="window the recorded-tape review + calibration to the "
+                         "last N session-dates (0 = all history). The synthetic "
+                         "universe depth is --days, independent of this.")
     ap.add_argument("--calibrate-from-recorded", action="store_true",
                     help="calibrate universe transition matrices from the "
                          "recorded tape (regime_calibration) and spar against "
@@ -554,6 +569,7 @@ def main() -> None:
         universes_per_gen=args.universes, generations=args.generations,
         full_lattice=args.full_lattice, universe_days=args.days,
         tick_stride=args.stride, catalog_seed=args.seed,
+        recent_days=args.recent_days,
         calibrate_from_recorded=args.calibrate_from_recorded,
     )
     out = run_dojo(cfg)

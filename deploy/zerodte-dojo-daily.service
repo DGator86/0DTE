@@ -1,0 +1,37 @@
+[Unit]
+# Daily light dojo: review the last 3 recorded sessions + a shallow universe
+# sparring pass (3-day worlds, 1 generation). Fast recency health-check.
+# Persists a dojo report the dashboard Dojo tab (and Vercel proxy) serves.
+# Never auto-promotes.
+Description=0DTE dojo — daily recent-3-day review
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zerodte
+Group=zerodte
+WorkingDirectory=/opt/zerodte
+EnvironmentFile=/etc/zerodte/zerodte.env
+ExecStart=/opt/zerodte/venv/bin/python dojo.py \
+    --db /var/lib/zerodte/shadow.db \
+    --record-dir /var/lib/zerodte/ticks \
+    --configs-dir /var/lib/zerodte/configs \
+    --reports-dir /var/lib/zerodte/reports/dojo \
+    --recent-days 3 \
+    --days 3 \
+    --universes 6 \
+    --generations 1 \
+    --trials 10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zerodte
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-dojo-daily
+
+SuccessExitStatus=0
