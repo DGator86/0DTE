@@ -44,11 +44,40 @@ def test_journals_stabilized_target_and_asymmetric_band():
     o._stabilize_forecast(_snap(), sig, _bundle(), _regime())
     # all stabilizer keys are v2_fc_-prefixed so they flow via forecast_summary
     assert all(k.startswith("v2_fc_") for k in sig)
-    assert sig["v2_fc_stab_target"] == 742.0 * (1 + 0.0015)   # seed = raw
+    # the RETURN is stabilized (seed = raw q50) and the price reconstructed
+    assert sig["v2_fc_stab_ret"] == 0.0015
+    assert sig["v2_fc_stab_target"] == 742.0 * (1 + 0.0015)
+    assert sig["v2_fc_stab_horizon_min"] == 30.0
     # band is asymmetric: q10=-0.2% / q90=+0.3% -> wider downside from target
     lo, hi, tgt = sig["v2_fc_stab_lo"], sig["v2_fc_stab_hi"], sig["v2_fc_stab_target"]
     assert lo < tgt < hi
     assert (tgt - lo) > (hi - tgt)                            # skew preserved
+
+
+def test_stabilized_target_tracks_spot_without_forecast_revision():
+    """Belief (return) stabilization: at a fixed q50, a rising spot moves the
+    price target 1:1 WITHOUT the stabilizer reading it as a revision (no
+    spurious deadband/hysteresis) — the target is reconstructed from the
+    current spot each tick, the return is what's held."""
+    o = _orch()
+    s1 = {}
+    o._stabilize_forecast(_snap(spot=742.0), s1, _bundle(q50=0.0015), _regime())
+    s2 = {}
+    o._stabilize_forecast(_snap(spot=744.0), s2, _bundle(q50=0.0015), _regime())
+    # unchanged belief -> stabilized return unchanged; price tracks spot exactly
+    assert s2["v2_fc_stab_ret"] == s1["v2_fc_stab_ret"]
+    assert s2["v2_fc_stab_target"] == 744.0 * (1 + 0.0015)
+    assert s2["v2_fc_stab_changed"] == 0.0        # no forecast revision
+
+
+def test_misordered_quantiles_suppress_the_band():
+    o = _orch()
+    sig = {}
+    # q10 > q50 (mis-ordered / garbage) -> no band edges emitted
+    o._stabilize_forecast(_snap(), sig, _bundle(q10=0.005, q50=0.0015, q90=0.003),
+                          _regime())
+    assert "v2_fc_stab_target" in sig
+    assert "v2_fc_stab_lo" not in sig and "v2_fc_stab_hi" not in sig
 
 
 def test_deadband_holds_target_across_ticks():

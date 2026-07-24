@@ -384,27 +384,32 @@ class UnifiedOrchestrator:
         q50 = getattr(bundle, "return_q50_30m", None)
         if not (spot > 0 and isinstance(q50, (int, float)) and math.isfinite(float(q50))):
             return
+        q50 = float(q50)
 
-        # reset the stabilizer at each new session so no target carries over
+        # reset the stabilizer at each new session so no belief carries over
         session = snap.market.now.astimezone(ET).date().isoformat()
         if session != self._forecast_stab_session:
             self._forecast_stab.reset()
             self._forecast_stab_session = session
 
-        raw_target = spot * (1.0 + float(q50))
-
-        # short-horizon sigma for the deadband: prefer the 30m expected move,
-        # fall back to a fraction of the session expected range
-        sigma_short = None
+        # Stabilize the forecast BELIEF (the expected 30m RETURN), not an
+        # absolute price. If we smoothed spot*(1+q50), a rising spot at an
+        # unchanged q50 would read as a forecast revision (spot translation
+        # contaminating the belief) — driving spurious deadband/hysteresis and
+        # stale lean. Instead we stabilize the return in return space (spot=0,
+        # lean = sign(return)) and reconstruct the price from the CURRENT spot
+        # each tick, so the cone tracks spot naturally while only conviction is
+        # smoothed. (Review of #146/#147, item 1.)
+        ret_sigma = None
         erm = getattr(bundle, "expected_realized_move_30m", None)
         if isinstance(erm, (int, float)) and math.isfinite(float(erm)) and erm > 0:
-            sigma_short = float(erm) * spot
-        if sigma_short is None:
+            ret_sigma = float(erm)
+        if ret_sigma is None:
             er = getattr(snap.market, "expected_range", None)
             if isinstance(er, (int, float)) and math.isfinite(float(er)) and er > 0:
-                sigma_short = 0.4 * float(er)
-        if not sigma_short or sigma_short <= 0:
-            sigma_short = spot * 0.001
+                ret_sigma = 0.4 * float(er) / spot
+        if not ret_sigma or ret_sigma <= 0:
+            ret_sigma = 0.001
 
         # confidence = 1 - forecast uncertainty; regime-change intensity from
         # the classifier's information gain (spikes on regime flips)
@@ -419,28 +424,42 @@ class UnifiedOrchestrator:
         # structural-break override signals (initial, conservative mapping):
         # a scheduled catalyst, and a below-flip veto = failed gamma-flip reclaim
         vetoes = set(getattr(regime_state, "vetoes", None) or ())
-        breaks = BreakSignals(
-            macro_release=bool(getattr(snap.market, "has_catalyst", False)),
-            gamma_flip_failed_reclaim=bool(
-                vetoes & {"below_flip", "below_gamma_flip"}),
-        )
+        brk_catalyst = bool(getattr(snap.market, "has_catalyst", False))
+        brk_gammaflip = bool(vetoes & {"below_flip", "below_gamma_flip"})
+        breaks = BreakSignals(macro_release=brk_catalyst,
+                              gamma_flip_failed_reclaim=brk_gammaflip)
 
         res = self._forecast_stab.update(
-            raw_target=raw_target, spot=spot, sigma_short=sigma_short,
+            raw_target=q50, spot=0.0, sigma_short=ret_sigma,
             confidence=confidence, regime_change_intensity=regime_intensity,
-            breaks=breaks)
+            breaks=breaks, flat_abs=0.0003)   # ±3bp return = "no lean"
 
-        # asymmetric band: the q10/q90 SPREAD around the median, re-centered on
-        # the stabilized target (keeps the skew, tilts with the stable center)
-        signals["v2_fc_stab_target"] = float(res.target)
+        stab_ret = float(res.target)
+        target_price = spot * (1.0 + stab_ret)      # reconstruct from CURRENT spot
+        signals["v2_fc_stab_ret"] = stab_ret
+        signals["v2_fc_stab_target"] = target_price
         signals["v2_fc_stab_changed"] = 1.0 if res.changed else 0.0
         signals["v2_fc_stab_lean"] = float(res.lean)
         signals["v2_fc_stab_override"] = 1.0 if res.override else 0.0
-        for src, dst in (("return_q10_30m", "v2_fc_stab_lo"),
-                         ("return_q90_30m", "v2_fc_stab_hi")):
-            qv = getattr(bundle, src, None)
-            if isinstance(qv, (int, float)) and math.isfinite(float(qv)):
-                signals[dst] = float(res.target + (float(qv) - float(q50)) * spot)
+        # horizon so the dashboard draws the cone to the ACTUAL target time
+        # (issued + 30m, capped at close) rather than the chart endpoint
+        signals["v2_fc_stab_horizon_min"] = 30.0
+        # which structural-break signals are wired/active (honest coverage —
+        # the rest of BreakSignals is defined but not yet fed live)
+        signals["v2_fc_stab_brk_catalyst"] = 1.0 if brk_catalyst else 0.0
+        signals["v2_fc_stab_brk_gammaflip"] = 1.0 if brk_gammaflip else 0.0
+
+        # asymmetric band: the q10/q90 SPREAD (in return space) around the
+        # stabilized median, applied to the current spot. Validated for
+        # finiteness AND monotone ordering (q10 <= q50 <= q90) — a mis-ordered
+        # or non-finite quantile must not produce a crossed/garbage band.
+        q10 = getattr(bundle, "return_q10_30m", None)
+        q90 = getattr(bundle, "return_q90_30m", None)
+        if (isinstance(q10, (int, float)) and isinstance(q90, (int, float))
+                and math.isfinite(float(q10)) and math.isfinite(float(q90))
+                and float(q10) <= q50 <= float(q90)):
+            signals["v2_fc_stab_lo"] = spot * (1.0 + stab_ret + (float(q10) - q50))
+            signals["v2_fc_stab_hi"] = spot * (1.0 + stab_ret + (float(q90) - q50))
 
     def _resolve_physical_forecast(self, snap, signals: dict, intent) -> Optional[object]:
         """
