@@ -86,6 +86,18 @@ def test_run_dojo_skip_universe():
         assert "universe sparring: skipped" in out["summary"]
 
 
+def test_run_dojo_calibrate_from_recorded_degrades_without_tape():
+    """The calibration hook must degrade to canonical priors (not crash) when
+    no recorded tape exists."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = run_dojo(_tiny_cfg(tmp, calibrate_from_recorded=True))
+        uni = out["metrics"]["phases"]["universe"]
+        assert uni["status"] == "ok"
+        assert uni["calibrated"] is False
+        assert uni["calibration"] is None
+        assert "canonical priors" in (uni["calibration_note"] or "")
+
+
 # --------------------------------------------------------------------------- #
 # attribution                                                                 #
 # --------------------------------------------------------------------------- #
@@ -108,8 +120,33 @@ def test_archetype_matrix_attributes_sessions_to_day_archetype():
     assert matrix[arch0]["win_rate"] == pytest.approx(2 / 3, abs=1e-4)
     # every session is an observation, traded or not
     assert sum(m["n_sessions"] for m in matrix.values()) == len(days)
-    # directional stats charge to the start archetype
-    assert matrix["calm_pin"]["dir_hit"] == pytest.approx(0.6)
+
+
+def test_directional_hit_decomposes_per_session_archetype():
+    """dir_hit is now charged to each session-day's actual archetype (like
+    P&L), not to the universe's start archetype."""
+    spec = UniverseSpec(universe_id="a", seed=1, days=2,
+                        start_archetype="calm_pin", tick_stride=30)
+    feed = MarkovWorldFeed(spec)
+    days = list(feed.day_archetype)
+    # put the directional observations on the SECOND day only
+    row = {
+        **spec.to_dict(),
+        "daily_pnl": {}, "trades": 0, "dir_hit": None, "dir_n": 0,
+        "total_pnl": 0.0, "win_rate": None, "sharpe": None,
+        "session_stats": {
+            days[1]: {"trades": 0, "wins": 0, "pnl": 0.0,
+                      "dir_n": 10, "dir_hits": 7},
+        },
+    }
+    matrix = _archetype_matrix([row], [feed])
+    arch1 = feed.day_archetype[days[1]]
+    assert matrix[arch1]["dir_hit"] == pytest.approx(0.7)
+    assert matrix[arch1]["dir_n"] == 10
+    # the first day's archetype (if different) carries no directional sample
+    arch0 = feed.day_archetype[days[0]]
+    if arch0 != arch1:
+        assert matrix[arch0]["dir_hit"] is None
 
 
 # --------------------------------------------------------------------------- #

@@ -72,6 +72,30 @@ def _git_commit() -> Optional[str]:
         return None
 
 
+def _build_calibration(cfg: "DojoConfig"):
+    """Calibrate universe transition matrices from the recorded tape via
+    regime_calibration. Returns (Calibration|None, note). Degrades to None
+    (canonical priors) when there is not enough recorded history."""
+    if not cfg.record_dir or not os.path.isdir(cfg.record_dir):
+        return None, f"no recording dir at {cfg.record_dir!r} — canonical priors"
+    try:
+        from chain_store import RecordedFeed
+        from regime_calibration import calibrate_from_feed
+        probe = RecordedFeed(cfg.record_dir)
+        ticks = probe.timestamps()
+        sessions = {t.date() for t in ticks}
+        if len(ticks) < cfg.min_ticks or len(sessions) < cfg.min_sessions:
+            return None, (f"{len(ticks)} ticks / {len(sessions)} sessions "
+                          f"recorded (< {cfg.min_ticks}/{cfg.min_sessions}) — "
+                          f"canonical priors")
+        cal = calibrate_from_feed(lambda: RecordedFeed(cfg.record_dir), ticks,
+                                  source=cfg.record_dir)
+        return cal, (f"calibrated from {cal.n_sessions} sessions / "
+                     f"{cal.n_minutes} minutes of recorded tape")
+    except Exception as exc:   # never let calibration sink the universe phase
+        return None, f"calibration failed ({type(exc).__name__}: {exc}) — canonical priors"
+
+
 # --------------------------------------------------------------------------- #
 # Config                                                                      #
 # --------------------------------------------------------------------------- #
@@ -101,6 +125,10 @@ class DojoConfig:
     universe_days: int = 8
     tick_stride: int = 5
     catalog_seed: int = 20260723
+    # calibrate the universe transition matrices from the recorded tape
+    # (regime_calibration) and spar against the data-informed prior instead of
+    # the canonical one. Needs >= min_sessions of recordings; else falls back.
+    calibrate_from_recorded: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -179,31 +207,46 @@ def _phase_learner(cfg: DojoConfig) -> dict:
 # --------------------------------------------------------------------------- #
 # Phase 3 — universe sparring                                                 #
 # --------------------------------------------------------------------------- #
-def _run_universe(spec: UniverseSpec) -> tuple[dict, MarkovWorldFeed]:
+def _run_universe(spec: UniverseSpec,
+                  calibration=None) -> tuple[dict, MarkovWorldFeed]:
     # One generation per universe: timestamps() only reads pre-computed arrays
     # (no _idx mutation), and run_backtest advances the feed via snapshot() —
     # neither touches the situation labels / coverage we return, so the same
     # feed serves both. (Generation is the expensive step; it was previously
     # run twice per universe.)
-    feed = MarkovWorldFeed(spec)
+    kw = {}
+    if calibration is not None:
+        kw = {"arch_transition": calibration.arch_transition,
+              "regime_transition": calibration.regime_transition}
+    feed = MarkovWorldFeed(spec, **kw)
     ticks = feed.timestamps()
     jrn = Journal(":memory:")
     tearsheet = run_backtest(feed, ticks, journal=jrn)
     cal = jrn.calibration()
-    # per-session trade stats so archetype attribution matches the P&L's
-    # session-level granularity (a universe can span several archetypes)
+    # per-session stats so archetype attribution matches the P&L's session-
+    # level granularity (a universe can span several archetypes). Directional
+    # hit is now decomposed per session too — resolved on EVERY settled tick
+    # (trades AND no-trades), scored exactly as journal.directional_accuracy:
+    # hit iff settlement moved in the regime-bias direction.
+    def _blank() -> dict:
+        return {"trades": 0, "wins": 0, "pnl": 0.0, "dir_n": 0, "dir_hits": 0}
     session_stats: dict[str, dict] = {}
     for r in jrn.fetch(settled_only=True):
-        if r["was_traded"] != 1:
-            continue
-        pnl = economic_pnl(r)
-        if pnl is None:
-            continue
-        s = session_stats.setdefault(
-            r["session_date"], {"trades": 0, "wins": 0, "pnl": 0.0})
-        s["trades"] += 1
-        s["pnl"] += pnl
-        s["wins"] += 1 if pnl > 0 else 0
+        sd = r["session_date"]
+        if (r["regime_direction"] in ("call", "put")
+                and r["spot"] is not None and r["settle_price"] is not None):
+            move = (r["settle_price"] - r["spot"]) / r["spot"]
+            signed = move if r["regime_direction"] == "call" else -move
+            s = session_stats.setdefault(sd, _blank())
+            s["dir_n"] += 1
+            s["dir_hits"] += 1 if signed > 0 else 0
+        if r["was_traded"] == 1:
+            pnl = economic_pnl(r)
+            if pnl is not None:
+                s = session_stats.setdefault(sd, _blank())
+                s["trades"] += 1
+                s["pnl"] += pnl
+                s["wins"] += 1 if pnl > 0 else 0
     jrn.close()
 
     d = cal["directional"]["overall"]
@@ -233,7 +276,7 @@ def _archetype_matrix(universe_rows: list[dict],
     agg: dict[str, dict] = {
         a: {"n_universes": 0, "n_sessions": 0, "total_pnl": 0.0,
             "session_pnls": [], "trades": 0, "trade_wins": 0,
-            "dir_hits": [], "dir_ns": []}
+            "dir_hits": 0, "dir_n": 0}
         for a in ARCHETYPES}
     for row, feed in zip(universe_rows, feeds):
         touched = set()
@@ -246,20 +289,18 @@ def _archetype_matrix(universe_rows: list[dict],
             a["session_pnls"].append(pnl)
             a["trades"] += stats.get("trades", 0)
             a["trade_wins"] += stats.get("wins", 0)
+            # directional hit now decomposes per session-day, same as P&L,
+            # so it is charged to that day's actual archetype
+            a["dir_hits"] += stats.get("dir_hits", 0)
+            a["dir_n"] += stats.get("dir_n", 0)
             touched.add(arch)
         for arch in touched:
             agg[arch]["n_universes"] += 1
-        # directional stats have no per-session decomposition; charge them to
-        # the START archetype (dominant by construction)
-        if row["dir_hit"] is not None and row["dir_n"]:
-            agg[row["start_archetype"]]["dir_hits"].append(
-                row["dir_hit"] * row["dir_n"])
-            agg[row["start_archetype"]]["dir_ns"].append(row["dir_n"])
 
     out = {}
     for arch, a in agg.items():
         pnls = a.pop("session_pnls")
-        hits, ns = a.pop("dir_hits"), a.pop("dir_ns")
+        hits, ns = a.pop("dir_hits"), a.pop("dir_n")
         wins = a.pop("trade_wins")
         mean = (sum(pnls) / len(pnls)) if pnls else None
         s_wins = sum(1 for p in pnls if p > 0)
@@ -271,7 +312,8 @@ def _archetype_matrix(universe_rows: list[dict],
             "win_rate": round(wins / a["trades"], 4) if a["trades"] else None,
             "session_win_rate": (round(s_wins / (s_wins + s_losses), 4)
                                  if (s_wins + s_losses) else None),
-            "dir_hit": (round(sum(hits) / sum(ns), 4) if ns else None),
+            "dir_hit": (round(hits / ns, 4) if ns else None),
+            "dir_n": ns,
         }
     return out
 
@@ -286,6 +328,14 @@ def _phase_universe(cfg: DojoConfig) -> dict:
     all_rows: list[dict] = []
     all_feeds: list[MarkovWorldFeed] = []
 
+    # optional: calibrate the transition matrices from the recorded tape and
+    # spar against the data-informed prior instead of the canonical one
+    calibration = None
+    calib_note = None
+    if cfg.calibrate_from_recorded:
+        calibration, calib_note = _build_calibration(cfg)
+        print(f"  [dojo] phase 3 — calibration: {calib_note}", flush=True)
+
     for gen in range(cfg.generations):
         specs = (catalog.lattice() if cfg.full_lattice
                  else catalog.sample(cfg.universes_per_gen))
@@ -296,7 +346,7 @@ def _phase_universe(cfg: DojoConfig) -> dict:
         rows, feeds = [], []
         for spec in specs:
             t0 = time.time()
-            row, feed = _run_universe(spec)
+            row, feed = _run_universe(spec, calibration=calibration)
             rows.append(row)
             feeds.append(feed)
             print(f"    {spec.universe_id} {spec.start_archetype:<15} "
@@ -340,6 +390,12 @@ def _phase_universe(cfg: DojoConfig) -> dict:
         "coverage_cells_visited": visited,
         "coverage_cells_visited_evaluated": visited_eval,
         "coverage_cells_total": len(ARCHETYPES) * len(REGIMES),
+        # transition source: data-calibrated prior vs canonical. When
+        # calibrated, the matrices travel with the report so a calibrated run
+        # is reproducible (the simulator_hash covers only the canonical priors)
+        "calibrated": calibration is not None,
+        "calibration_note": calib_note,
+        "calibration": (calibration.to_dict() if calibration is not None else None),
         # reproducibility: the COMPLETE generative model (transition matrices,
         # var tables, breakout table, all price/gap/chain/snapshot params) plus
         # its content hash — a stored report is auditable without diffing source
@@ -481,6 +537,10 @@ def main() -> None:
     ap.add_argument("--stride", type=int, default=5,
                     help="serve every Nth minute of each universe")
     ap.add_argument("--seed", type=int, default=20260723)
+    ap.add_argument("--calibrate-from-recorded", action="store_true",
+                    help="calibrate universe transition matrices from the "
+                         "recorded tape (regime_calibration) and spar against "
+                         "the data-informed prior instead of the canonical one")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -494,6 +554,7 @@ def main() -> None:
         universes_per_gen=args.universes, generations=args.generations,
         full_lattice=args.full_lattice, universe_days=args.days,
         tick_stride=args.stride, catalog_seed=args.seed,
+        calibrate_from_recorded=args.calibrate_from_recorded,
     )
     out = run_dojo(cfg)
 
@@ -504,10 +565,10 @@ def main() -> None:
     uni = out["metrics"]["phases"]["universe"]
     if uni.get("status") == "ok":
         print("\n  Robustness matrix (per archetype):")
-        # dir(start): directional hit is charged to each universe's START
-        # archetype (it has no per-session decomposition)
+        # dir_hit is now decomposed per session-day, charged to that day's
+        # actual archetype (same granularity as P&L)
         print(f"    {'archetype':<16} {'univ':>4} {'sess':>4} {'trades':>6} "
-              f"{'total_pnl':>10} {'mean/sess':>10} {'win%':>5} {'dir(start)':>10}")
+              f"{'total_pnl':>10} {'mean/sess':>10} {'win%':>5} {'dir_hit':>7}")
         for arch, m in uni["archetype_matrix"].items():
             wr = (f"{m['session_win_rate'] * 100:.0f}%"
                   if m["session_win_rate"] is not None else "—")
@@ -517,7 +578,7 @@ def main() -> None:
                     if m["mean_session_pnl"] is not None else "—")
             print(f"    {arch:<16} {m['n_universes']:>4} {m['n_sessions']:>4} "
                   f"{m['trades']:>6} {m['total_pnl']:>+10.4f} {mean:>10} "
-                  f"{wr:>5} {dh:>10}")
+                  f"{wr:>5} {dh:>7}")
     print(f"\n  JSON: {out['json_path']}")
     if args.json:
         print(json.dumps(out, indent=2, default=str))

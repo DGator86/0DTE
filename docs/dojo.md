@@ -114,20 +114,30 @@ generation`) plus that config block; two reports with the same
   REAL data, Brier skill ≥ 0) still decide sizing. The dojo accelerates
   evaluation and hardening; it cannot substitute for live calendar
   diversity.
-- The smile is a single-parameter linear-in-log-moneyness slope (no wings,
-  no curvature), so the gym cannot surface wing- or convexity-shaped failure
-  modes. The slope **is** direction-coherent and responsive: an up-move
-  (drift_up or an up-resolving breakout) bids the calls, a down-move steepens
-  the puts, breakout direction is archetype-biased (crash breaks down, squeeze
-  breaks up), and the skew value's OU target follows that direction directly
-  (theta 0.08 — ~65% of the way inside a ~12-min breakout) rather than waiting
-  on the slow discrete state. Note the skew follows the **intended/latent**
-  regime direction, not each minute's realized return (a single breakout
-  minute's noise dwarfs its drift). Shape realism beyond the slope is future
-  work.
-- The transition matrices, OU parameters, and target levels are hand-tuned
-  from the system's thesis, not estimated from the joint distribution of real
-  SPY 0DTE sessions. Calibrating them from recorded data is the natural next
-  step, with one caveat: the simulator's regimes (`pin`/`drift_*`/…) are a
-  distinct taxonomy from the live Legacy/V3 regime labels, so real-data
-  calibration needs a labeling bridge first — it is not a drop-in.
+- The smile now has SHAPE beyond the slope: `s(k) = s_atm − skew·k +
+  curv·k² + wing·|k|` (`matrix_universe._smile_vol`), a convex curvature term
+  plus a wing lift, both fattened in stress archetypes (crash / vol_expansion
+  / gap_shock) — so the gym can exercise convexity- and wing-sensitive
+  structures, not just the ATM skew. The slope is direction-coherent and
+  responsive: an up-move bids the calls, a down-move steepens the puts,
+  breakout direction is archetype-biased, and the skew value's OU target
+  follows that direction directly (theta 0.08 — ~65% of the way inside a
+  ~12-min breakout). Skew follows the **intended/latent** regime direction,
+  not each minute's realized return (noise dwarfs the drift). Full surface
+  realism (term structure, dynamic curvature) remains future work.
+- The canonical transition matrices, OU parameters, and target levels are
+  hand-tuned from the system's thesis. `regime_calibration.py` supplies the
+  bridge to estimate them from recorded data instead: a session labeler maps
+  observable features (session-relative vol, range expansion, distance to the
+  pin, net day move, gap) to the simulator's own regime/archetype taxonomy,
+  and an empirical estimator turns labeled sequences into transition matrices
+  the generator consumes (`MarkovWorldFeed(spec, arch_transition=...,
+  regime_transition=...)`). Run it with `dojo.py --calibrate-from-recorded`
+  to spar against the data-informed prior; the calibrated matrices travel in
+  the report for reproducibility. **Honest limit:** labeling latent minute
+  regimes from noisy one-minute features is approximate — the regime labeler
+  runs ~1.5× the chance line and the archetype labeler ~3× (measured on the
+  simulator's own ground truth via `labeler_accuracy` /
+  `archetype_labeler_accuracy`). A calibrated run is a data-informed
+  challenger, not ground truth, and is judged by the same journal readouts as
+  everything else.
