@@ -3746,11 +3746,9 @@
         <thead><tr><th>archetype</th><th>univ</th><th>sess</th><th>trades</th>
         <th>total P&amp;L</th><th>mean/sess</th><th>trade win</th>
         <th>sess win</th>
-        <th title="Directional hit rate attributed to each universe's START archetype — it has no per-session decomposition, unlike the P&amp;L columns">dir hit*</th>
+        <th title="Directional hit rate, decomposed per session-day and charged to that day's actual archetype — same granularity as the P&amp;L columns">dir hit</th>
         </tr></thead>
-        <tbody>${rows}</tbody></table></div>
-      <p class="tj-sub">* directional hit is charged to each universe's start
-      archetype; P&amp;L columns attribute per session-day.</p>`;
+        <tbody>${rows}</tbody></table></div>`;
   }
 
   function renderDojoCoverage(uni) {
