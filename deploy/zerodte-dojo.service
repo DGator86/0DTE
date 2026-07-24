@@ -1,0 +1,36 @@
+[Unit]
+# Weekly "matrix training": recorded-tape walk-forward + adaptive learning
+# cycle + Markov-universe sparring (dojo.py). Persists a dojo report the
+# dashboard's Dojo tab (and the Vercel proxy) serves. Never auto-promotes.
+Description=0DTE dojo matrix-training run
+After=network-online.target zerodte-learn-weekly.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zerodte
+Group=zerodte
+WorkingDirectory=/opt/zerodte
+EnvironmentFile=/etc/zerodte/zerodte.env
+ExecStart=/opt/zerodte/venv/bin/python dojo.py \
+    --db /var/lib/zerodte/shadow.db \
+    --record-dir /var/lib/zerodte/ticks \
+    --configs-dir /var/lib/zerodte/configs \
+    --reports-dir /var/lib/zerodte/reports/dojo \
+    --universes 8 \
+    --generations 2 \
+    --days 8 \
+    --stride 5 \
+    --trials 15
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zerodte
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-dojo
+
+SuccessExitStatus=0

@@ -250,6 +250,29 @@ async def api_validation_report(report_id: int):
 
 
 # --------------------------------------------------------------------------- #
+# Dojo routes (matrix-training reports — dojo.py)                             #
+# --------------------------------------------------------------------------- #
+@app.get("/api/dojo")
+async def api_dojo(limit: int = Query(50, ge=1, le=200)):
+    """Dojo training-report history (validation_reports rows with
+    report_type='dojo'): recorded-tape walk-forward, learner outcome, and the
+    Markov-universe robustness matrix + situation coverage."""
+    db = _config.get("db", "shadow.db")
+    if not os.path.isfile(db):
+        return {"reports": [], "note": "journal database not found"}
+    return {"reports": validation_reports(db, report_type="dojo", limit=limit)}
+
+
+@app.get("/api/dojo/{report_id}")
+async def api_dojo_report(report_id: int):
+    db = _config.get("db", "shadow.db")
+    report = validation_report_by_id(db, report_id) if os.path.isfile(db) else None
+    if report is None or report.get("report_type") != "dojo":
+        raise HTTPException(status_code=404, detail="Dojo report not found")
+    return report
+
+
+# --------------------------------------------------------------------------- #
 # Adaptive-learning routes (Learning tab)                                     #
 # --------------------------------------------------------------------------- #
 @app.get("/api/learning")

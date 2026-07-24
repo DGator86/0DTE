@@ -1076,3 +1076,14 @@ html, body {
 .tab-dot.live { background: #f0a35e; box-shadow: 0 0 0 3px rgba(240,163,94,0.18); }
 .tab-dot.idle { background: var(--amber); }
 .tab-dot.off  { background: var(--muted-2); }
+
+/* ===================== Dojo tab (matrix training) ===================== */
+.dojo-scroll { overflow-x: auto; }
+.dojo-matrix { margin-bottom: 8px; }
+.dojo-matrix td, .dojo-matrix th { white-space: nowrap; }
+.dojo-pos { color: var(--green); }
+.dojo-neg { color: var(--red); }
+.dojo-cov-0 { color: var(--muted); opacity: 0.45; }
+.dojo-cov-1 { background: rgba(46,199,133,0.08); }
+.dojo-cov-2 { background: rgba(46,199,133,0.18); }
+.dojo-cov-3 { background: rgba(46,199,133,0.30); }
