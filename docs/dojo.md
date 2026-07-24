@@ -103,10 +103,15 @@ served at `/api/dojo`) and as JSON under `reports/dojo/`.
   diversity.
 - The smile is a single-parameter linear-in-log-moneyness slope (no wings,
   no curvature), so the gym cannot surface wing- or convexity-shaped failure
-  modes. The slope **is** now direction-coherent — an up-move (drift_up or an
-  up-resolving breakout) bids the calls, a down-move steepens the puts, and
-  breakout direction is biased by archetype (crash breaks down, squeeze
-  breaks up) — but shape realism beyond the slope is future work.
+  modes. The slope **is** direction-coherent and responsive: an up-move
+  (drift_up or an up-resolving breakout) bids the calls, a down-move steepens
+  the puts, breakout direction is archetype-biased (crash breaks down, squeeze
+  breaks up), and the skew value's OU target follows that direction directly
+  (theta 0.08 — ~65% of the way inside a ~12-min breakout) rather than waiting
+  on the slow discrete state. Note the skew follows the **intended/latent**
+  regime direction, not each minute's realized return (a single breakout
+  minute's noise dwarfs its drift). Shape realism beyond the slope is future
+  work.
 - The transition matrices, OU parameters, and target levels are hand-tuned
   from the system's thesis, not estimated from the joint distribution of real
   SPY 0DTE sessions. Calibrating them from recorded data is the natural next

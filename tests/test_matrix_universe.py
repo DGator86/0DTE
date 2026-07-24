@@ -257,3 +257,49 @@ def test_breakout_skew_override_is_deterministic():
     f1 = MarkovWorldFeed(_spec(start_archetype="vol_expansion", seed=3))
     f2 = MarkovWorldFeed(_spec(start_archetype="vol_expansion", seed=3))
     assert (f1._skew == f2._skew).all()
+
+
+# --------------------------------------------------------------------------- #
+# skew responsiveness + reproducibility (PR #141 follow-up)                    #
+# --------------------------------------------------------------------------- #
+def test_skew_ou_target_follows_override_fast():
+    """A sustained direction override must move the skew VALUE most of the way
+    to its target within a typical breakout (~15 min), not wait ~58 min for
+    the discrete Markov state to switch."""
+    from matrix_universe import VariableChain, _VAR_TARGETS
+    hi = _VAR_TARGETS["skew"]["high"]
+    mid = _VAR_TARGETS["skew"]["mid"]
+    ch = VariableChain("skew", np.random.default_rng(1))
+    val = mid
+    for _ in range(15):
+        val = ch.step("breakout", "high")   # sustained down-breakout
+    assert (val - mid) / (hi - mid) > 0.5   # >50% of the way to put-heavy
+
+    lo = _VAR_TARGETS["skew"]["low"]
+    ch2 = VariableChain("skew", np.random.default_rng(2))
+    val2 = mid
+    for _ in range(15):
+        val2 = ch2.step("breakout", "low")  # sustained up-breakout
+    assert val2 < mid                        # moved toward the call bid
+
+
+def test_override_does_not_change_non_overridden_vars():
+    """gex/rv/vrp/drift never receive an override, so their OU target stays
+    the discrete state — unchanged behavior."""
+    from matrix_universe import VariableChain
+    a = VariableChain("gex", np.random.default_rng(5))
+    b = VariableChain("gex", np.random.default_rng(5))
+    seq_a = [a.step("pin") for _ in range(30)]
+    seq_b = [b.step("pin") for _ in range(30)]
+    assert seq_a == seq_b
+
+
+def test_simulator_config_is_self_describing():
+    from matrix_universe import simulator_config, _BREAKOUT_P_UP, _SIMULATOR_VERSION
+    cfg = simulator_config()
+    assert cfg["version"] == _SIMULATOR_VERSION
+    assert cfg["breakout_p_up"] == _BREAKOUT_P_UP
+    assert cfg["breakout_p_up"]["crash"] < 0.5      # crash breaks down
+    assert cfg["breakout_p_up"]["squeeze_melt_up"] > 0.5
+    assert set(cfg["var_targets"]) == {"gex", "rv", "vrp", "skew", "drift"}
+    assert cfg["var_ou_theta"]["skew"] >= 0.08      # responsiveness pinned

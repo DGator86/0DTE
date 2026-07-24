@@ -208,12 +208,14 @@ _VAR_PREFERENCE: dict[str, dict[str, str]] = {
 
 def _skew_state(regime: str, breakout_dir: float) -> str:
     """Direction-aware skew preference. Positive skew is put-heavy (see
-    _VAR_TARGETS), so an UPSIDE move flattens toward a call bid ("low") and a
-    DOWNSIDE move steepens the put wing ("high"). Drift regimes carry their
-    own direction; breakout takes it from the active breakout_dir; pin and
-    compression stay symmetric ("mid"). This fixes the direction-agnostic
-    breakout smile flagged in review (an up-breakout no longer inherits a
-    down-breakout's put skew)."""
+    _VAR_TARGETS), so an INTENDED upside move flattens toward a call bid
+    ("low") and an intended downside move steepens the put wing ("high").
+    Drift regimes carry their own direction; breakout takes it from the
+    active (latent) breakout_dir; pin and compression stay symmetric ("mid").
+    Note this follows the INTENDED/latent direction of the regime, not each
+    minute's realized return — a single breakout minute's noise (1.4·σ) dwarfs
+    its 0.12·σ directional drift, so per-minute returns often oppose the skew
+    tilt even though the aggregate path leans the intended way."""
     if regime == "drift_up":
         return "low"
     if regime == "drift_down":
@@ -239,6 +241,32 @@ def _breakout_direction(archetype: str, rng: np.random.Generator) -> float:
     p_up = _BREAKOUT_P_UP.get(archetype, 0.5)
     return 1.0 if rng.random() < p_up else -1.0
 
+
+# Bump when any generative constant below changes (breakout probabilities,
+# skew/OU parameters, targets, transition matrices). A stored dojo report
+# records this + the tables via simulator_config(), so a universe result is
+# reproducible without pinning the exact commit.
+_SIMULATOR_VERSION = "2026.07.24"
+
+
+def simulator_config() -> dict:
+    """Self-describing snapshot of the constants that shape generated worlds.
+    Serialized into every dojo report so `(seed, archetype, tilt, vol,
+    jitter, generation)` plus this block fully determine a universe — the
+    breakout-direction table and OU/skew parameters no longer live only in
+    the source at a given commit."""
+    return {
+        "version": _SIMULATOR_VERSION,
+        "archetypes": list(ARCHETYPES),
+        "regimes": list(REGIMES),
+        "breakout_p_up": dict(_BREAKOUT_P_UP),
+        "var_targets": {k: dict(v) for k, v in _VAR_TARGETS.items()},
+        "var_ou_theta": dict(_VAR_OU_THETA),
+        "var_ou_noise": dict(_VAR_OU_NOISE),
+        "var_stay": _VAR_STAY,
+        "var_pull": _VAR_PULL,
+    }
+
 # Numeric targets per variable state. GEX in $bn gamma notional, vols
 # annualized, drift as fraction of minute-vol, skew in smile-slope units.
 _VAR_TARGETS: dict[str, dict[str, float]] = {
@@ -249,16 +277,26 @@ _VAR_TARGETS: dict[str, dict[str, float]] = {
     "drift": {"low": -0.10,  "mid": 0.0,   "high": 0.10},   # frac of minute-vol
 }
 
-_VAR_OU_THETA = {"gex": 0.06, "rv": 0.04, "vrp": 0.03, "skew": 0.03, "drift": 0.05}
+# skew theta is high (0.08 ≈ 33% of the gap closed in ~5 min, ~65% in ~12 min)
+# so the direction-selected target below is actually reached inside a typical
+# 11-20 min breakout, not ~58 min later. gex/rv/vrp/drift keep their slower
+# discrete-state cadence.
+_VAR_OU_THETA = {"gex": 0.06, "rv": 0.04, "vrp": 0.03, "skew": 0.08, "drift": 0.05}
 _VAR_OU_NOISE = {"gex": 0.12e9, "rv": 0.004, "vrp": 0.01, "skew": 0.003, "drift": 0.01}
 _VAR_STAY = 0.985           # per-minute probability a variable keeps its state
 _VAR_PULL = 0.010           # extra mass toward the regime's preferred state
 
 
 class VariableChain:
-    """One driver variable: 3-state Markov chain + OU relaxation toward the
-    active state's numeric target. Gets its own numpy Generator stream so
-    every variable has an independent Markov RNG, as specced."""
+    """One driver variable: 3-state Markov chain + OU relaxation toward a
+    numeric target. Gets its own numpy Generator stream so every variable has
+    an independent Markov RNG, as specced.
+
+    When a caller supplies `prefer_override` (skew does, per breakout/drift
+    direction) the OU target follows the OVERRIDE immediately rather than the
+    discrete Markov `state`, whose expected switch time (~1/(1-_VAR_STAY) ≈ 58
+    min) is far longer than a breakout lasts. Without an override the target is
+    the current discrete state, so gex/rv/vrp/drift are unchanged."""
 
     def __init__(self, name: str, rng: np.random.Generator,
                  scale: float = 1.0) -> None:
@@ -279,7 +317,10 @@ class VariableChain:
         states = list(probs)
         self.state = str(self.rng.choice(
             states, p=[probs[s] / total for s in states]))
-        target = _VAR_TARGETS[self.name][self.state] * self.scale
+        # OU target: relax toward the override when one is given (fast,
+        # direction-coherent skew), else toward the discrete Markov state.
+        target_state = prefer_override if prefer_override is not None else self.state
+        target = _VAR_TARGETS[self.name][target_state] * self.scale
         theta = _VAR_OU_THETA[self.name]
         noise = _VAR_OU_NOISE[self.name] * self.scale
         self.value += theta * (target - self.value) + noise * self.rng.standard_normal()
@@ -521,7 +562,7 @@ class MarkovWorldFeed:
                 g = chains["gex"].step(regime)
                 rv = max(chains["rv"].step(regime), 0.04)
                 vrp = max(chains["vrp"].step(regime), 0.75)
-                # skew tracks the realized move direction (see _skew_state)
+                # skew tracks the intended/latent move direction (see _skew_state)
                 skew = chains["skew"].step(regime, _skew_state(regime, breakout_dir))
                 drift = chains["drift"].step(regime)
 

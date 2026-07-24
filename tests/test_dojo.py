@@ -69,6 +69,11 @@ def test_run_dojo_persists_report_and_degrades_honestly():
         # JSON artifact written
         assert os.path.isfile(out["json_path"])
 
+        # simulator constants serialized for reproducibility
+        sim = phases["universe"]["simulator"]
+        assert sim["version"] and "breakout_p_up" in sim
+        assert sim["breakout_p_up"]["crash"] < 0.5
+
 
 def test_run_dojo_skip_universe():
     with tempfile.TemporaryDirectory() as tmp:
