@@ -65,19 +65,23 @@ market archetypes (day-scale chain)
   72 seeded, fully deterministic universes (`--full-lattice` runs them all;
   the default samples `--universes` per generation)
 - **Evolution**: each generation re-weights sampling toward the archetypes
-  the pipeline scored worst on — it spars hardest where it is weakest
+  the pipeline scored worst on — it spars hardest where it is weakest — and
+  from generation 1 onward applies seeded Dirichlet jitter to both
+  transition layers so no two generations replay identical dynamics
 - **Attribution**: every generated minute is labeled (archetype, regime), so
-  the report shows a **robustness matrix** (P&L / win rate / directional hit
-  per archetype) and a **situation coverage map** (minutes sparred per
-  archetype × regime cell)
+  the report shows a **robustness matrix** (P&L / win rate per archetype;
+  directional hit is charged to each universe's start archetype) and a
+  **situation coverage map** — reported both as generated environment
+  minutes and as the tick-stride subset the pipeline actually evaluated
+  (the flags and dashboard use the evaluated counts)
 
 ## Reading the report
 
 - **Robustness matrix** — a red `mean/sess` row is a market type where the
   pipeline loses money *in a world built from its own thesis*. That earns a
   `weak_archetype:<name>` flag and the amber tab dot.
-- **Coverage map** — cells at `·` are situations no universe has generated
-  yet; the next generations fill them in.
+- **Coverage map** — cells at `·` are situations the pipeline has not yet
+  evaluated; the next generations fill them in.
 - **Flags** — `no_recorded_tape`, `weak_archetype:*`,
   `promotion_pending_review`, `uncovered_situations`.
 

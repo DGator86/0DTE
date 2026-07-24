@@ -303,8 +303,14 @@ def _phase_universe(cfg: DojoConfig) -> dict:
         catalog = catalog.evolve(scores)
 
     matrix = _archetype_matrix(all_rows, all_feeds)
+    # two coverage matrices: generated minutes describe the ENVIRONMENT;
+    # evaluated ticks are what the pipeline actually sparred (tick_stride
+    # subset) — the honest coverage claim, and the one the flags use.
     coverage = merge_coverage(all_feeds)
+    coverage_eval = merge_coverage(all_feeds, evaluated=True)
     visited = sum(1 for a in coverage for r in coverage[a] if coverage[a][r] > 0)
+    visited_eval = sum(1 for a in coverage_eval for r in coverage_eval[a]
+                       if coverage_eval[a][r] > 0)
     return {
         "status": "ok",
         "lattice_size": lattice_size,
@@ -312,7 +318,9 @@ def _phase_universe(cfg: DojoConfig) -> dict:
         "generations": generations,
         "archetype_matrix": matrix,
         "coverage": coverage,
+        "coverage_evaluated": coverage_eval,
         "coverage_cells_visited": visited,
+        "coverage_cells_visited_evaluated": visited_eval,
         "coverage_cells_total": len(ARCHETYPES) * len(REGIMES),
     }
 
@@ -338,13 +346,13 @@ def _build_flags(recorded: dict, learner: dict, universe: dict) -> list[dict]:
                     "detail": f"mean session P&L {mean:+.4f} over "
                               f"{m['n_sessions']} sessions — the pipeline "
                               f"loses in this market type"})
-        cov = universe["coverage"]
+        cov = universe.get("coverage_evaluated") or universe["coverage"]
         missing = [f"{a}×{r}" for a in cov for r in cov[a] if cov[a][r] == 0]
         if missing:
             flags.append({"severity": "info", "flag": "uncovered_situations",
                           "detail": f"{len(missing)} (archetype × regime) "
-                                    f"cells not yet generated: "
-                                    f"{', '.join(missing[:6])}"
+                                    f"cells not yet evaluated by the "
+                                    f"pipeline: {', '.join(missing[:6])}"
                                     + ("…" if len(missing) > 6 else "")})
     return flags
 
@@ -361,11 +369,12 @@ def _summary_text(recorded: dict, learner: dict, universe: dict,
     parts.append(f"learner: {learner.get('outcome', learner.get('status'))}")
     if universe.get("status") == "ok":
         weak = sum(1 for f in flags if f["flag"].startswith("weak_archetype"))
+        visited = universe.get("coverage_cells_visited_evaluated",
+                               universe["coverage_cells_visited"])
         parts.append(
             f"universe sparring: {universe['n_universes']} universes, "
-            f"{universe['coverage_cells_visited']}/"
-            f"{universe['coverage_cells_total']} situation cells covered, "
-            f"{weak} weak archetype(s)")
+            f"{visited}/{universe['coverage_cells_total']} situation cells "
+            f"evaluated, {weak} weak archetype(s)")
     else:
         parts.append(f"universe sparring: {universe.get('status')}")
     return " · ".join(parts)
@@ -469,8 +478,10 @@ def main() -> None:
     uni = out["metrics"]["phases"]["universe"]
     if uni.get("status") == "ok":
         print("\n  Robustness matrix (per archetype):")
+        # dir(start): directional hit is charged to each universe's START
+        # archetype (it has no per-session decomposition)
         print(f"    {'archetype':<16} {'univ':>4} {'sess':>4} {'trades':>6} "
-              f"{'total_pnl':>10} {'mean/sess':>10} {'win%':>5} {'dir_hit':>7}")
+              f"{'total_pnl':>10} {'mean/sess':>10} {'win%':>5} {'dir(start)':>10}")
         for arch, m in uni["archetype_matrix"].items():
             wr = (f"{m['session_win_rate'] * 100:.0f}%"
                   if m["session_win_rate"] is not None else "—")
@@ -480,7 +491,7 @@ def main() -> None:
                     if m["mean_session_pnl"] is not None else "—")
             print(f"    {arch:<16} {m['n_universes']:>4} {m['n_sessions']:>4} "
                   f"{m['trades']:>6} {m['total_pnl']:>+10.4f} {mean:>10} "
-                  f"{wr:>5} {dh:>7}")
+                  f"{wr:>5} {dh:>10}")
     print(f"\n  JSON: {out['json_path']}")
     if args.json:
         print(json.dumps(out, indent=2, default=str))
