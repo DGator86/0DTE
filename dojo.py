@@ -167,10 +167,15 @@ def _phase_learner(cfg: DojoConfig) -> dict:
 # Phase 3 — universe sparring                                                 #
 # --------------------------------------------------------------------------- #
 def _run_universe(spec: UniverseSpec) -> tuple[dict, MarkovWorldFeed]:
+    # One generation per universe: timestamps() only reads pre-computed arrays
+    # (no _idx mutation), and run_backtest advances the feed via snapshot() —
+    # neither touches the situation labels / coverage we return, so the same
+    # feed serves both. (Generation is the expensive step; it was previously
+    # run twice per universe.)
     feed = MarkovWorldFeed(spec)
     ticks = feed.timestamps()
     jrn = Journal(":memory:")
-    tearsheet = run_backtest(MarkovWorldFeed(spec), ticks, journal=jrn)
+    tearsheet = run_backtest(feed, ticks, journal=jrn)
     cal = jrn.calibration()
     # per-session trade stats so archetype attribution matches the P&L's
     # session-level granularity (a universe can span several archetypes)

@@ -198,8 +198,46 @@ _VAR_PREFERENCE: dict[str, dict[str, str]] = {
     "drift_up":    {"gex": "mid",  "rv": "mid",  "vrp": "mid",  "skew": "low",  "drift": "high"},
     "drift_down":  {"gex": "low",  "rv": "mid",  "vrp": "mid",  "skew": "high", "drift": "low"},
     "compression": {"gex": "high", "rv": "low",  "vrp": "high", "skew": "mid",  "drift": "mid"},
+    # breakout skew is a PLACEHOLDER: the live value is chosen per-minute by
+    # _skew_state() from the realized move direction, because an up-breakout
+    # bids the calls while a down-breakout steepens the puts. "high" here is
+    # only the down-breakout / fallback default.
     "breakout":    {"gex": "low",  "rv": "high", "vrp": "low",  "skew": "high", "drift": "mid"},
 }
+
+
+def _skew_state(regime: str, breakout_dir: float) -> str:
+    """Direction-aware skew preference. Positive skew is put-heavy (see
+    _VAR_TARGETS), so an UPSIDE move flattens toward a call bid ("low") and a
+    DOWNSIDE move steepens the put wing ("high"). Drift regimes carry their
+    own direction; breakout takes it from the active breakout_dir; pin and
+    compression stay symmetric ("mid"). This fixes the direction-agnostic
+    breakout smile flagged in review (an up-breakout no longer inherits a
+    down-breakout's put skew)."""
+    if regime == "drift_up":
+        return "low"
+    if regime == "drift_down":
+        return "high"
+    if regime == "breakout":
+        return "low" if breakout_dir > 0 else "high"
+    return "mid"   # pin, compression: symmetric
+
+
+# Per-archetype probability that a breakout resolves UP. Directional
+# archetypes bias both the price path and (via _skew_state) the smile so the
+# two stay coherent — a crash breaks down and carries a put skew; a squeeze
+# breaks up and bids the calls. Everything else is a symmetric coin.
+_BREAKOUT_P_UP: dict[str, float] = {
+    "crash": 0.12, "grind_down": 0.34,
+    "squeeze_melt_up": 0.88, "grind_up": 0.66,
+}
+
+
+def _breakout_direction(archetype: str, rng: np.random.Generator) -> float:
+    """+1 (up) or -1 (down) for a breakout, biased by the day's archetype.
+    One RNG draw, so it is a drop-in for the previous 50/50 coin."""
+    p_up = _BREAKOUT_P_UP.get(archetype, 0.5)
+    return 1.0 if rng.random() < p_up else -1.0
 
 # Numeric targets per variable state. GEX in $bn gamma notional, vols
 # annualized, drift as fraction of minute-vol, skew in smile-slope units.
@@ -230,8 +268,8 @@ class VariableChain:
         self.state = "mid"
         self.value = _VAR_TARGETS[name]["mid"] * scale
 
-    def step(self, regime: str) -> float:
-        prefer = _VAR_PREFERENCE[regime][self.name]
+    def step(self, regime: str, prefer_override: Optional[str] = None) -> float:
+        prefer = prefer_override or _VAR_PREFERENCE[regime][self.name]
         others = [s for s in VAR_STATES if s != self.state]
         p_move = 1.0 - _VAR_STAY
         probs = {s: p_move / len(others) for s in others}
@@ -469,21 +507,22 @@ class MarkovWorldFeed:
 
             regime = _initial_regime(archetype, rng_regime)
             open_dt = dt.datetime(date.year, date.month, date.day, 9, 30, tzinfo=ET)
-            breakout_dir = 1.0 if rng_path.random() < 0.5 else -1.0
+            breakout_dir = _breakout_direction(archetype, rng_path)
 
             for m in range(MIN_PER_DAY):
                 base_row = self._regime_T[archetype][regime]
                 row = _tilt_row(base_row, regime, sp.persistence_tilt)
                 new_regime = str(rng_regime.choice(list(row), p=_norm(row)))
                 if new_regime == "breakout" and regime != "breakout":
-                    breakout_dir = 1.0 if rng_path.random() < 0.5 else -1.0
+                    breakout_dir = _breakout_direction(archetype, rng_path)
                 regime = new_regime
                 occupancy[regime] += 1
 
                 g = chains["gex"].step(regime)
                 rv = max(chains["rv"].step(regime), 0.04)
                 vrp = max(chains["vrp"].step(regime), 0.75)
-                skew = chains["skew"].step(regime)
+                # skew tracks the realized move direction (see _skew_state)
+                skew = chains["skew"].step(regime, _skew_state(regime, breakout_dir))
                 drift = chains["drift"].step(regime)
 
                 sig_min = rv / math.sqrt(MINUTES_PER_YEAR)

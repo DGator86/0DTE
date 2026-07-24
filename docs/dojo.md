@@ -101,3 +101,15 @@ served at `/api/dojo`) and as JSON under `reports/dojo/`.
   REAL data, Brier skill ≥ 0) still decide sizing. The dojo accelerates
   evaluation and hardening; it cannot substitute for live calendar
   diversity.
+- The smile is a single-parameter linear-in-log-moneyness slope (no wings,
+  no curvature), so the gym cannot surface wing- or convexity-shaped failure
+  modes. The slope **is** now direction-coherent — an up-move (drift_up or an
+  up-resolving breakout) bids the calls, a down-move steepens the puts, and
+  breakout direction is biased by archetype (crash breaks down, squeeze
+  breaks up) — but shape realism beyond the slope is future work.
+- The transition matrices, OU parameters, and target levels are hand-tuned
+  from the system's thesis, not estimated from the joint distribution of real
+  SPY 0DTE sessions. Calibrating them from recorded data is the natural next
+  step, with one caveat: the simulator's regimes (`pin`/`drift_*`/…) are a
+  distinct taxonomy from the live Legacy/V3 regime labels, so real-data
+  calibration needs a labeling bridge first — it is not a drop-in.
