@@ -63,14 +63,31 @@ r.to_dict()     # JSON for the live state / dashboard
 Pure, deterministic, no numpy/IO — safe on the live path and trivially tested
 (`tests/test_forecast_stabilizer.py`).
 
-## Where it fits (Stage 2)
+## Live wiring (Stage 2)
 
-This module is the foundation; the **cone visualization rebuild** (next PR)
-consumes `r.target` as the stabilized centerline and layers the existing V3
-outputs around it — the asymmetric quantile fan (`return_distribution` /
-`return_quantiles`), barrier-touch probabilities (`models/barrier_touch`),
-remaining-session high/low (`models/range_survival`), and regime-mixture
-confidence (`models/regime_moe`). The stabilizer lands first so the surfaced
-cone is stable from day one. Live wiring (extracting `σ_short`, `C`, `R`, and
-the break signals from each tick's snapshot) happens in that Stage-2 PR, next
-to the consumer.
+`UnifiedOrchestrator._stabilize_forecast` runs the shadow forecast median
+through one stabilizer per session and journals the result as `v2_fc_stab_*`
+signals (which flow into `live.forecast` via the existing `forecast_summary`
+passthrough):
+
+- **raw target** = `spot · (1 + return_q50_30m)` from the forecast bundle
+- **σ_short** = the 30m expected move (`expected_realized_move_30m · spot`),
+  falling back to a fraction of the session `expected_range`
+- **confidence** = `1 − uncertainty`
+- **regime-change intensity** = a bounded transform of the classifier's
+  `global_information_gain` (which spikes on regime flips)
+- **break signals** (initial conservative mapping) = a scheduled catalyst
+  (`has_catalyst`) and a below-flip veto (failed gamma-flip reclaim)
+
+The cone (`drawChart`) now tilts to `stab_target` with an **asymmetric** band
+built from the q10/q90 spread re-centered on the stabilized median, and labels
+the call/put walls with their barrier-touch probabilities
+(`p_touch_call_wall_30m` / `p_touch_put_wall_30m`). It falls back to the old
+symmetric `expected_range` cone when no forecast is present.
+
+Because the live bundle is still the **shadow heuristic** (`inference.py`,
+"until policy_mode=champion"), the cone shows a stabilized *heuristic* median
+today; when the trained V3 quantile models are promoted onto the live path the
+same wiring surfaces them unchanged. Remaining-session high/low
+(`models/range_survival`) and the full multi-band fan (50/80/95 across
+5/15/60/close) need the extra horizons journaled live — a later increment.

@@ -2461,34 +2461,80 @@
       ctx.font = "9px ui-monospace, monospace";
       ctx.fillText(label, padL + 2, y - 3);
     };
-    level(callWall, "#ff5470", "CALL WALL", false);
-    level(putWall, "#2ec785", "PUT WALL", false);
+    // wall levels carry their barrier-touch probability when the forecast has it
+    const fc = (live && live.forecast) || {};
+    const pTouchCall = num(fc.p_touch_call_wall_30m);
+    const pTouchPut = num(fc.p_touch_put_wall_30m);
+    const wallLbl = (base, p) => p != null
+      ? `${base} · touch ${(p * 100).toFixed(0)}%` : base;
+    level(callWall, "#ff5470", wallLbl("CALL WALL", pTouchCall), false);
+    level(putWall, "#2ec785", wallLbl("PUT WALL", pTouchPut), false);
     level(gammaFlip, "#ffb648", "γ-FLIP", true);
     level(vwap, "#4aa8ff", "VWAP", true);
 
     // --- projection cone (violet) from now to end ---
-    const yUp = Y(spot + band), yDn = Y(spot - band), yMid = Y(spot);
+    // Prefer the stabilized forecast: a tilted centerline to the whiplash-
+    // controlled target with an ASYMMETRIC band from the q10/q90 spread. Fall
+    // back to the symmetric expected_range band when no forecast is present.
+    const stabTarget = num(fc.stab_target);
     const xEnd = X(tEnd);
-    const grad = ctx.createLinearGradient(xNow, 0, xEnd, 0);
-    grad.addColorStop(0, "rgba(157,123,255,0.02)");
-    grad.addColorStop(1, "rgba(157,123,255,0.20)");
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.moveTo(xNow, yMid);
-    ctx.lineTo(xEnd, yUp);
-    ctx.lineTo(xEnd, yDn);
-    ctx.closePath();
-    ctx.fill();
-    ctx.strokeStyle = "rgba(157,123,255,0.5)";
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(xNow, yMid); ctx.lineTo(xEnd, yUp); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(xNow, yMid); ctx.lineTo(xEnd, yDn); ctx.stroke();
+    const yMidNow = Y(spot);
+    if (stabTarget != null && Number.isFinite(stabTarget)) {
+      const hiEnd = (num(fc.stab_hi) != null) ? num(fc.stab_hi) : stabTarget + band;
+      const loEnd = (num(fc.stab_lo) != null) ? num(fc.stab_lo) : stabTarget - band;
+      const yUp = Y(hiEnd), yDn = Y(loEnd), yMidEnd = Y(stabTarget);
+      const grad = ctx.createLinearGradient(xNow, 0, xEnd, 0);
+      grad.addColorStop(0, "rgba(157,123,255,0.02)");
+      grad.addColorStop(1, "rgba(157,123,255,0.20)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(xNow, yMidNow);
+      ctx.lineTo(xEnd, yUp);
+      ctx.lineTo(xEnd, yDn);
+      ctx.closePath();
+      ctx.fill();
+      // asymmetric band edges
+      ctx.strokeStyle = "rgba(157,123,255,0.5)";
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xEnd, yUp); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xEnd, yDn); ctx.stroke();
+      // tilted median centerline to the stabilized target
+      ctx.strokeStyle = "rgba(157,123,255,0.85)";
+      ctx.setLineDash([]);
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xEnd, yMidEnd); ctx.stroke();
+      ctx.fillStyle = "#9d7bff";
+      ctx.textAlign = "right";
+      ctx.font = "9px ui-monospace, monospace";
+      ctx.fillText(hiEnd.toFixed(1), xEnd - 2, yUp + 10);
+      ctx.fillText(loEnd.toFixed(1), xEnd - 2, yDn - 3);
+      ctx.fillText("→ " + stabTarget.toFixed(2), xEnd - 2, yMidEnd - 3);
+    } else {
+      // fallback: symmetric expected_range cone centered on spot
+      const yUp = Y(spot + band), yDn = Y(spot - band);
+      const grad = ctx.createLinearGradient(xNow, 0, xEnd, 0);
+      grad.addColorStop(0, "rgba(157,123,255,0.02)");
+      grad.addColorStop(1, "rgba(157,123,255,0.20)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(xNow, yMidNow);
+      ctx.lineTo(xEnd, yUp);
+      ctx.lineTo(xEnd, yDn);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "rgba(157,123,255,0.5)";
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xEnd, yUp); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xEnd, yDn); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#9d7bff";
+      ctx.textAlign = "right";
+      ctx.font = "9px ui-monospace, monospace";
+      ctx.fillText("+" + band.toFixed(1), xEnd - 2, yUp + 10);
+      ctx.fillText("-" + band.toFixed(1), xEnd - 2, yDn - 3);
+    }
     ctx.setLineDash([]);
-    ctx.fillStyle = "#9d7bff";
-    ctx.textAlign = "right";
-    ctx.font = "9px ui-monospace, monospace";
-    ctx.fillText("+" + band.toFixed(1), xEnd - 2, yUp + 10);
-    ctx.fillText("-" + band.toFixed(1), xEnd - 2, yDn - 3);
+    ctx.lineWidth = 1;
 
     // --- spot area + line ---
     const areaGrad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
