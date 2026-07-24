@@ -172,3 +172,22 @@ def test_result_is_json_serializable():
     import json
     assert json.loads(json.dumps(d))["transition"] in (
         "seed", "continue", "neutralize", "reverse", "hold")
+
+
+# --------------------------------------------------------------------------- #
+# return-space operation (belief stabilization) via flat_abs                  #
+# --------------------------------------------------------------------------- #
+def test_return_space_lean_uses_flat_abs():
+    # spot=0.0 reference (return space); flat band 3bp
+    up = _s().update(0.0005, spot=0.0, sigma_short=0.001, flat_abs=0.0003)
+    assert up.lean == 1                       # +5bp return -> bullish
+    flat = _s().update(0.0001, spot=0.0, sigma_short=0.001, flat_abs=0.0003)
+    assert flat.lean == 0                      # +1bp within the flat band
+    dn = _s().update(-0.0005, spot=0.0, sigma_short=0.001, flat_abs=0.0003)
+    assert dn.lean == -1
+
+
+def test_flat_abs_none_falls_back_to_price_space():
+    # unchanged price-space behavior when flat_abs omitted
+    r = _s().update(743.0, spot=742.0, sigma_short=0.2)
+    assert r.lean == 1

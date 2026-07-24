@@ -70,20 +70,30 @@ through one stabilizer per session and journals the result as `v2_fc_stab_*`
 signals (which flow into `live.forecast` via the existing `forecast_summary`
 passthrough):
 
-- **raw target** = `spot · (1 + return_q50_30m)` from the forecast bundle
-- **σ_short** = the 30m expected move (`expected_realized_move_30m · spot`),
-  falling back to a fraction of the session `expected_range`
+- **signal** = the expected **30m return** `return_q50_30m` — the belief is
+  stabilized in *return space* (`spot=0`, `flat_abs=±3bp`), and the price
+  target is reconstructed as `spot · (1 + stab_ret)` from the **current** spot
+  each tick. Stabilizing the return rather than an absolute price means a
+  rising spot at an unchanged forecast tracks 1:1 without reading as a
+  revision — no spurious deadband/hysteresis, no stale lean.
+- **σ_short** = the 30m expected move `expected_realized_move_30m` (a return),
+  falling back to `expected_range / spot`
 - **confidence** = `1 − uncertainty`
 - **regime-change intensity** = a bounded transform of the classifier's
-  `global_information_gain` (which spikes on regime flips)
+  `global_information_gain` (spikes on regime flips)
 - **break signals** (initial conservative mapping) = a scheduled catalyst
-  (`has_catalyst`) and a below-flip veto (failed gamma-flip reclaim)
+  (`has_catalyst`) and a below-flip veto (failed gamma-flip reclaim); the wired
+  subset is exposed as `v2_fc_stab_brk_*` coverage flags
+- **horizon** = `v2_fc_stab_horizon_min` (30) so the dashboard draws the cone
+  to the real target time, not the chart width
+- the asymmetric band uses the q10/q90 return spread, **validated** for
+  finiteness and monotone ordering (`q10 ≤ q50 ≤ q90`) before it is emitted
 
-The cone (`drawChart`) now tilts to `stab_target` with an **asymmetric** band
-built from the q10/q90 spread re-centered on the stabilized median, and labels
-the call/put walls with their barrier-touch probabilities
-(`p_touch_call_wall_30m` / `p_touch_put_wall_30m`). It falls back to the old
-symmetric `expected_range` cone when no forecast is present.
+The cone (`drawChart`) tilts to the stabilized target, draws the band only to
+the **actual target time** (`now + horizon`, capped at close) with a `+30m`
+marker, shows the raw median faintly alongside the stabilized one, and labels
+the call/put walls with their barrier-touch probabilities. It falls back to
+the symmetric `expected_range` cone when no forecast is present.
 
 Because the live bundle is still the **shadow heuristic** (`inference.py`,
 "until policy_mode=champion"), the cone shows a stabilized *heuristic* median

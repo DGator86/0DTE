@@ -2480,35 +2480,57 @@
     const xEnd = X(tEnd);
     const yMidNow = Y(spot);
     if (stabTarget != null && Number.isFinite(stabTarget)) {
+      // draw the cone to the forecast's ACTUAL target time (now + horizon,
+      // capped at close), not the chart endpoint — a 30-minute forecast must
+      // not be stretched to the session close (review of #146/#147, item 2).
+      const horizonMin = num(fc.stab_horizon_min) || 30;
+      const tTarget = Math.min(tLast + horizonMin * 60000, tEnd);
+      const xTgt = X(tTarget);
       const hiEnd = (num(fc.stab_hi) != null) ? num(fc.stab_hi) : stabTarget + band;
       const loEnd = (num(fc.stab_lo) != null) ? num(fc.stab_lo) : stabTarget - band;
       const yUp = Y(hiEnd), yDn = Y(loEnd), yMidEnd = Y(stabTarget);
-      const grad = ctx.createLinearGradient(xNow, 0, xEnd, 0);
+      const grad = ctx.createLinearGradient(xNow, 0, xTgt, 0);
       grad.addColorStop(0, "rgba(157,123,255,0.02)");
-      grad.addColorStop(1, "rgba(157,123,255,0.20)");
+      grad.addColorStop(1, "rgba(157,123,255,0.22)");
       ctx.fillStyle = grad;
       ctx.beginPath();
       ctx.moveTo(xNow, yMidNow);
-      ctx.lineTo(xEnd, yUp);
-      ctx.lineTo(xEnd, yDn);
+      ctx.lineTo(xTgt, yUp);
+      ctx.lineTo(xTgt, yDn);
       ctx.closePath();
       ctx.fill();
       // asymmetric band edges
       ctx.strokeStyle = "rgba(157,123,255,0.5)";
       ctx.setLineDash([4, 4]);
-      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xEnd, yUp); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xEnd, yDn); ctx.stroke();
-      // tilted median centerline to the stabilized target
-      ctx.strokeStyle = "rgba(157,123,255,0.85)";
+      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xTgt, yUp); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xTgt, yDn); ctx.stroke();
+      // raw (unstabilized) median, faint, so the smoothing is visible
+      const rawRet = num(fc.return_q50_30m);
+      if (rawRet != null) {
+        ctx.strokeStyle = "rgba(157,123,255,0.28)";
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath(); ctx.moveTo(xNow, yMidNow);
+        ctx.lineTo(xTgt, Y(spot * (1 + rawRet))); ctx.stroke();
+      }
+      // tilted stabilized median centerline
+      ctx.strokeStyle = "rgba(157,123,255,0.9)";
       ctx.setLineDash([]);
-      ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xEnd, yMidEnd); ctx.stroke();
+      ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.moveTo(xNow, yMidNow); ctx.lineTo(xTgt, yMidEnd); ctx.stroke();
+      ctx.lineWidth = 1;
+      // explicit target-time marker so the horizon is read, not inferred
+      ctx.strokeStyle = "rgba(157,123,255,0.25)";
+      ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(xTgt, padT); ctx.lineTo(xTgt, padT + plotH); ctx.stroke();
+      ctx.setLineDash([]);
       ctx.fillStyle = "#9d7bff";
       ctx.textAlign = "right";
       ctx.font = "9px ui-monospace, monospace";
-      ctx.fillText(hiEnd.toFixed(1), xEnd - 2, yUp + 10);
-      ctx.fillText(loEnd.toFixed(1), xEnd - 2, yDn - 3);
-      ctx.fillText("→ " + stabTarget.toFixed(2), xEnd - 2, yMidEnd - 3);
+      ctx.fillText(hiEnd.toFixed(1), xTgt - 2, yUp + 10);
+      ctx.fillText(loEnd.toFixed(1), xTgt - 2, yDn - 3);
+      ctx.fillText("→ " + stabTarget.toFixed(2), xTgt - 2, yMidEnd - 3);
+      ctx.textAlign = "center";
+      ctx.fillText("+" + horizonMin + "m", xTgt, padT + plotH - 4);
     } else {
       // fallback: symmetric expected_range cone centered on spot
       const yUp = Y(spot + band), yDn = Y(spot - band);

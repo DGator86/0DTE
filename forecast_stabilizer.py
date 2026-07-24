@@ -151,19 +151,30 @@ class ForecastStabilizer:
     # -- the update ----------------------------------------------------------
     def update(self, raw_target: float, spot: float, sigma_short: float,
                confidence: float = 1.0, regime_change_intensity: float = 1.0,
-               breaks: Optional[BreakSignals] = None) -> StabilizedForecast:
+               breaks: Optional[BreakSignals] = None,
+               flat_abs: Optional[float] = None) -> StabilizedForecast:
         """
-        raw_target              the tick's unfiltered forecast target (price)
-        spot                    current spot (defines the bullish/bearish lean)
-        sigma_short             short-horizon price sigma (deadband scale)
+        raw_target              the tick's unfiltered forecast SIGNAL. Prefer a
+                                spot-invariant belief (an expected RETURN) with
+                                `spot=0.0` so translation of the underlying does
+                                not read as a forecast revision; a price target
+                                also works but then spot moves contaminate it.
+        spot                    reference the lean is measured against (0.0 in
+                                return space; current spot in price space)
+        sigma_short             short-horizon sigma in the signal's units
         confidence              C_t in [0,1] — model confidence in raw_target
         regime_change_intensity R_t in [0,1] — 0 stable .. 1 strong change
         breaks                  confirmed structural-break signals (override)
+        flat_abs                absolute half-width of the "no lean" band around
+                                `spot`. None -> cfg.flat_frac * |spot| (price
+                                space); pass a small return threshold in return
+                                space, where flat_frac*|0| would be degenerate.
         """
         cfg = self.cfg
         breaks = breaks or BreakSignals()
         sigma_short = max(float(sigma_short), 1e-9)
-        raw_lean = _lean_of(raw_target, spot, cfg.flat_frac * spot)
+        flat = cfg.flat_frac * abs(spot) if flat_abs is None else float(flat_abs)
+        raw_lean = _lean_of(raw_target, spot, flat)
 
         # -- first tick of the session: seed straight from the raw reading ---
         if self._target is None:
@@ -181,7 +192,7 @@ class ForecastStabilizer:
             alpha = _clip(cfg.break_alpha, cfg.alpha_min, cfg.alpha_max)
             new = (1.0 - alpha) * prev + alpha * raw_target
             self._target = new
-            self._lean = _lean_of(new, spot, cfg.flat_frac * spot)
+            self._lean = _lean_of(new, spot, flat)
             return StabilizedForecast(
                 target=new, raw_target=raw_target, prev_target=prev,
                 changed=abs(new - prev) > 1e-9, alpha=alpha, deadband=0.0,
@@ -190,7 +201,7 @@ class ForecastStabilizer:
                 lean=self._lean, override=breaks.active())
 
         # -- classify the transition the raw move implies --------------------
-        transition, mult = _classify(prev, raw_target, spot, self._lean, cfg)
+        transition, mult = _classify(prev, raw_target, spot, self._lean, cfg, flat)
         deadband = cfg.deadband_k * sigma_short * mult
 
         # -- adaptive deadband + hysteresis: hold on insufficient evidence ---
@@ -208,7 +219,7 @@ class ForecastStabilizer:
                       cfg.alpha_min, cfg.alpha_max)
         new = (1.0 - alpha) * prev + alpha * raw_target
         self._target = new
-        self._lean = _lean_of(new, spot, cfg.flat_frac * spot)
+        self._lean = _lean_of(new, spot, flat)
         return StabilizedForecast(
             target=new, raw_target=raw_target, prev_target=prev,
             changed=abs(new - prev) > 1e-9, alpha=alpha, deadband=deadband,
@@ -226,11 +237,11 @@ def _lean_of(target: float, spot: float, flat_abs: float) -> int:
 
 
 def _classify(prev: float, raw: float, spot: float, cur_lean: int,
-              cfg: StabilizerConfig) -> tuple[str, float]:
+              cfg: StabilizerConfig, flat: float) -> tuple[str, float]:
     """Which transition does moving from prev toward raw imply, relative to the
     current lean (target vs spot)? Continue (extend lean) is easiest, reverse
     (cross spot to the other side) is hardest."""
-    raw_lean = _lean_of(raw, spot, cfg.flat_frac * spot)
+    raw_lean = _lean_of(raw, spot, flat)
     move = raw - prev
     if cur_lean == 0:
         # no established lean yet: any move is a "continue"
