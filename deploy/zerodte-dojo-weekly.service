@@ -1,0 +1,38 @@
+[Unit]
+# Weekend deep dojo: the FULL 72-cell lattice (every archetype × tilt × vol),
+# calibrated from ALL recorded history (no recent-day window). The exhaustive
+# weekly robustness sweep. Never auto-promotes.
+Description=0DTE dojo — weekly full 72-universe lattice + calibration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zerodte
+Group=zerodte
+WorkingDirectory=/opt/zerodte
+EnvironmentFile=/etc/zerodte/zerodte.env
+ExecStart=/opt/zerodte/venv/bin/python dojo.py \
+    --db /var/lib/zerodte/shadow.db \
+    --record-dir /var/lib/zerodte/ticks \
+    --configs-dir /var/lib/zerodte/configs \
+    --reports-dir /var/lib/zerodte/reports/dojo \
+    --full-lattice \
+    --days 8 \
+    --generations 2 \
+    --trials 25 \
+    --calibrate-from-recorded
+
+# the 72-lattice run is long — give it room before systemd calls it hung
+TimeoutStartSec=4h
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zerodte
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-dojo-weekly
+
+SuccessExitStatus=0

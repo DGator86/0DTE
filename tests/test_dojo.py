@@ -98,6 +98,14 @@ def test_run_dojo_calibrate_from_recorded_degrades_without_tape():
         assert "canonical priors" in (uni["calibration_note"] or "")
 
 
+def test_run_dojo_records_recent_days_in_config():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = run_dojo(_tiny_cfg(tmp, recent_days=3))
+        assert out["metrics"]["config"]["recent_days"] == 3
+        # with no tape, the recorded phase still degrades cleanly
+        assert out["metrics"]["phases"]["recorded"]["status"] == "insufficient_data"
+
+
 # --------------------------------------------------------------------------- #
 # attribution                                                                 #
 # --------------------------------------------------------------------------- #
