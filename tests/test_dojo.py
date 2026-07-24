@@ -73,6 +73,10 @@ def test_run_dojo_persists_report_and_degrades_honestly():
         sim = phases["universe"]["simulator"]
         assert sim["version"] and "breakout_p_up" in sim
         assert sim["breakout_p_up"]["crash"] < 0.5
+        # complete model + content hash + git commit travel with the report
+        assert "arch_transition" in sim and "gen_params" in sim
+        assert len(phases["universe"]["simulator_hash"]) == 64
+        assert "git_commit" in out["metrics"]     # None off a repo is fine
 
 
 def test_run_dojo_skip_universe():

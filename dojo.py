@@ -52,11 +52,24 @@ from backtest import run_backtest
 from journal import Journal, economic_pnl
 from matrix_universe import (
     ARCHETYPES, REGIMES, MarkovWorldFeed, UniverseCatalog, UniverseSpec,
-    merge_coverage, simulator_config,
+    merge_coverage, simulator_config, simulator_config_hash,
 )
 from walk_forward import WalkForwardConfig, run_walk_forward
 
 ET = ZoneInfo("America/New_York")
+
+
+def _git_commit() -> Optional[str]:
+    """Best-effort current commit SHA for reproducibility; None off a repo."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or None if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -327,9 +340,11 @@ def _phase_universe(cfg: DojoConfig) -> dict:
         "coverage_cells_visited": visited,
         "coverage_cells_visited_evaluated": visited_eval,
         "coverage_cells_total": len(ARCHETYPES) * len(REGIMES),
-        # reproducibility: the exact generative constants (version + breakout
-        # table + OU/skew params) these universes were sparred under
+        # reproducibility: the COMPLETE generative model (transition matrices,
+        # var tables, breakout table, all price/gap/chain/snapshot params) plus
+        # its content hash — a stored report is auditable without diffing source
         "simulator": simulator_config(),
+        "simulator_hash": simulator_config_hash(),
     }
 
 
@@ -407,6 +422,9 @@ def run_dojo(cfg: Optional[DojoConfig] = None) -> dict:
         "phases": {"recorded": recorded, "learner": learner,
                    "universe": universe},
         "elapsed_s": round(time.time() - started, 1),
+        # the code that produced this report (best-effort) — pairs with the
+        # universe phase's simulator_hash so a result is exactly reproducible
+        "git_commit": _git_commit(),
         "config": {
             "record_dir": cfg.record_dir, "wf_folds": cfg.wf_folds,
             "learn_trials": cfg.learn_trials,
