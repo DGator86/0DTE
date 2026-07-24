@@ -52,7 +52,7 @@ from backtest import run_backtest
 from journal import Journal, economic_pnl
 from matrix_universe import (
     ARCHETYPES, REGIMES, MarkovWorldFeed, UniverseCatalog, UniverseSpec,
-    merge_coverage,
+    merge_coverage, simulator_config,
 )
 from walk_forward import WalkForwardConfig, run_walk_forward
 
@@ -327,6 +327,9 @@ def _phase_universe(cfg: DojoConfig) -> dict:
         "coverage_cells_visited": visited,
         "coverage_cells_visited_evaluated": visited_eval,
         "coverage_cells_total": len(ARCHETYPES) * len(REGIMES),
+        # reproducibility: the exact generative constants (version + breakout
+        # table + OU/skew params) these universes were sparred under
+        "simulator": simulator_config(),
     }
 
 
