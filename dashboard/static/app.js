@@ -3893,19 +3893,41 @@
         <tbody>${rows}</tbody></table></div>`;
   }
 
+  function dojoCoverageGrid(raw) {
+    // SPY-DER reports nest the archetype×regime counts under `.cells`
+    // (`{cells: {calm_pin: {pin: n, ...}}, coverage_fraction, ...}`). Older
+    // reports were already flat (`{calm_pin: {pin: n, ...}}`). Treat either.
+    if (!raw || typeof raw !== "object") return {};
+    const nested = raw.cells;
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      const first = Object.values(nested)[0];
+      if (first && typeof first === "object" && !Array.isArray(first)) return nested;
+    }
+    return raw;
+  }
+
   function renderDojoCoverage(uni) {
     // Prefer evaluated-tick coverage (what the pipeline actually decided on);
     // older reports only carry generated-minute coverage.
     const evaluated = !!(uni && uni.coverage_evaluated);
-    const cov = (uni && (uni.coverage_evaluated || uni.coverage)) || {};
-    const archs = Object.keys(cov);
+    const cov = dojoCoverageGrid(
+      (uni && (uni.coverage_evaluated || uni.coverage)) || {}
+    );
+    const archs = Object.keys(cov).filter((a) => {
+      const row = cov[a];
+      return row && typeof row === "object" && !Array.isArray(row);
+    });
     if (!archs.length) return "";
     const regimes = Object.keys(cov[archs[0]] || {});
-    const maxN = Math.max(1, ...archs.flatMap((a) => regimes.map((r) => cov[a][r] || 0)));
+    const counts = archs.flatMap((a) => regimes.map((r) => {
+      const n = num(cov[a][r]);
+      return n == null ? 0 : n;
+    }));
+    const maxN = Math.max(1, ...counts);
     const unit = evaluated ? "pipeline evaluations" : "generated minutes";
     const rows = archs.map((a) => {
       const cells = regimes.map((r) => {
-        const n = cov[a][r] || 0;
+        const n = num(cov[a][r]) || 0;
         const heat = n === 0 ? "dojo-cov-0"
           : n > maxN * 0.5 ? "dojo-cov-3"
           : n > maxN * 0.15 ? "dojo-cov-2" : "dojo-cov-1";
@@ -3929,14 +3951,34 @@
     const m = rep.metrics || {};
     const phases = m.phases || {};
     const parts = [];
+    const cfg = m.config || {};
+    const elapsed = num(m.elapsed_s);
 
     parts.push(`<p class="val-summary">${esc(rep.summary || "—")}</p>`);
+    parts.push('<div class="metrics">'
+      + metricCard("Elapsed", elapsed == null ? "—" : fmtDuration(elapsed))
+      + metricCard("Lattice", cfg.full_lattice ? "full" : "sample")
+      + metricCard("Generations", String(cfg.generations ?? "—"))
+      + metricCard("Universes/gen", String(cfg.universes_per_gen ?? "—"))
+      + "</div>");
 
     const flags = rep.flags || [];
     if (flags.length) {
       parts.push('<div class="chips">' + flags.map((f) =>
         `<span class="chip ${f.severity === "warn" ? "warn" : f.severity === "alert" ? "veto" : ""}"
           title="${esc(f.detail || "")}">${esc(f.flag)}</span>`).join("") + "</div>");
+      // Loud banner: a finished run with no tape looks like "no results" otherwise.
+      const thin = flags.filter((f) =>
+        /no_recorded|insufficient/i.test(String(f.flag || ""))
+        || /insufficient|no .*tape|need/i.test(String(f.detail || ""))
+      );
+      if (thin.length) {
+        parts.push('<p class="empty" style="margin-top:10px">'
+          + 'This Dojo run <b>finished</b>, but there was nothing useful to train on: '
+          + esc(thin.map((f) => f.detail || f.flag).join(" · "))
+          + ". Coverage below is synthetic only — P&amp;L stays empty until the "
+          + "shadow loop records market sessions.</p>");
+      }
     }
 
     // phase status strip
@@ -3944,7 +3986,7 @@
       ["recorded", "learner", "universe"].map((p) => {
         const ph = phases[p] || {};
         const st = ph.status || ph.outcome || "—";
-        const cls = st === "ok" ? "ok" : (st === "error" ? "veto" : "");
+        const cls = st === "ok" ? "ok" : (st === "error" ? "veto" : "warn");
         return `<span class="chip ${cls}" title="${esc(ph.note || "")}">${esc(DOJO_PHASE_LABEL[p])}: ${esc(String(st))}</span>`;
       }).join("") + "</div>");
 
@@ -3965,6 +4007,9 @@
         + metricCard("Profitable folds", `${wf.n_profitable ?? "—"}/${wf.n_valid_folds ?? "—"}`)
         + metricCard("Session CI (95%)", ci)
         + "</div>");
+    } else if (rec.status || rec.note) {
+      parts.push('<h3 class="val-h3">Recorded tape — real-data walk-forward</h3>');
+      parts.push(`<p class="empty">${esc(rec.note || rec.status || "no recorded tape")}</p>`);
     }
 
     // phase 2 — learner
@@ -3983,13 +4028,27 @@
     // phase 3 — universe sparring
     const uni = phases.universe || {};
     if (uni.status === "ok") {
+      parts.push('<h3 class="val-h3">Universe sparring</h3>');
+      parts.push('<div class="metrics">'
+        + metricCard("Universes", String(uni.n_universes ?? "—"))
+        + metricCard("Snapshots", String(uni.n_snapshots ?? "—"))
+        + metricCard("Scored", String(uni.n_scored_universes ?? "—"))
+        + metricCard("Days/universe", String(uni.universe_days ?? "—"))
+        + "</div>");
+      if (uni.note) {
+        parts.push(`<p class="tj-sub">${esc(uni.note)}</p>`);
+      }
       parts.push(renderDojoMatrix(uni));
       parts.push(renderDojoCoverage(uni));
-      const gens = uni.generations || [];
-      if (gens.length > 1) {
-        parts.push(`<p class="tj-sub">${gens.length} generations ·
-          ${uni.n_universes} universes of a ${uni.lattice_size}-cell lattice ·
-          each generation re-weights toward the weakest archetypes</p>`);
+      // `generations` is a count in current SPY-DER reports; older ones used an array.
+      const gens = Array.isArray(uni.generations)
+        ? uni.generations.length
+        : num(uni.generations);
+      if (gens != null && gens > 1) {
+        parts.push(`<p class="tj-sub">${gens} generations ·
+          ${uni.n_universes ?? "?"} universes`
+          + (uni.lattice_size != null ? ` of a ${uni.lattice_size}-cell lattice` : "")
+          + ` · each generation re-weights toward the weakest archetypes</p>`);
       }
     }
 
