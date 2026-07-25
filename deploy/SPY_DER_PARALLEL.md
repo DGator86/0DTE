@@ -23,8 +23,13 @@ Phase 5 ownership: **SPY-DER owns all AI**. 0DTE publishes `MarketPacket` /
 Manual one-shot (root):
 
 ```bash
+# If the outbox is empty but shadow.db has history, backfill first:
+sudo -u zerodte /opt/zerodte/venv/bin/python \
+  /opt/zerodte/scripts/backfill_experience_from_journal.py \
+  --db /var/lib/zerodte/shadow.db \
+  --root /var/lib/zerodte/spyder_experience
 sudo bash /opt/zerodte/deploy/ops/sync-experience-to-spyder.sh
-# then: sudo systemctl start spy-der-dojo-recent.service
+sudo systemctl start spy-der-dojo-recent.service
 ```
 
 AI keys (`XAI_API_KEY`, model routing) belong in the **SPY-DER** environment,

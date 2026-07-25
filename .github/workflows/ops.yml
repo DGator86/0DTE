@@ -8,9 +8,9 @@ name: VPS Ops
 #
 # Commands (see deploy/remote-ops.sh): status, logs, report,
 # diagnose-tradier, diagnose-tastytrade, restart, settle, validate, learn,
-# experience-status, test-notify.
-# Everything is read/observe except `restart`, `settle`, and `learn`;
-# nothing places an order (the service is shadow-mode only).
+# experience-status, backfill-experience, test-notify.
+# Everything is read/observe except `restart`, `settle`, `learn`, and
+# `backfill-experience`; nothing places an order (shadow-mode only).
 
 on:
   workflow_dispatch:
@@ -32,6 +32,7 @@ on:
           - validate
           - learn
           - experience-status
+          - backfill-experience
           - test-notify
       arg:
         description: "Optional arg: log line count, symbol for diagnose, YYYY-MM-DD for settle, daily/weekly for validate, or daily/evening/weekly for learn"

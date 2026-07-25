@@ -105,6 +105,27 @@ case "$CMD" in
     # Read-only: confirm 0DTE outbox → SPY-DER Dojo inbox sync state.
     SRC="${ZERODTE_SPYDER_EXPERIENCE_ROOT:-/var/lib/zerodte/spyder_experience}"
     DST="${SPY_DER_EXPERIENCE_INBOX:-/var/lib/spy-der/inbox/experience}"
+    echo "--- journal ($DB) ---"
+    if [ -f "$DB" ]; then
+      as_svc "$PY" - <<PY
+import sqlite3
+c = sqlite3.connect("$DB")
+sessions = c.execute("SELECT COUNT(DISTINCT session_date) FROM evaluations").fetchone()[0]
+rows = c.execute("SELECT COUNT(*) FROM evaluations").fetchone()[0]
+snaps = c.execute(
+    "SELECT COUNT(*) FROM evaluations WHERE snapshot_id IS NOT NULL AND snapshot_id != ''"
+).fetchone()[0]
+print(f"sessions={sessions} evaluations={rows} with_snapshot_id={snaps}")
+print("dates:", ", ".join(
+    r[0] for r in c.execute(
+        "SELECT DISTINCT session_date FROM evaluations ORDER BY session_date"
+    ).fetchall()
+))
+PY
+    else
+      echo "journal missing"
+    fi
+    echo
     echo "--- source outbox: $SRC ---"
     if [ -d "$SRC/snapshots" ]; then
       echo "snapshots: $(find "$SRC/snapshots" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
@@ -140,6 +161,22 @@ case "$CMD" in
     systemctl status zerodte-sync-experience.timer --no-pager -l 2>&1 | head -n 20 || true
     ;;
 
+  backfill-experience)
+    # Convert shadow.db evaluations → MarketPacket/OutcomePacket outbox, then sync.
+    # ARG: optional stride (default 1). Example: ARG=5 keeps every 5th row.
+    stride="${ARG:-1}"
+    case "$stride" in ''|*[!0-9]*) stride=1 ;; esac
+    [ "$stride" -ge 1 ] || stride=1
+    echo "backfill stride=$stride db=$DB"
+    as_svc "$PY" "$APP/scripts/backfill_experience_from_journal.py" \
+        --db "$DB" \
+        --root /var/lib/zerodte/spyder_experience \
+        --stride "$stride"
+    if [ -x "$APP/deploy/ops/sync-experience-to-spyder.sh" ]; then
+      bash "$APP/deploy/ops/sync-experience-to-spyder.sh" || true
+    fi
+    ;;
+
   test-notify)
     # Send a test push through the SAME ntfy path real trade signals use, reading
     # the topic from the 0600 env file (as root). The topic is never printed —
@@ -168,7 +205,7 @@ PYEOF
 
   *)
     echo "Unknown command: $CMD" >&2
-    echo "Valid: status | logs | report | paper-report | diagnose-tradier | diagnose-tastytrade | restart | settle | validate | learn | experience-status | test-notify" >&2
+    echo "Valid: status | logs | report | paper-report | diagnose-tradier | diagnose-tastytrade | restart | settle | validate | learn | experience-status | backfill-experience | test-notify" >&2
     exit 2
     ;;
 esac
