@@ -1,9 +1,12 @@
 [Unit]
+# DEPRECATED (Phase 5): AI / Dojo ownership moved to SPY-DER.
+# Keep this unit file for VPS cutover reference only — do not enable on new
+# hosts. Deploy spy-der-dojo-daily.timer from DGator86/SPY-DER instead.
 # Daily light dojo: review the last 3 recorded sessions + a shallow universe
 # sparring pass (3-day worlds, 1 generation). Fast recency health-check.
 # Persists a dojo report the dashboard Dojo tab (and Vercel proxy) serves.
 # Never auto-promotes.
-Description=0DTE dojo — daily recent-3-day review
+Description=DEPRECATED — use spy-der-dojo-daily (0DTE dojo daily)
 After=network-online.target
 Wants=network-online.target
 

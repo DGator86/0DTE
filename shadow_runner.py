@@ -137,26 +137,34 @@ class ShadowRunner:
         # an "exit" action actually closes) — a single flag, never three that
         # can drift apart.
         self._ras_cfg = RASConfig(exit_enabled=ras_exit)
-        # Champion config: the ONE live configuration, produced by the
-        # adaptive-learning promotion flow and installed only via the human
-        # approval CLI. Missing file = dataclass defaults (unchanged
-        # behaviour); an INVALID file raises — silently trading on defaults
-        # when a champion was intended is the worse failure mode.
+        # Champion config: produced by SPY-DER learning/promotion and applied
+        # mechanically here. Prefer /var/lib/spy-der/configs/champion.json,
+        # then legacy 0DTE paths. Missing file = dataclass defaults; an
+        # INVALID file raises — silently trading on defaults when a champion
+        # was intended is the worse failure mode.
         engine_cfg = classifier_cfg = None
         regime_overrides = None
         self.champion = None
-        if champion_path is None:
-            champion_path = os.path.join("configs", "champion.json")
-        if champion_path and os.path.isfile(champion_path):
-            from adaptive_learning.config_store import load_config
-            rec = load_config(champion_path)          # raises on invalid file
-            engine_cfg, classifier_cfg = rec.engine_cfg()
-            regime_overrides = rec.regime_overrides or None
-            self.champion = rec
+        from integrations.spy_der.champion_reader import (
+            load_champion_file,
+            resolve_champion_path,
+        )
+        if champion_path == "":
+            resolved = None
+        elif champion_path is None:
+            resolved = resolve_champion_path(None)
+        else:
+            resolved = resolve_champion_path(champion_path)
+        if resolved and os.path.isfile(resolved):
+            champ = load_champion_file(resolved)          # raises on invalid file
+            engine_cfg, classifier_cfg = champ.engine_cfg, champ.classifier_cfg
+            regime_overrides = champ.regime_overrides or None
+            self.champion = champ.record
             log.info("Champion config loaded: %s (id=%s, label=%r, "
                      "%d overrides, %d regime overrides)",
-                     champion_path, rec.config_id[:8], rec.label,
-                     len(rec.overrides), len(rec.regime_overrides or {}))
+                     resolved, champ.record.config_id[:8], champ.record.label,
+                     len(champ.record.overrides),
+                     len(champ.record.regime_overrides or {}))
 
         # Prediction Engine V2 parallel path (shadow by default).
         pred_db = prediction_db
@@ -535,8 +543,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="RAS observation-only: log scores/actions but never "
                         "auto-close paper positions (default: exits enabled)")
     p.add_argument("--champion", dest="champion_path", default=None,
-                   help="Champion config JSON (default: configs/champion.json "
-                        "when present; pass an empty string to force defaults)")
+                   help="Champion config JSON (prefer /var/lib/spy-der/configs/"
+                        "champion.json, then legacy paths; empty string forces "
+                        "defaults)")
     p.add_argument("--policy-mode", dest="policy_mode", default="shadow",
                    choices=["legacy", "shadow", "champion"],
                    help="Policy promotion mode (default: shadow = dual-run, "

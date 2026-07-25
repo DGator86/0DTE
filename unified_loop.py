@@ -128,10 +128,10 @@ class UnifiedOrchestrator:
     state_path: Optional[str] = None            # persist adaptive scales across restarts
     ras_cfg: Optional[RASConfig] = None
     # Static per-dominant-regime engine deltas from the champion config
-    # (adaptive_learning.config_store schema). Resolved ONCE at construction —
-    # nothing adaptive happens at tick time, the live engine stays
-    # deterministic. Keys: classifier regime names (or "unknown"); values:
-    # dot-notation engine overrides plus the special "size_mult".
+    # (integrations.spy_der.champion_reader schema). Resolved ONCE at
+    # construction — nothing adaptive happens at tick time; the live engine
+    # stays deterministic. Keys: classifier regime names (or "unknown");
+    # values: dot-notation engine overrides plus the special "size_mult".
     regime_overrides: Optional[dict] = None
     # Transition flag (Prediction Engine V2, PR 2): the matrix scale book is
     # the per-feature-AND-timeframe, exponentially decayed, lagged
@@ -213,7 +213,7 @@ class UnifiedOrchestrator:
         # bad champion file fails at startup, not mid-session.
         self._regime_cfg: dict[str, tuple[EngineConfig, float]] = {}
         if self.regime_overrides:
-            from adaptive_learning.config_store import (
+            from integrations.spy_der.champion_reader import (
                 engine_cfg_for_regime, validate_regime_overrides)
             validate_regime_overrides(self.regime_overrides)
             base = self.engine_cfg or EngineConfig()
@@ -890,11 +890,16 @@ class UnifiedOrchestrator:
                     "reason": "part3_meta",
                 })
 
-        # ---- SPY-DER (AI decision maker) ----
+        # ---- SPY-DER (HTTP decision client; AI owned by SPY-DER) ----
         try:
             from types import SimpleNamespace
 
-            from spy_der_bridge import PARALLEL_TRACK_ID, decide_spy_der_tick
+            from integrations.spy_der.contracts import PARALLEL_TRACK_ID
+            from integrations.spy_der.decision_client import DecisionClient
+            from integrations.spy_der.market_publisher import (
+                build_market_packet_from_tick,
+                publish_market_packet,
+            )
 
             market = getattr(snap, "market", None)
             spot = float(getattr(market, "spot", 0.0) or 0.0)
@@ -934,46 +939,42 @@ class UnifiedOrchestrator:
                 if v3_only is not None:
                     annotated = [v3_only]
             snap_id = str(signals.get("_snapshot_id") or signals.get("snapshot_id") or "")
-            # NOTE: do NOT forward regime vetoes as SPY-DER hard vetoes. In the
-            # package a hard veto absolutely blocks candidate selection (raises
-            # "hard veto blocks candidate selection"), so passing the regime's
-            # structural vetoes — short-gamma, catalyst, etc., which are almost
-            # always present on a directional tick and which legacy trades
-            # through — made SPY-DER ABSTAIN on every tick and never trade.
-            # SPY-DER only chooses among already-vetted shadow candidates, and
-            # the paper broker (warmup, cooldowns, prob/size guards) plus
-            # SPY-DER's own authority handle risk. A genuine no-trade regime
-            # yields no candidates, so `annotated` is empty and the bridge
-            # returns NO_EDGE before any model call.
-            sd = decide_spy_der_tick(
-                snapshot_id=snap_id or f"tick-{int(tick_now.timestamp())}",
-                symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
+            snap_id = snap_id or f"tick-{int(tick_now.timestamp())}"
+            # Do NOT forward regime vetoes as SPY-DER hard vetoes — SPY-DER
+            # chooses among already-vetted shadow candidates. Empty annotated
+            # → NO_EDGE / ABSTAIN without requiring AI.
+            forecast_blob = {}
+            if isinstance(signals.get("forecast"), dict):
+                forecast_blob = dict(signals["forecast"])
+            elif isinstance(signals.get("shadow_forecast"), dict):
+                forecast_blob = dict(signals["shadow_forecast"])
+            fu = signals.get("forecast_uncertainty")
+            try:
+                forecast_uncertainty = float(fu) if fu is not None else 0.0
+            except (TypeError, ValueError):
+                forecast_uncertainty = 0.0
+            packet = build_market_packet_from_tick(
+                snapshot_id=snap_id,
                 session_date=session_date,
+                symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
                 underlying_price=spot,
                 shadow_candidates=annotated,
-                now=tick_now,
                 hard_vetoes=(),
+                forecast=forecast_blob,
+                forecast_uncertainty=forecast_uncertainty,
                 track_record=self._spy_der_track_record(tick_now),
+                generated_at=tick_now,
             )
+            try:
+                publish_market_packet(packet)
+            except Exception as pub_exc:
+                log.warning("spy_der MarketPacket publish failed: %s", pub_exc)
+            client = getattr(self, "_spy_der_client", None)
+            if client is None:
+                client = DecisionClient()
+                self._spy_der_client = client
+            sd = client.decide(packet, request_id=snap_id)
             self._tick_spy_der = sd.as_parallel_payload()
-            # SPY-DER reads the chart/market context and draws a prediction.
-            try:
-                from spy_der_predict import predict_spy_der_tick
-                pred = predict_spy_der_tick(
-                    market, now_iso=tick_now.isoformat(), decision=sd)
-                if pred:
-                    self._tick_spy_der["prediction"] = pred
-            except Exception as exc:
-                log.warning("spy_der prediction failed: %s", exc)
-            # Grok token/cost usage for the dashboard usage bar (soft — only when
-            # the SPY-DER package exposes the meter).
-            try:
-                from spy_der.integrations.zerodte import usage_snapshot
-                usage = usage_snapshot()
-                if usage:
-                    self._tick_spy_der["usage"] = usage
-            except Exception:
-                pass
             if sd.action == "TRADE" and sd.candidate_id:
                 sd_cand = self._pick_shadow_candidate(
                     candidate_id=sd.candidate_id,
@@ -1012,7 +1013,7 @@ class UnifiedOrchestrator:
                 "mode": "shadow",
                 "action": "ABSTAIN",
                 "available": False,
-                "rationale": f"bridge_exception:{type(exc).__name__}",
+                "rationale": f"decision_client_exception:{type(exc).__name__}",
             }
 
         return intents
@@ -1833,6 +1834,23 @@ class UnifiedOrchestrator:
                                                  realized_ts=far)
                     except Exception as exc:
                         log.warning("sigma cone EOD settle failed: %s", exc)
+                # Publish OutcomePackets for SPY-DER experience feed.
+                try:
+                    from datetime import datetime, timezone
+
+                    from integrations.spy_der.outcome_publisher import (
+                        publish_settlement_outcomes,
+                    )
+                    rows = self.journal.fetch(session_date=session_date,
+                                              settled_only=True)
+                    publish_settlement_outcomes(
+                        session_date=session_date,
+                        symbol=str(getattr(self, "symbol", "SPY") or "SPY"),
+                        rows=rows,
+                        settled_at=datetime.now(timezone.utc),
+                    )
+                except Exception as exc:
+                    log.warning("spy_der OutcomePacket publish failed: %s", exc)
         return n
 
 

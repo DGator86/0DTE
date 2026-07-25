@@ -1,8 +1,11 @@
 [Unit]
+# DEPRECATED (Phase 5): adaptive learning ownership moved to SPY-DER.
+# Keep for VPS cutover reference — do not enable on new hosts. Learning /
+# promotion now live under /var/lib/spy-der/configs/ in DGator86/SPY-DER.
 # Evening learning: post-close walk-forward backtests + parameter search over
 # recorded ticks. Stages candidate configs for human review (never auto-writes
 # champion.json). Populates the dashboard Learning tab.
-Description=0DTE evening learning cycle (optimize candidate settings)
+Description=DEPRECATED — adaptive learning owned by SPY-DER (evening)
 After=network-online.target zerodte-validate-daily.service
 Wants=network-online.target
 

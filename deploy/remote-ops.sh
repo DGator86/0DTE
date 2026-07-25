@@ -94,19 +94,11 @@ case "$CMD" in
     ;;
 
   learn)
-    # Run the adaptive learner on demand (ARG: evening | weekly | daily; default evening).
-    # Evening/weekly optimize candidate settings from recorded ticks; daily is
-    # diagnostics-only. Candidates stage under /var/lib/zerodte/configs for
-    # human promotion (promoter --approve); never auto-writes champion.json.
-    mode="${ARG:-evening}"
-    case "$mode" in daily|evening|weekly) ;; *) echo "learn arg must be 'daily', 'evening', or 'weekly'"; exit 2 ;; esac
-    trials=20; folds=3
-    case "$mode" in weekly) trials=40; folds=5 ;; daily) trials=30; folds=4 ;; esac
-    as_svc "$PY" -m adaptive_learning.learner --mode "$mode" \
-        --db "$DB" --record-dir /var/lib/zerodte/ticks \
-        --configs-dir /var/lib/zerodte/configs \
-        --reports-dir /var/lib/zerodte/reports/promotion \
-        --trials "$trials" --folds "$folds"
+    # DEPRECATED (Phase 5): adaptive learning is owned by SPY-DER.
+    echo "learn: removed from 0DTE — run SPY-DER learning / Dojo instead" >&2
+    echo "See docs/migrations/PHASE5_AI_OWNERSHIP_REMOVAL.md" >&2
+    echo "Enable spy-der-dojo-* timers and spy-der-agent.service on the VPS." >&2
+    exit 2
     ;;
 
   test-notify)

@@ -160,10 +160,10 @@ def composite_score(wf: WalkForwardResult) -> float:
 # --------------------------------------------------------------------------- #
 def _build_engine_cfg(base: EngineConfig, params: dict) -> EngineConfig:
     """Apply a flat param dict (dot-notation paths) on top of a base EngineConfig.
-    Delegates to the ONE shared applier in adaptive_learning.config_store so
-    the optimizer, the YAML config loader, and the live champion loader can
+    Delegates to the ONE shared applier in integrations.spy_der.champion_reader
+    so the optimizer, the YAML config loader, and the live champion loader can
     never drift apart."""
-    from adaptive_learning.config_store import build_engine_cfg
+    from integrations.spy_der.champion_reader import build_engine_cfg
     return build_engine_cfg(base, params)
 
 
