@@ -101,6 +101,45 @@ case "$CMD" in
     exit 2
     ;;
 
+  experience-status)
+    # Read-only: confirm 0DTE outbox → SPY-DER Dojo inbox sync state.
+    SRC="${ZERODTE_SPYDER_EXPERIENCE_ROOT:-/var/lib/zerodte/spyder_experience}"
+    DST="${SPY_DER_EXPERIENCE_INBOX:-/var/lib/spy-der/inbox/experience}"
+    echo "--- source outbox: $SRC ---"
+    if [ -d "$SRC/snapshots" ]; then
+      echo "snapshots: $(find "$SRC/snapshots" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+      echo "outcomes:  $(find "$SRC/outcomes" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+    else
+      echo "snapshots dir missing"
+    fi
+    if [ -f "$SRC/sessions.json" ]; then
+      echo "sessions.json:"
+      cat "$SRC/sessions.json"
+    else
+      echo "sessions.json: (missing)"
+    fi
+    echo
+    echo "--- dojo inbox: $DST ---"
+    if [ -d "$DST/snapshots" ]; then
+      echo "snapshots: $(find "$DST/snapshots" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+      echo "outcomes:  $(find "$DST/outcomes" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+    else
+      echo "snapshots dir missing"
+    fi
+    if [ -f "$DST/sessions.json" ]; then
+      echo "sessions.json:"
+      cat "$DST/sessions.json"
+    else
+      echo "sessions.json: (missing)"
+    fi
+    echo
+    echo "--- spy-der-dojo-recent.service ---"
+    systemctl status spy-der-dojo-recent.service --no-pager -l 2>&1 | head -n 40 || true
+    echo
+    echo "--- zerodte-sync-experience.timer ---"
+    systemctl status zerodte-sync-experience.timer --no-pager -l 2>&1 | head -n 20 || true
+    ;;
+
   test-notify)
     # Send a test push through the SAME ntfy path real trade signals use, reading
     # the topic from the 0600 env file (as root). The topic is never printed —
@@ -129,7 +168,7 @@ PYEOF
 
   *)
     echo "Unknown command: $CMD" >&2
-    echo "Valid: status | logs | report | paper-report | diagnose-tradier | diagnose-tastytrade | restart | settle | validate | learn | test-notify" >&2
+    echo "Valid: status | logs | report | paper-report | diagnose-tradier | diagnose-tastytrade | restart | settle | validate | learn | experience-status | test-notify" >&2
     exit 2
     ;;
 esac
