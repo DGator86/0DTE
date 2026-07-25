@@ -71,8 +71,14 @@ fi
 "$APP_DIR/venv/bin/pip" install --quiet --upgrade pip
 "$APP_DIR/venv/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
 
-if [ "$SPY_DER_ENABLED" = "1" ]; then
-    log "SPY-DER checkout -> $SPY_DER_REF (no pip install into 0DTE venv)"
+# SPY-DER now ships itself: it has its own poller (spy-der-update.timer), its
+# own remote-deploy.sh, its own venv and its own units. When that is installed,
+# this deploy must keep its hands off /opt/spy-der — two deploys resetting the
+# same checkout on independent 2-minute timers is a race with no upside.
+if [ -f /etc/systemd/system/spy-der-update.timer ]; then
+    log "SPY-DER self-deploys (spy-der-update.timer present) — not touching $SPY_DER_DIR"
+elif [ "$SPY_DER_ENABLED" = "1" ]; then
+    log "SPY-DER checkout -> $SPY_DER_REF (bootstrap only; no pip install here)"
     if [ ! -d "$SPY_DER_DIR/.git" ]; then
         git clone "$SPY_DER_REPO_URL" "$SPY_DER_DIR"
     fi
@@ -86,15 +92,22 @@ if [ "$SPY_DER_ENABLED" = "1" ]; then
     fi
     git -C "$SPY_DER_DIR" reset --hard "$SPY_TARGET"
     echo "SPY-DER commit: $(git -C "$SPY_DER_DIR" rev-parse --short HEAD)"
-    # Ensure experience + spy-der state directories exist; agent/dojo units are
-    # owned by the SPY-DER deploy (spy-der-agent.service, spy-der-dojo-*).
-    mkdir -p /var/lib/spy-der/reports/dojo /var/lib/spy-der/configs \
-             "$DATA_DIR/spyder_experience/snapshots" \
-             "$DATA_DIR/spyder_experience/outcomes"
-    chown -R "$SVC_USER:$SVC_USER" /var/lib/spy-der "$DATA_DIR/spyder_experience" 2>/dev/null || true
+    echo "Run $SPY_DER_DIR/deploy/remote-deploy.sh once to hand SPY-DER its own deploy."
 else
     log "SPY-DER checkout disabled (SPY_DER_ENABLED=$SPY_DER_ENABLED)"
 fi
+
+# Experience hand-off lives under this project's data dir and stays ours.
+mkdir -p "$DATA_DIR/spyder_experience/snapshots" "$DATA_DIR/spyder_experience/outcomes"
+chown -R "$SVC_USER:$SVC_USER" "$DATA_DIR/spyder_experience" 2>/dev/null || true
+
+# /var/lib/spy-der is deliberately NOT chowned here. Those units declare
+# StateDirectory=spy-der, so systemd resets the tree to the spy-der user every
+# time one starts — a chown to this project's user does not win, it just flaps,
+# and the two fight on independent schedules. Read access comes from the modes
+# SPY-DER publishes (0644 files, 0755 directories), not from ownership. If the
+# dashboard cannot read a report, fix the mode, never the owner.
+mkdir -p /var/lib/spy-der/reports/dojo
 
 log "systemd unit"
 install -m 644 "$APP_DIR/deploy/$SVC.service" "/etc/systemd/system/$SVC.service"
