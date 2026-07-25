@@ -1,5 +1,18 @@
 # 0DTE GEX System — Claude Code Handoff
 
+> **STATUS: BEING RETIRED.** This repository is the legacy implementation being
+> absorbed into `DGator86/SPY-DER` and archived.
+>
+> **0DTE remains a temporary upstream market provider during full-stack
+> migration. The final target is an independently operating SPY-DER system with
+> no runtime dependency on 0DTE.**
+>
+> New development belongs in SPY-DER. Start with SPY-DER
+> `docs/TARGET_ARCHITECTURE.md`, then `docs/CAPABILITY_MATRIX.md` for where each
+> capability described below now lives, and `docs/CUTOVER_PLAN.md` for the
+> retirement sequence. This document remains accurate as a description of the
+> *legacy* system and is retained for provenance.
+
 A GEX-driven 0DTE options system for SPY/XSP. The thesis: intraday 0DTE price is
 dominated by dealer gamma hedging, so the edge is **structural** (regime + dealer
 positioning), not indicator-based. The system measures the risk-neutral density,

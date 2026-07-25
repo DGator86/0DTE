@@ -1,12 +1,66 @@
 # Phase 5 — 0DTE AI Ownership Removal & SPY-DER Integration
 
+> **This is an interim bridge, not the final architecture.**
+>
+> **0DTE remains a temporary upstream market provider during full-stack
+> migration. The final target is an independently operating SPY-DER system with
+> no runtime dependency on 0DTE.**
+>
+> Everything this PR *added* on the 0DTE side — `zerodte/**` and
+> `integrations/**` — is scheduled for deletion at cutover, not maintenance. See
+> SPY-DER `docs/TARGET_ARCHITECTURE.md` and `docs/CUTOVER_PLAN.md`.
+
 This PR finishes the 0DTE side of the ownership boundary established by
 SPY-DER PR #41 / #43. **SPY-DER is not modified here.**
 
-End state:
+## Why this PR is still worth having
 
-- **0DTE** = market engine, packet publisher, thin decision client, dashboard
-- **SPY-DER** = AI brain, Dojo, learning, promotion, model routing
+It is a genuine improvement over the previous state, because it:
+
+- removes duplicate AI ownership from 0DTE
+- establishes the versioned contracts
+- lets SPY-DER operate while migration continues
+- reduces dangerous in-process coupling
+
+None of that requires 0DTE to survive.
+
+## Interim state (not the end state)
+
+- **0DTE** = temporary market engine, packet publisher, thin decision client,
+  dashboard — *all of which move to SPY-DER*
+- **SPY-DER** = AI brain, Dojo, learning, promotion, model routing today; the
+  complete system after migration
+
+## Final state
+
+SPY-DER owns market ingestion, options chains, features, forecasts, candidates,
+risk and vetoes, decisions, execution, journal and settlement, replay and
+synthetic universes, Dojo and learning, and the dashboard API. 0DTE is archived
+read-only.
+
+Per-module dispositions for every one of 0DTE's 328 tracked paths live in SPY-DER
+at `migrations/inventory/zerodte_disposition.json`, with a test that fails if any
+path is left undecided.
+
+Two things in this PR are **already** superseded:
+
+- `integrations/spy_der/synthetic.py` — the Dojo now calls
+  `spy_der.synthetic.SyntheticUniverseProvider` natively. SPY-DER owns synthetic
+  universe production outright, including the archetype catalog, Markov world
+  generation, coupled chain repricing, the coverage matrix, regime calibration
+  and weak-archetype evolution.
+- The decision bridge's SPY-DER-side counterpart moved from
+  `spy_der.integrations.zerodte.provider` to `spy_der.decisions.shadow`;
+  `spy_der.integrations.zerodte` is now a re-export-only shim that is deleted at
+  cutover step 10.
+
+## Do not
+
+- Do not add new capability to `zerodte/**` or `integrations/**`. Both are
+  marked `delete`.
+- Do not treat `MarketPacket` as a permanent cross-repository dependency. After
+  cutover it is an internal SPY-DER boundary or an external API schema.
+- Do not use this document to argue that a capability should stay in 0DTE.
 
 ## Removed from 0DTE (manifest)
 
