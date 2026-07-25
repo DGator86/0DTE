@@ -1,0 +1,424 @@
+From 002699680fbf67b1f424c4dcd6cefb36edeed858 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 25 Jul 2026 21:51:48 +0000
+Subject: [PATCH] Refuse empty-tape universe lattice; wire synthetic outcomes
+ for scoring
+
+Weekend dojo burned ~74 minutes generating a full lattice with zero
+recorded sessions, then scored nothing because generate_result outcomes
+were discarded and realized_pnl was never filled.
+
+- Skip universe when recorded tape is insufficient (force_universe override)
+- Keep native provider outcomes through the scoring path
+- Attach per-candidate terminal P&L at settlement so evaluators match trades
+- Flag universe_unscored / universe_skipped_no_tape instead of silent no-ops
+---
+ docs/ops/dojo.md                  | 14 ++++++
+ src/spy_der/dojo/config.py        |  5 +++
+ src/spy_der/dojo/runner.py        | 71 +++++++++++++++++++++++++++----
+ src/spy_der/dojo/universe.py      | 31 +++++++++-----
+ src/spy_der/synthetic/provider.py | 67 ++++++++++++++++++++++++-----
+ tests/unit/test_dojo_ownership.py | 36 ++++++++++++----
+ 6 files changed, 186 insertions(+), 38 deletions(-)
+
+diff --git a/docs/ops/dojo.md b/docs/ops/dojo.md
+index 0112cc7..c0f4601 100644
+--- a/docs/ops/dojo.md
++++ b/docs/ops/dojo.md
+@@ -27,6 +27,20 @@ venv/bin/spy-der dojo \
+     --trials 10
+ ```
+ 
++## Preconditions
++
++If recorded tape is below `min_sessions`, the **universe lattice is refused**
++(`status=skipped`, flag `universe_skipped_no_tape`). A full-lattice weekend run
++with zero sessions previously burned ~an hour generating snapshots and scored
++none of them. Override only when you explicitly want synthetic-only sparring:
++
++```bash
++venv/bin/spy-der dojo --force-universe --full-lattice ...
++```
++
++Native synthetic outcomes now carry per-candidate terminal P&L against the
++world's settlement, so when the lattice *does* run it is scored.
++
+ ## Timers
+ 
+ | Timer | When (ET) | Window |
+diff --git a/src/spy_der/dojo/config.py b/src/spy_der/dojo/config.py
+index 2cc6e1c..cee219d 100644
+--- a/src/spy_der/dojo/config.py
++++ b/src/spy_der/dojo/config.py
+@@ -31,6 +31,11 @@ class DojoConfig:
+     skip_recorded: bool = False
+     skip_learner: bool = False
+     skip_universe: bool = False
++    #: When True (default), refuse the universe lattice if recorded tape is
++    #: insufficient. A full-lattice weekend run with zero sessions is a
++    #: multi-hour no-op — generate nothing until there is tape to train against.
++    #: Set force_universe=True to override (tests / explicit synthetic-only runs).
++    force_universe: bool = False
+     # recorded-phase
+     wf_folds: int = 3
+     min_ticks: int = 100
+diff --git a/src/spy_der/dojo/runner.py b/src/spy_der/dojo/runner.py
+index d0b57e0..23e97d5 100644
+--- a/src/spy_der/dojo/runner.py
++++ b/src/spy_der/dojo/runner.py
+@@ -88,9 +88,32 @@ def _build_flags(
+                 "detail": str(learner.get("note", "promotion gates failed")),
+             }
+         )
+-    # `universe_provider_missing` is gone: synthetic-universe production is
+-    # SPY-DER's own (spy_der.synthetic), so the phase always has a provider.
+-    if universe.get("status") == "ok":
++    if universe.get("status") == "skipped" and universe.get("reason") == "no_recorded_tape":
++        flags.append(
++            {
++                "severity": "warn",
++                "flag": "universe_skipped_no_tape",
++                "detail": str(
++                    universe.get("note")
++                    or "universe lattice refused — no recorded sessions"
++                ),
++            }
++        )
++    if universe.get("status") in {"ok", "unscored"}:
++        if int(universe.get("n_scored_universes") or 0) == 0 and int(
++            universe.get("n_universes") or 0
++        ) > 0:
++            flags.append(
++                {
++                    "severity": "alert",
++                    "flag": "universe_unscored",
++                    "detail": (
++                        f"generated {universe.get('n_universes')} universes / "
++                        f"{universe.get('n_snapshots')} snapshots but scored 0 — "
++                        "outcomes were not attached; lattice work was wasted"
++                    ),
++                }
++            )
+         for arch, metrics in (universe.get("archetype_matrix") or {}).items():
+             mean = metrics.get("mean_session_pnl")
+             if (
+@@ -290,12 +313,33 @@ def _run_dojo_phases(
+         if staged_changes
+         else authority_set
+     )
+-    universe = run_universe_phase(
+-        cfg,
+-        synthetic,
+-        authorities=universe_authorities,
+-        evaluator=scorer,
+-    )
++    # Refuse the expensive lattice when there is nothing to train against.
++    # Saturday's weekly full-lattice job previously burned ~74 minutes generating
++    # ~40k synthetic snapshots, scored zero of them, and wrote an empty report.
++    if (
++        not cfg.skip_universe
++        and not cfg.force_universe
++        and recorded.get("status") == "insufficient_data"
++    ):
++        universe = {
++            "status": "skipped",
++            "reason": "no_recorded_tape",
++            "note": (
++                "no recorded tape — refusing universe lattice "
++                f"({recorded.get('note', 'insufficient_data')}); "
++                "pass force_universe to override"
++            ),
++            "n_universes": 0,
++            "n_snapshots": 0,
++            "n_scored_universes": 0,
++        }
++    else:
++        universe = run_universe_phase(
++            cfg,
++            synthetic,
++            authorities=universe_authorities,
++            evaluator=scorer,
++        )
+ 
+     from pathlib import Path
+ 
+@@ -354,6 +398,14 @@ def main(argv: list[str] | None = None) -> int:
+     ap.add_argument("--skip-recorded", action="store_true")
+     ap.add_argument("--skip-learner", action="store_true")
+     ap.add_argument("--skip-universe", action="store_true")
++    ap.add_argument(
++        "--force-universe",
++        action="store_true",
++        help=(
++            "Run the universe lattice even when recorded tape is insufficient. "
++            "Default is to refuse — a full lattice with zero sessions is a no-op."
++        ),
++    )
+     ap.add_argument("--skip-sequential", action="store_true")
+     ap.add_argument("--folds", type=int, default=3)
+     ap.add_argument("--trials", type=int, default=15)
+@@ -380,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
+         skip_recorded=args.skip_recorded,
+         skip_learner=args.skip_learner,
+         skip_universe=args.skip_universe,
++        force_universe=args.force_universe,
+         wf_folds=args.folds,
+         learn_trials=args.trials,
+         universes_per_gen=args.universes,
+diff --git a/src/spy_der/dojo/universe.py b/src/spy_der/dojo/universe.py
+index 377ff1f..baceac6 100644
+--- a/src/spy_der/dojo/universe.py
++++ b/src/spy_der/dojo/universe.py
+@@ -113,18 +113,25 @@ def _score_packets(
+ def _generate(
+     provider: SyntheticUniverseProvider,
+     spec: Any,
+-) -> tuple[list[MarketPacket], dict[str, dict[str, int]]]:
+-    """Generate a universe, capturing coverage when the provider reports it.
++) -> tuple[list[MarketPacket], list[OutcomePacket], dict[str, dict[str, int]]]:
++    """Generate a universe, keeping outcomes + coverage when the provider has them.
+ 
+-    The native provider exposes ``generate_result`` with the world's
+-    ``(archetype, regime)`` minute occupancy; a third-party provider satisfying
+-    only the protocol yields packets alone, and coverage stays empty.
++    The native provider's ``generate_result`` returns packets, ground-truth
++    outcomes, and ``(archetype, regime)`` occupancy together. Discarding the
++    outcomes (the previous bug) meant the lattice generated tens of thousands of
++    snapshots and then scored none of them.
+     """
+     result_fn = getattr(provider, "generate_result", None)
+     if callable(result_fn):
+         result = result_fn(spec)
+-        return list(result.packets), dict(result.coverage)
+-    return list(provider.generate(spec)), {}
++        packets = list(result.packets)
++        outcomes = list(getattr(result, "outcomes", ()) or ())
++        coverage = dict(getattr(result, "coverage", {}) or {})
++        if not outcomes:
++            outcomes = outcomes_from_packets(packets)
++        return packets, outcomes, coverage
++    packets = list(provider.generate(spec))
++    return packets, outcomes_from_packets(packets), {}
+ 
+ 
+ def _merge_coverage_into(
+@@ -163,7 +170,7 @@ def run_universe_phase(
+         catalog = default_catalog(cfg, generation)
+         n_catalog_specs += len(catalog)
+         for spec in catalog:
+-            packets, world_coverage = _generate(active, spec)
++            packets, outcomes, world_coverage = _generate(active, spec)
+             _merge_coverage_into(coverage, world_coverage)
+             n_packets += len(packets)
+             bucket = per_archetype.setdefault(spec.archetype, _empty_bucket())
+@@ -173,8 +180,6 @@ def run_universe_phase(
+ 
+             if not authorities or not packets:
+                 continue
+-
+-            outcomes = outcomes_from_packets(packets)
+             if not outcomes:
+                 continue
+ 
+@@ -269,6 +274,12 @@ def run_universe_phase(
+         result["note"] = (
+             "universe packets scored via DecisionAuthority + CandidateEvaluator"
+         )
++    elif n_catalog_specs > 0 and n_scored_universes == 0:
++        result["status"] = "unscored"
++        result["note"] = (
++            f"generated {n_catalog_specs} universes / {n_packets} snapshots but "
++            "scored 0 — provider outcomes missing realized_pnl labels"
++        )
+     else:
+         result["note"] = (
+             "universe packets generated via SyntheticUniverseProvider; "
+diff --git a/src/spy_der/synthetic/provider.py b/src/spy_der/synthetic/provider.py
+index a2f97e6..16c45cb 100644
+--- a/src/spy_der/synthetic/provider.py
++++ b/src/spy_der/synthetic/provider.py
+@@ -32,6 +32,7 @@ from typing import Any
+ 
+ from spy_der.candidates.factory import generate_candidate_universe
+ from spy_der.candidates.geometry import FactoryConfig
++from spy_der.candidates.payoff import terminal_payoff
+ from spy_der.contracts.candidates import Candidate
+ from spy_der.contracts.integration import (
+     MARKET_PACKET_SCHEMA,
+@@ -216,11 +217,13 @@ class SyntheticUniverseProvider:
+             snapshot = feed.snapshot(tick.timestamp)
+             if snapshot is None:
+                 continue
+-            packet = self._packet(spec, world, tick, snapshot, index)
++            packet, candidates = self._packet_with_candidates(
++                spec, world, tick, snapshot, index
++            )
+             packets.append(packet)
+             settle = world.settlement(tick.session)
+             if settle is not None:
+-                outcomes.append(self._outcome(packet, tick, settle))
++                outcomes.append(self._outcome(packet, tick, settle, candidates))
+ 
+         return SyntheticUniverseResult(
+             spec=spec,
+@@ -249,13 +252,25 @@ class SyntheticUniverseProvider:
+         snapshot: CanonicalMarketSnapshot,
+         index: int,
+     ) -> MarketPacket:
+-        universe = generate_candidate_universe(snapshot, cfg=self._factory_config)
+-        views = tuple(
+-            self._candidate_view(c) for c in universe.candidates[: self.max_candidates]
++        packet, _candidates = self._packet_with_candidates(
++            spec, world, tick, snapshot, index
+         )
++        return packet
++
++    def _packet_with_candidates(
++        self,
++        spec: UniverseSpec,
++        world: MarkovWorld,
++        tick: WorldTick,
++        snapshot: CanonicalMarketSnapshot,
++        index: int,
++    ) -> tuple[MarketPacket, tuple[Candidate, ...]]:
++        universe = generate_candidate_universe(snapshot, cfg=self._factory_config)
++        candidates = tuple(universe.candidates[: self.max_candidates])
++        views = tuple(self._candidate_view(c) for c in candidates)
+         session = tick.timestamp.date()
+         snapshot_id = f"{spec.universe_id}-{session.isoformat()}-{index:05d}"
+-        return MarketPacket(
++        packet = MarketPacket(
+             schema_version=MARKET_PACKET_SCHEMA,
+             snapshot_id=snapshot_id,
+             session_date=session,
+@@ -270,6 +285,7 @@ class SyntheticUniverseProvider:
+             generated_at=tick.timestamp,
+             risk_max_size_scalar=1.0,
+         )
++        return packet, candidates
+ 
+     @staticmethod
+     def _candidate_view(candidate: Candidate) -> MarketCandidateView:
+@@ -331,26 +347,57 @@ class SyntheticUniverseProvider:
+         }
+ 
+     @staticmethod
+-    def _outcome(packet: MarketPacket, tick: WorldTick, settlement: float) -> OutcomePacket:
+-        """Ground-truth outcome: the world's realized close for the session."""
++    def _outcome(
++        packet: MarketPacket,
++        tick: WorldTick,
++        settlement: float,
++        candidates: tuple[Candidate, ...] = (),
++    ) -> OutcomePacket:
++        """Ground-truth outcome: settlement + per-candidate terminal P&L.
++
++        Earlier builds shipped ``realized_pnl=None`` and dropped the candidate
++        map, so the Dojo's evaluator matched zero trades after spending the
++        whole lattice generating packets. Terminal P&L is computed here from
++        the real candidate legs against the world's realized close.
++        """
+         move = settlement - tick.spot
++        settle_px = Decimal(str(settlement))
++        by_candidate: dict[str, str] = {}
++        for candidate in candidates:
++            pnl = terminal_payoff(
++                candidate.legs,
++                entry_credit=candidate.entry_credit,
++                spot=settle_px,
++            )
++            by_candidate[candidate.candidate_id] = str(pnl)
++        true_direction = (
++            "bullish" if move > 0 else ("bearish" if move < 0 else "flat")
++        )
++        # Prefer the first (dominance-ordered) candidate as the settlement pnl
++        # so evaluators that only read realized_pnl still get a number.
++        head_pnl = None
++        if by_candidate:
++            head_id = candidates[0].candidate_id
++            head_pnl = Decimal(by_candidate[head_id])
+         return OutcomePacket(
+             schema_version=OUTCOME_PACKET_SCHEMA,
+             snapshot_id=packet.snapshot_id,
+             session_date=packet.session_date,
+             symbol=packet.symbol,
+-            candidate_id=None,
++            candidate_id=candidates[0].candidate_id if candidates else None,
+             action="settle",
+-            realized_pnl=None,
++            realized_pnl=head_pnl,
+             settled=True,
+             labels={
+                 "settlement": settlement,
+                 "spot_at_snapshot": tick.spot,
+                 "realized_move": move,
+                 "direction": "up" if move > 0 else ("down" if move < 0 else "flat"),
++                "true_direction": true_direction,
+                 "archetype": tick.archetype,
+                 "regime": tick.regime,
+                 "minutes_to_close": tick.minutes_to_close,
++                "realized_pnl_by_candidate": by_candidate,
+             },
+             settled_at=tick.timestamp,
+         )
+diff --git a/tests/unit/test_dojo_ownership.py b/tests/unit/test_dojo_ownership.py
+index 797b609..40106aa 100644
+--- a/tests/unit/test_dojo_ownership.py
++++ b/tests/unit/test_dojo_ownership.py
+@@ -49,13 +49,11 @@ def test_dojo_package_does_not_import_zerodte_internals() -> None:
+ 
+ 
+ def test_run_dojo_without_providers(tmp_path: Path) -> None:
+-    """No experience provider still produces a report — and real universes.
++    """No experience provider still produces a report — but refuses the lattice.
+ 
+-    Universe sparring no longer needs an injected provider: it generates
+-    SPY-DER-owned synthetic worlds. The universe knobs are bounded here only to
+-    keep the unit test quick; the phase runs its real code path (world
+-    generation, chain repricing, the candidate factory), just over one 1-day
+-    world per generation instead of the nightly twelve 8-day ones.
++    A full-lattice (or even a small sample) with zero recorded sessions is a
++    CPU burn that scores nothing. Default is to skip universe until tape exists;
++    ``force_universe`` opts back into synthetic-only runs.
+     """
+     cfg = DojoConfig(
+         reports_dir=str(tmp_path / "reports"),
+@@ -70,12 +68,32 @@ def test_run_dojo_without_providers(tmp_path: Path) -> None:
+     assert out["report_date"] == "2026-07-24"
+     assert (tmp_path / "reports" / "latest.json").is_file()
+     assert any(f["flag"] == "no_recorded_tape" for f in out["flags"])
+-    # Synthetic universes are native, so the phase must actually run.
++    universe = out["metrics"]["phases"]["universe"]
++    assert universe["status"] == "skipped"
++    assert universe["reason"] == "no_recorded_tape"
++    assert universe["n_universes"] == 0
++    assert any(f["flag"] == "universe_skipped_no_tape" for f in out["flags"])
++
++
++def test_force_universe_runs_without_tape_and_scores(tmp_path: Path) -> None:
++    """force_universe opts into synthetic-only sparring — and must score it."""
++    cfg = DojoConfig(
++        reports_dir=str(tmp_path / "reports"),
++        configs_dir=str(tmp_path / "configs"),
++        report_date="2026-07-24",
++        universes_per_gen=1,
++        generations=1,
++        universe_days=1,
++        universe_snapshot_stride=120,
++        force_universe=True,
++    )
++    out = run_dojo(cfg)
+     universe = out["metrics"]["phases"]["universe"]
+     assert universe["status"] == "ok"
+     assert universe["n_snapshots"] > 0
+-    assert universe["coverage_cells_total"] == 40  # 8 archetypes x 5 regimes
+-    assert not any(f["flag"] == "universe_provider_missing" for f in out["flags"])
++    assert universe["n_scored_universes"] > 0
++    assert "authorities" in universe
++    assert not any(f["flag"] == "universe_unscored" for f in out["flags"])
+ 
+ 
+ def test_run_dojo_with_file_experience(tmp_path: Path) -> None:
+-- 
+2.43.0
+
