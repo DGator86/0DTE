@@ -1087,3 +1087,28 @@ html, body {
 .dojo-cov-1 { background: rgba(46,199,133,0.08); }
 .dojo-cov-2 { background: rgba(46,199,133,0.18); }
 .dojo-cov-3 { background: rgba(46,199,133,0.30); }
+
+/* ---------------- system panel (SPY-DER service health) ---------------- */
+.sys-services { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.sys-row {
+  display: grid;
+  grid-template-columns: 10px 88px 68px 76px 1fr;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--line, #1e2430);
+}
+.sys-row:last-child { border-bottom: none; }
+.sys-name { font-weight: 600; }
+.sys-state { text-transform: uppercase; font-size: 10px; letter-spacing: .04em; }
+.sys-state.ok { color: var(--ok, #3fb950); }
+.sys-state.warn { color: var(--warn, #d29922); }
+.sys-state.veto { color: var(--bad, #f85149); }
+.sys-when { color: var(--dim, #8b949e); font-variant-numeric: tabular-nums; }
+.sys-detail { color: var(--dim, #8b949e); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sys-deploy { margin: 8px 0 0; font-size: 11px; color: var(--dim, #8b949e); }
+@media (max-width: 640px) {
+  .sys-row { grid-template-columns: 10px 1fr auto; }
+  .sys-when, .sys-detail { display: none; }
+}

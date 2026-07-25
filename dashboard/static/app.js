@@ -3015,12 +3015,79 @@
     $("view-validation").classList.toggle("hidden", tab !== "validation");
     $("view-learning").classList.toggle("hidden", tab !== "learning");
     $("view-dojo").classList.toggle("hidden", tab !== "dojo");
-    if (tab === "spyder") renderSpyder(lastLive, lastPaper, lastTrades);
+    if (tab === "spyder") { renderSpyder(lastLive, lastPaper, lastTrades); refreshSystem(); }
     if (tab === "prediction") refreshPrediction();
     if (tab === "journal") refreshJournal();
     if (tab === "validation") refreshValidation();
     if (tab === "learning") refreshLearning();
     if (tab === "dojo") refreshDojo();
+  }
+
+  /* ---------------- system panel (SPY-DER service health) ---------------- */
+  // Replaces `systemctl status` / `journalctl` / `git rev-parse` over SSH.
+  const SYS_STATE_CLS = {
+    ok: "ok", late: "warn", stale: "veto", never_seen: "veto", unknown: "warn",
+  };
+
+  function sysAge(seconds) {
+    if (seconds == null) return "—";
+    const s = Math.round(seconds);
+    if (s < 90) return `${s}s ago`;
+    if (s < 5400) return `${Math.round(s / 60)}m ago`;
+    if (s < 172800) return `${Math.round(s / 3600)}h ago`;
+    return `${Math.round(s / 86400)}d ago`;
+  }
+
+  function renderSystem(sys) {
+    const overall = sys.overall || "unknown";
+    const badge = $("sys-overall");
+    badge.textContent = overall;
+    badge.className = "h2-right " + (SYS_STATE_CLS[overall] || (overall === "ok" ? "ok" : "warn"));
+
+    $("sys-services").innerHTML = (sys.services || []).map((s) => {
+      const cls = SYS_STATE_CLS[s.state] || "";
+      // A service that never started shows no age — say so rather than "—".
+      const when = s.state === "never_seen" ? "never run" : sysAge(s.age_seconds);
+      return `<div class="sys-row">
+        <span class="val-dot ${cls}"></span>
+        <span class="sys-name mono">${esc(s.service)}</span>
+        <span class="sys-state ${cls}">${esc(s.state)}</span>
+        <span class="sys-when">${esc(when)}</span>
+        <span class="sys-detail">${esc(s.detail || s.purpose || "")}</span>
+      </div>`;
+    }).join("") || '<p class="empty">no services reporting</p>';
+
+    const feed = sys.feed || {};
+    $("sys-feed").innerHTML = [
+      metricCard("Feed", esc(feed.state || "—"),
+        feed.state === "recording" ? "" : "warn"),
+      metricCard("Ticks today", feed.ticks == null ? "—" : String(feed.ticks)),
+      metricCard("Last tick", sysAge(feed.last_tick_age_seconds)),
+      metricCard("Provider", esc(feed.provider || "—")),
+      metricCard("Sessions", feed.sessions_recorded == null ? "—" : String(feed.sessions_recorded)),
+    ].join("");
+
+    const d = sys.deploy || {};
+    $("sys-deploy").innerHTML = d.state === "ok"
+      ? `deployed <span class="mono">${esc(d.commit_short || "?")}</span> `
+        + `${esc(sysAge(d.deployed_age_seconds))}`
+        + (d.subject ? ` · ${esc(d.subject)}` : "")
+      : `deploy state unknown${d.note ? ` — ${esc(d.note)}` : ""}`;
+  }
+
+  async function refreshSystem() {
+    try {
+      renderSystem(await api("/api/system"));
+    } catch (e) {
+      if (e.message !== "Unauthorized") {
+        // The panel exists to explain outages; it must say so when it is the
+        // one that cannot load, rather than showing stale values.
+        $("sys-overall").textContent = "unreachable";
+        $("sys-overall").className = "h2-right veto";
+        $("sys-services").innerHTML =
+          `<p class="empty">could not load system status — ${esc(e.message)}</p>`;
+      }
+    }
   }
 
   function entryLogicLine(ctx) {

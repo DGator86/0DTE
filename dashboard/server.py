@@ -410,6 +410,18 @@ async def api_drift(limit: int = Query(30, ge=1, le=200)):
     }
 
 
+@app.get("/api/system")
+async def api_system():
+    """SPY-DER service health, feed progress and deployed commit.
+
+    The panel that removes the need to SSH: heartbeats, whether market data is
+    actually landing, and which commit is live. Read from published files, so it
+    keeps working when SPY-DER's own API is down — which is when it matters.
+    """
+    from integrations.spy_der.dashboard_reader import read_system_status
+    return read_system_status()
+
+
 @app.get("/api/spy-der")
 async def api_spy_der():
     """Thin SPY-DER dashboard bundle (live_state + dojo latest)."""
