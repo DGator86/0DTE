@@ -195,6 +195,7 @@ def test_dashboard_route_inventory():
         "/api/health",
         "/api/market-status",
         "/api/live",
+        "/api/system",
         "/api/ticks",
         "/api/ticks/{row_id}",
         "/api/paper",
@@ -237,7 +238,7 @@ def test_appjs_render_and_refresh_inventory():
                            _appjs()))
     assert found == {
         "refresh", "refreshDojo", "refreshJournal", "refreshLearning",
-        "refreshPrediction", "refreshValidation",
+        "refreshPrediction", "refreshSystem", "refreshValidation",
         "renderCompetition",
         "renderConeCoverage", "renderConeJournal",
         "renderDojoBadge", "renderDojoCoverage", "renderDojoDetail",
@@ -254,7 +255,8 @@ def test_appjs_render_and_refresh_inventory():
         "renderReadiness", "renderReason", "renderRegime", "renderSigCorr",
         "renderSignal", "renderSpyder", "renderSpyderContext", "renderSpyderOpen",
         "renderSpyderPrediction", "renderSpyderTrades",
-        "renderSpyderUsage", "renderSpyderVs", "renderTech", "renderTimeline",
+        "renderSpyderUsage", "renderSpyderVs", "renderSystem",
+        "renderTech", "renderTimeline",
         "renderTopbar", "renderTradeInsights",
         "renderV2Funnel", "renderV2OpenPositions", "renderV2Paper",
         "renderV2Playbook", "renderV2Regime", "renderV2Signal",
@@ -269,7 +271,8 @@ def test_appjs_api_endpoint_inventory():
         "/api/candidates", "/api/dojo", "/api/drift", "/api/feature-scores",
         "/api/learning", "/api/live", "/api/market-status", "/api/paper",
         "/api/predictions", "/api/promotions", "/api/readiness",
-        "/api/report", "/api/sigma-cones", "/api/ticks", "/api/trades",
+        "/api/report", "/api/sigma-cones", "/api/system", "/api/ticks",
+        "/api/trades",
         "/api/trade-insights", "/api/validation",
     }
 
