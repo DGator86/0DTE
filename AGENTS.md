@@ -12,23 +12,41 @@ observability dashboard** (`dashboard/`). The Vercel bits (`api/[...path].js`,
 `public/`, `vercel.json`) are only a thin proxy to a remote VPS — not a local
 app. Nothing here places live orders.
 
-### Canonical architecture migration
+### This repository is being retired
 
-The repository is being migrated incrementally into the `zerodte/` package.
-The existing top-level modules and `shadow_runner.py` remain the production
-baseline until a later, separately reviewed promotion PR.
+**Stop new development here.** 0DTE is the legacy implementation being absorbed
+into `DGator86/SPY-DER` and archived. It remains a temporary upstream market
+provider during full-stack migration; the final target is an independently
+operating SPY-DER system with no runtime dependency on 0DTE.
+
+Read SPY-DER `docs/TARGET_ARCHITECTURE.md` before starting anything, and
+`docs/CUTOVER_PLAN.md` for the retirement sequence. Every path in this
+repository already has a disposition — move, reimplement, replace, archive or
+delete — recorded in SPY-DER `migrations/inventory/zerodte_disposition.json`.
+
+An earlier revision of this file told agents to migrate the repository
+incrementally *into* the `zerodte/` package. That is no longer the plan:
+`zerodte/**` and `integrations/**` are both marked **delete**, so work invested
+there is thrown away at cutover.
 
 For new work:
 
-- Put cross-stage data contracts in `zerodte/contracts/`.
-- Put orchestration interfaces in `zerodte/runtime/`; orchestration must not
-  contain pricing, forecasting, risk, or execution mathematics.
-- Use `zerodte/adapters/` to bridge legacy objects. Do not add new downstream
-  imports of `unified_loop.TickResult` or provider SDK response types.
-- AI ownership lives in **SPY-DER**, not 0DTE. Integrate only through
-  `integrations/spy_der/` (MarketPacket / OutcomePacket publishers, HTTP
-  `DecisionClient` to `:8787`, dashboard reader for `/var/lib/spy-der/*`).
-  Do not import `spy_der.*` internals or add Grok/Dojo/learning modules here.
+- **Default to adding it in SPY-DER**, not here. New capability belongs to the
+  system that survives.
+- Do not add capability to `zerodte/**` or `integrations/**`.
+- Do not treat `MarketPacket` as a permanent cross-repository dependency; after
+  cutover it is an internal SPY-DER boundary or an external API schema.
+- Changes here should be limited to keeping the existing runtime alive and
+  supporting parity validation until cutover.
+- AI ownership already lives in **SPY-DER**: integrate only through
+  `integrations/spy_der/` (HTTP `DecisionClient` to `:8787`, dashboard reader for
+  `/var/lib/spy-der/*`). Do not import `spy_der.*` internals or add
+  Grok/Dojo/learning modules here.
+- `integrations/spy_der/synthetic.py` is **dead**. SPY-DER owns synthetic
+  universe production outright (`spy_der.synthetic`) and the Dojo calls it
+  natively. Do not extend it.
+- If you must touch shared mathematics, change it in SPY-DER and hold 0DTE to
+  the parity tolerances in SPY-DER `docs/CUTOVER_PLAN.md`.
 - `zerodte.agent.AgentProvider` remains a fail-closed protocol scaffold only.
 - Keep hard vetoes, candidate construction, payoff validation, risk, sizing,
   execution, deployment promotion, and rollback deterministic.
