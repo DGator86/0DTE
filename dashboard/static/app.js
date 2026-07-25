@@ -3744,6 +3744,7 @@
   /* ---------------- dojo tab (matrix training reports) ---------------- */
   let dojoReports = [];
   let dojoSelectedId = null;
+  let dojoNote = "";
 
   const DOJO_PHASE_LABEL = {
     recorded: "Recorded tape", learner: "Adaptive learner",
@@ -3767,9 +3768,14 @@
   function renderDojoList() {
     $("dojo-count").textContent = String(dojoReports.length);
     if (!dojoReports.length) {
-      $("dojo-list").innerHTML = '<p class="empty">No SPY-DER dojo report yet — enable '
-        + '<span class="mono">spy-der-dojo-*</span> timers; 0DTE reads '
-        + '<span class="mono">/var/lib/spy-der/reports/dojo/latest.json</span></p>';
+      // Show the reason the API gave. Blaming the timers unconditionally sent
+      // operators to restart services that were already running, when the real
+      // failure was that the report existed and could not be read.
+      $("dojo-list").innerHTML = dojoNote
+        ? `<p class="empty">Dojo report unavailable — <span class="mono">${esc(dojoNote)}</span></p>`
+        : '<p class="empty">No SPY-DER dojo report yet — enable '
+          + '<span class="mono">spy-der-dojo-*</span> timers; 0DTE reads '
+          + '<span class="mono">/var/lib/spy-der/reports/dojo/latest.json</span></p>';
       return;
     }
     $("dojo-list").innerHTML = dojoReports.map((r) => {
@@ -3927,6 +3933,7 @@
     try {
       const data = await api("/api/dojo?limit=50");
       dojoReports = data.reports || [];
+      dojoNote = data.note || "";
       if (dojoSelectedId == null || !dojoReports.some((r) => r.id === dojoSelectedId)) {
         dojoSelectedId = (dojoReports[0] || {}).id ?? null;
       }

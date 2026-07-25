@@ -73,6 +73,74 @@ configured correctly.
 
 If you see `502 VPS dashboard unreachable`, check the tunnel and `VPS_API_URL`.
 
+## 4. Dojo tab — SPY-DER reports on the dashboard
+
+The Dojo tab renders SPY-DER's report. Nothing is copied or duplicated: the VPS
+dashboard reads SPY-DER's published state file directly.
+
+```
+Vercel /api/dojo  →  VPS dashboard :8765 /api/dojo
+                     →  /var/lib/spy-der/reports/dojo/latest.json
+```
+
+The `spy-der-dojo-*` timers write that file; `integrations/spy_der/dashboard_reader`
+reads it. The dashboard never imports SPY-DER's Dojo, learning or agent modules —
+only this file and `live_state.json`, per `docs/OWNERSHIP_BOUNDARY.md`.
+
+### The permission requirement
+
+This is the step that bites. SPY-DER writes the report as the **`spy-der`** user;
+the dashboard reads it as **`zerodte`**. The report must therefore be readable by
+others, and every parent directory must be traversable:
+
+```bash
+sudo chmod 0644 /var/lib/spy-der/reports/dojo/*.json
+sudo chmod 0755 /var/lib/spy-der /var/lib/spy-der/reports /var/lib/spy-der/reports/dojo
+```
+
+SPY-DER now publishes these at `0644` (minus the operator umask), so new runs are
+readable automatically. Files written before that change keep `0600` until the
+next run overwrites them — hence the one-time `chmod` above.
+
+### Verify, VPS first
+
+```bash
+# 1. the report exists and is world-readable
+ls -l /var/lib/spy-der/reports/dojo/latest.json
+
+# 2. the dashboard user can actually open it
+sudo -u zerodte cat /var/lib/spy-der/reports/dojo/latest.json | head -c 200
+
+# 3. the API serves it
+curl -s -H "Authorization: Bearer $DASHBOARD_TOKEN" \
+  http://127.0.0.1:8765/api/dojo | jq '.reports[0].summary, .note'
+
+# 4. and through Vercel
+curl -s https://your-project.vercel.app/api/dojo | jq '.reports | length'
+```
+
+Step 3 returning `{"reports": [], "note": ...}` means the note tells you the
+cause — it distinguishes *not found* (no Dojo run yet) from *permission denied*
+(the case above) from *unreadable*. The Dojo tab shows that same note rather
+than assuming the timers are off.
+
+### If the tab is empty
+
+| Note | Cause | Fix |
+|---|---|---|
+| `not found` | no Dojo run has completed | `systemctl list-timers 'spy-der-dojo-*'`; run it manually |
+| `permission denied` | mode/ownership | the `chmod` above |
+| `unreadable (JSONDecodeError)` | truncated write | re-run the Dojo; the writer is atomic, so this implies disk trouble |
+| tab shows `Unauthorized` | token mismatch | `DASHBOARD_TOKEN` must match on VPS and Vercel |
+
+`zerodte-dashboard.service` passes `--spy-der-dojo-latest` and
+`--spy-der-live-state` explicitly and declares `ReadOnlyPaths=/var/lib/spy-der`,
+so the dependency survives a sandbox tightening. After editing the unit:
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart zerodte-dashboard
+```
+
 ## Notes
 
 - **Read-only** — same GET-only API as the VPS dashboard; no trades or config changes

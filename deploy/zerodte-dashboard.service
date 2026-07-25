@@ -15,6 +15,8 @@ ExecStart=/opt/zerodte/venv/bin/python -m dashboard.server \
     --paper-db /var/lib/zerodte/paper.sqlite \
     --live-state /var/lib/zerodte/live_state.json \
     --configs-dir /var/lib/zerodte/configs \
+    --spy-der-live-state /var/lib/spy-der/live_state.json \
+    --spy-der-dojo-latest /var/lib/spy-der/reports/dojo/latest.json \
     --host 127.0.0.1 \
     --port 8765
 
@@ -27,6 +29,11 @@ ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=/opt/zerodte
 ReadWritePaths=/var/lib/zerodte
+# The Dojo and live-state panels read SPY-DER's published state. ProtectSystem=strict
+# already leaves this readable, so this line does not grant new access — it declares
+# the dependency, so tightening the sandbox later cannot silently blank those panels.
+# Note this is a *read* grant only: the dashboard must never write SPY-DER state.
+ReadOnlyPaths=/var/lib/spy-der
 
 StandardOutput=journal
 StandardError=journal

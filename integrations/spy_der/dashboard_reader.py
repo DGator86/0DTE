@@ -37,16 +37,37 @@ def dojo_latest_path(path: Optional[str | Path] = None) -> Path:
     return Path(env or DEFAULT_DOJO_LATEST)
 
 
-def _read_json(path: Path) -> Optional[dict[str, Any]]:
-    if not path.is_file():
-        return None
+def _read_json(path: Path) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Return ``(data, note)``. ``note`` says why ``data`` is ``None``.
+
+    The reason matters more than it looks. This used to collapse every failure
+    to ``None``, and the caller reported "not found" for all of them — so a
+    report that existed but could not be *read* was displayed as a report that
+    had never been written, and the dashboard told the operator to enable timers
+    that were already running. Permission denied is the failure that actually
+    happens here: SPY-DER writes this state as ``spy-der`` and the dashboard
+    reads it as ``zerodte``.
+    """
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
-        return data if isinstance(data, dict) else None
+    except FileNotFoundError:
+        return None, f"not found: {path}"
+    except PermissionError:
+        log.warning("permission denied reading %s", path)
+        return None, (
+            f"permission denied: {path} — the dashboard reads this as a different "
+            "user than the one that wrote it; the file must be readable by "
+            "others (0644) and every parent directory traversable"
+        )
+    except IsADirectoryError:
+        return None, f"expected a file, found a directory: {path}"
     except (OSError, ValueError, TypeError) as exc:
         log.warning("failed reading %s: %s", path, exc)
-        return None
+        return None, f"unreadable ({type(exc).__name__}): {path}: {exc}"
+    if not isinstance(data, dict):
+        return None, f"expected a JSON object, got {type(data).__name__}: {path}"
+    return data, None
 
 
 def read_live_state(
@@ -54,9 +75,9 @@ def read_live_state(
 ) -> dict[str, Any]:
     """Return spyder.dashboard.v1 or a soft note when missing/invalid."""
     p = live_state_path(path)
-    data = _read_json(p)
+    data, note = _read_json(p)
     if data is None:
-        return {"note": f"spy-der live_state not found: {p}", "path": str(p)}
+        return {"note": f"spy-der live_state {note}", "path": str(p)}
     try:
         validate_dashboard_packet(data)
     except ValueError as exc:
@@ -74,11 +95,11 @@ def read_live_state(
 def read_dojo_latest(
     path: Optional[str | Path] = None,
 ) -> dict[str, Any]:
-    """Return dojo latest report JSON or a soft note when missing."""
+    """Return dojo latest report JSON, or a soft note explaining why not."""
     p = dojo_latest_path(path)
-    data = _read_json(p)
+    data, note = _read_json(p)
     if data is None:
-        return {"note": f"spy-der dojo latest not found: {p}", "path": str(p)}
+        return {"note": f"spy-der dojo latest {note}", "path": str(p)}
     return data
 
 
