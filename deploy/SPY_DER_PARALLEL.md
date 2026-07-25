@@ -10,12 +10,22 @@ Phase 5 ownership: **SPY-DER owns all AI**. 0DTE publishes `MarketPacket` /
 ## Runtime wiring
 
 1. 0DTE shadow loop builds a `MarketPacket` and writes it under
-   `/var/lib/zerodte/spyder_experience/snapshots/`.
-2. 0DTE `DecisionClient` POSTs that packet to `SPY_DER_DECISION_URL`
+   `/var/lib/zerodte/spyder_experience/snapshots/` (zerodte-owned outbox).
+2. `zerodte-sync-experience.timer` copies that outbox into
+   `/var/lib/spy-der/inbox/experience` (spy-der-owned Dojo inbox) every 15
+   minutes; deploy also runs a one-shot sync.
+3. 0DTE `DecisionClient` POSTs that packet to `SPY_DER_DECISION_URL`
    (default `http://127.0.0.1:8787/v1/decision`).
-3. SPY-DER `spy-der-agent.service` answers with `spyder.dashboard.v1`.
-4. Dashboard reads `/var/lib/spy-der/live_state.json` and
+4. SPY-DER `spy-der-agent.service` answers with `spyder.dashboard.v1`.
+5. Dashboard reads `/var/lib/spy-der/live_state.json` and
    `/var/lib/spy-der/reports/dojo/latest.json` only.
+
+Manual one-shot (root):
+
+```bash
+sudo bash /opt/zerodte/deploy/ops/sync-experience-to-spyder.sh
+# then: sudo systemctl start spy-der-dojo-recent.service
+```
 
 AI keys (`XAI_API_KEY`, model routing) belong in the **SPY-DER** environment,
 not `/etc/zerodte/zerodte.env`.

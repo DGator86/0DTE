@@ -1,0 +1,14 @@
+[Unit]
+# Copy MarketPacket / OutcomePacket outbox into the SPY-DER Dojo inbox.
+# 0DTE publishes under /var/lib/zerodte/spyder_experience (zerodte-owned);
+# spy-der-dojo-* reads /var/lib/spy-der/inbox/experience. Without this sync
+# Dojo sees 0 sessions even when shadow has been publishing.
+Description=Sync 0DTE experience outbox to SPY-DER Dojo inbox
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash /opt/zerodte/deploy/ops/sync-experience-to-spyder.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte-sync-experience

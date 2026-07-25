@@ -98,6 +98,9 @@ else
 fi
 
 # Experience hand-off lives under this project's data dir and stays ours.
+# Shadow publishes MarketPacket / OutcomePacket here (zerodte-owned). A
+# separate sync copies into /var/lib/spy-der/inbox/experience for Dojo —
+# never write the inbox as zerodte (ownership fight with spy-der units).
 mkdir -p "$DATA_DIR/spyder_experience/snapshots" "$DATA_DIR/spyder_experience/outcomes"
 chown -R "$SVC_USER:$SVC_USER" "$DATA_DIR/spyder_experience" 2>/dev/null || true
 
@@ -107,7 +110,20 @@ chown -R "$SVC_USER:$SVC_USER" "$DATA_DIR/spyder_experience" 2>/dev/null || true
 # and the two fight on independent schedules. Read access comes from the modes
 # SPY-DER publishes (0644 files, 0755 directories), not from ownership. If the
 # dashboard cannot read a report, fix the mode, never the owner.
-mkdir -p /var/lib/spy-der/reports/dojo
+mkdir -p /var/lib/spy-der/reports/dojo /var/lib/spy-der/inbox/experience
+
+log "Experience sync timer (0DTE outbox → SPY-DER Dojo inbox)"
+install -m 644 "$APP_DIR/deploy/zerodte-sync-experience.service" \
+    /etc/systemd/system/zerodte-sync-experience.service
+install -m 644 "$APP_DIR/deploy/zerodte-sync-experience.timer" \
+    /etc/systemd/system/zerodte-sync-experience.timer
+systemctl daemon-reload
+systemctl enable --now zerodte-sync-experience.timer >/dev/null 2>&1 || true
+# Best-effort one-shot so Dojo sees existing packets without waiting 15m.
+if [ -x "$APP_DIR/deploy/ops/sync-experience-to-spyder.sh" ]; then
+    bash "$APP_DIR/deploy/ops/sync-experience-to-spyder.sh" \
+        || log "WARN: experience sync skipped (source empty or spy-der not ready)"
+fi
 
 log "systemd unit"
 install -m 644 "$APP_DIR/deploy/$SVC.service" "/etc/systemd/system/$SVC.service"

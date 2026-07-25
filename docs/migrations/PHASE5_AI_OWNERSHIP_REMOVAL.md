@@ -103,10 +103,19 @@ Experience filesystem layout (SPY-DER `FileMarketExperienceProvider`):
 
 ```
 $ZERODTE_SPYDER_EXPERIENCE_ROOT/   # default /var/lib/zerodte/spyder_experience
-  sessions.json
+  sessions.json                    # 0DTE outbox (shadow publisher)
   snapshots/{snapshot_id}.json
   outcomes/{snapshot_id}.json
+
+/var/lib/spy-der/inbox/experience/ # Dojo inbox (rsync'd by zerodte-sync-experience)
+  sessions.json
+  snapshots/
+  outcomes/
 ```
+
+Ops: keep publishing to the zerodte-owned outbox; sync into the spy-der-owned
+inbox (avoids ownership fights with `StateDirectory=spy-der`). One-shot:
+`sudo bash /opt/zerodte/deploy/ops/sync-experience-to-spyder.sh`.
 
 Decision URL: `SPY_DER_DECISION_URL` (default `http://127.0.0.1:8787/v1/decision`).
 

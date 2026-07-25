@@ -18,7 +18,8 @@ SSH as a sudo-capable user. Paths used:
 | `/var/lib/zerodte/shadow.db` | the journal — persists across restarts/updates |
 | `/var/lib/zerodte/ticks/` | recorded market/chain ticks for evening backtests |
 | `/var/lib/zerodte/configs/` | legacy champion fallback (prefer SPY-DER) |
-| `/var/lib/zerodte/spyder_experience/` | MarketPacket / OutcomePacket outbox for SPY-DER |
+| `/var/lib/zerodte/spyder_experience/` | MarketPacket / OutcomePacket outbox (zerodte-owned) |
+| `/var/lib/spy-der/inbox/experience/` | Dojo inbox — filled by `zerodte-sync-experience` |
 | `/var/lib/spy-der/` | SPY-DER live_state, dojo reports, champion, memories |
 
 ---
@@ -34,6 +35,7 @@ Phase 5 removed AI ownership from 0DTE. See
 |---|---|---|
 | `zerodte-validate-daily` | Mon–Fri 17:15 | Health / walk-forward **report** only |
 | `zerodte-validate-weekly` | Sun 18:00 | Deep validation report |
+| `zerodte-sync-experience` | every 15 min | Copy experience outbox → SPY-DER Dojo inbox |
 
 Deprecated (kept in-tree, **not** enabled by deploy):
 
