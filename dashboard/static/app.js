@@ -1494,7 +1494,7 @@
     SELECT_CANDIDATE: { word: "TRADE",   cls: "go",   sub: "AI selected a candidate to paper" },
     NO_EDGE:          { word: "NO EDGE", cls: "wait", sub: "no candidate cleared the AI's bar" },
     ABSTAIN:          { word: "ABSTAIN", cls: "wait", sub: "AI stood down this tick" },
-    UNAVAILABLE:      { word: "OFFLINE", cls: "off",  sub: "SPY-DER package not reporting on the VPS" },
+    UNAVAILABLE:      { word: "OFFLINE", cls: "off",  sub: "SPY-DER decision service not reporting" },
   };
 
   function spyderDecision(live) {
@@ -1502,10 +1502,12 @@
   }
   function providerLabel(p) {
     const s = String(p || "").toLowerCase();
-    if (s === "grok") return "Grok (xAI)";
     if (s === "deterministic") return "Deterministic";
+    if (s === "spy_der" || s === "spy-der") return "SPY-DER";
     if (!s || s === "none") return "—";
-    return p;
+    // Never surface AI provider brand names (Grok / xAI) in the 0DTE UI.
+    if (s === "grok" || s === "xai") return "SPY-DER";
+    return "SPY-DER";
   }
   function isSpyderTrack(t) {
     return String(t || "").toLowerCase() === "spy_der";
@@ -1541,10 +1543,9 @@
     $("spyder-action").textContent = meta.word;
     $("spyder-action-sub").textContent = meta.sub;   // crisp one-liner; full rationale sits in its own panel
     $("spyder-verdict").className = "spyder-verdict sv-" + (offline ? "off" : meta.cls);
-    const provider = sd.source || sd.provider || (offline ? "none" : "grok");
+    const provider = sd.source || sd.provider || (offline ? "none" : "spy_der");
     $("spyder-identity").innerHTML = [
-      `<div class="sid-row"><span class="sid-k">Provider</span><span class="sid-v">${esc(providerLabel(provider))}</span></div>`,
-      `<div class="sid-row"><span class="sid-k">Model</span><span class="sid-v mono">${esc(sd.model_id || "—")}</span></div>`,
+      `<div class="sid-row"><span class="sid-k">Source</span><span class="sid-v">${esc(providerLabel(provider))}</span></div>`,
       `<div class="sid-row"><span class="sid-k">Mode</span><span class="sid-v">${esc(sd.mode || "shadow")}</span></div>`,
       `<div class="sid-status ${offline ? "off" : "live"}">${offline ? "OFFLINE" : "LIVE"}</div>`,
     ].join("");
@@ -1553,8 +1554,8 @@
     renderSpyderPrediction(sd, offline);
     // Market context — the trader data SPY-DER reads
     renderSpyderContext(live);
-    // Grok model usage / cost
-    renderSpyderUsage(live);
+    // Usage / cost metering is owned by SPY-DER — do not display here.
+    renderSpyderUsage(null);
 
     // Live decision
     $("spyder-decision-sub").textContent = act || "—";
@@ -1700,20 +1701,20 @@
       ? `<span class="sr-quote">${esc(pred.rationale)}</span>` : "";
     const note = $("spyder-chart-note");
     if (note) {
-      const src = pred.source === "grok" ? "Grok forecast" : "trader model";
-      note.textContent = `SPY-DER (${src}) projects ${bias} to ${tgt != null ? tgt.toFixed(2) : "—"} by close.`;
+      note.textContent = `SPY-DER projects ${bias} to ${tgt != null ? tgt.toFixed(2) : "—"} by close.`;
     }
   }
 
-  function renderSpyderUsage(live) {
-    const u = spyderDecision(live).usage || null;
+  function renderSpyderUsage(_live) {
     const costEl = $("spyder-usage-cost");
     const budgetWrap = $("spyder-usage-budget");
+    // AI usage / cost / model metering belongs to SPY-DER — never shown here.
+    const u = null;
     if (!u) {
-      if (costEl) { costEl.textContent = "no data"; costEl.className = "h2-right"; }
+      if (costEl) { costEl.textContent = "owned by SPY-DER"; costEl.className = "h2-right"; }
       if (budgetWrap) budgetWrap.classList.add("hidden");
       $("spyder-usage-metrics").innerHTML =
-        '<div class="metric"><span class="k">status</span><span class="v sm">usage not reported</span></div>';
+        '<div class="metric"><span class="k">status</span><span class="v sm">usage owned by SPY-DER</span></div>';
       $("spyder-usage-models").innerHTML = "";
       $("spyder-usage-note").textContent = "";
       return;
@@ -3520,8 +3521,8 @@
     const mode = v2.mode || s.policy_mode || "—";
     $("lrn-v2-sub").textContent = mode;
     if (!live || (!liveTs(live) && !Object.keys(s).length && !v2.mode)) {
-      el.innerHTML = '<p class="empty">No live V3 observation yet — Learning stays empty until '
-        + '<span class="mono">adaptive_learning.learner</span> runs; V3 status appears once the shadow pipeline ticks</p>';
+      el.innerHTML = '<p class="empty">No live V3 observation yet — Learning status comes from '
+        + '<span class="mono">/var/lib/spy-der/live_state.json</span> once SPY-DER is running</p>';
       $("lrn-v2-chips").innerHTML = "";
       return;
     }
@@ -3586,7 +3587,7 @@
         </div>
         <div class="lrn-rules">${rules.map((r) =>
           `<span class="lrn-rule ${r.passed ? "ok" : "bad"}" title="${esc(r.detail || "")}">${r.passed ? "✓" : "✗"} ${esc(r.name)}</span>`).join("")}</div>
-        ${pending ? `<div class="tj-sub lrn-reco">awaiting human review — <span class="mono">python3 -m adaptive_learning.promoter --approve ${esc(String(p.config_id || "").slice(0, 8))}</span></div>` : ""}
+        ${pending ? `<div class="tj-sub lrn-reco">awaiting human review in SPY-DER (pending_review)</div>` : ""}
       </div>`;
     }).join("");
   }
@@ -3766,9 +3767,9 @@
   function renderDojoList() {
     $("dojo-count").textContent = String(dojoReports.length);
     if (!dojoReports.length) {
-      $("dojo-list").innerHTML = '<p class="empty">No dojo runs yet — run '
-        + '<span class="mono">python3 dojo.py --db /var/lib/zerodte/shadow.db '
-        + '--record-dir /var/lib/zerodte/ticks</span> on the VPS</p>';
+      $("dojo-list").innerHTML = '<p class="empty">No SPY-DER dojo report yet — enable '
+        + '<span class="mono">spy-der-dojo-*</span> timers; 0DTE reads '
+        + '<span class="mono">/var/lib/spy-der/reports/dojo/latest.json</span></p>';
       return;
     }
     $("dojo-list").innerHTML = dojoReports.map((r) => {

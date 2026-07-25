@@ -215,6 +215,7 @@ def test_dashboard_route_inventory():
         "/api/promotions",
         "/api/feature-scores",
         "/api/drift",
+        "/api/spy-der",
         "/api/readiness",
         "/api/stream",
     }

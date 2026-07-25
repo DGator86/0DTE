@@ -25,8 +25,11 @@ For new work:
   contain pricing, forecasting, risk, or execution mathematics.
 - Use `zerodte/adapters/` to bridge legacy objects. Do not add new downstream
   imports of `unified_loop.TickResult` or provider SDK response types.
-- AI providers belong behind `zerodte.agent.AgentProvider`. They may select only
-  canonical candidate IDs and may reduce, but never raise, deterministic size.
+- AI ownership lives in **SPY-DER**, not 0DTE. Integrate only through
+  `integrations/spy_der/` (MarketPacket / OutcomePacket publishers, HTTP
+  `DecisionClient` to `:8787`, dashboard reader for `/var/lib/spy-der/*`).
+  Do not import `spy_der.*` internals or add Grok/Dojo/learning modules here.
+- `zerodte.agent.AgentProvider` remains a fail-closed protocol scaffold only.
 - Keep hard vetoes, candidate construction, payoff validation, risk, sizing,
   execution, deployment promotion, and rollback deterministic.
 - Do not move the live entrypoint or merge large file relocations together with
@@ -45,7 +48,7 @@ See `docs/ARCHITECTURE_V4.md` for the target layout and migration sequence.
   `python3 -m dashboard.server`).
 
 ### Test / lint / smoke (all offline — synthetic data, no creds, no network)
-- Tests: `python3 -m pytest tests/ -q` (234 tests, ~50s).
+- Tests: `python3 -m pytest tests/ -q` (offline; ~50s).
 - No linter is configured. CI (`.github/workflows/ci.yml`) is just pytest plus
   engine smoke demos: `python3 spy0dte.py`, `python3 mc.py`, `python3 journal.py`
   (each exits 0; `journal.py` is silent by design), and a feed-import check.

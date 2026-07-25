@@ -22,7 +22,8 @@ ENV_FILE=/etc/zerodte/zerodte.env
 DATA_DIR=/var/lib/zerodte
 SVC=zerodte-shadow
 SVC_USER=zerodte
-# SPY-DER System B — parallel paper/dashboard track (paper/shadow only).
+# SPY-DER checkout (separate venv + spy-der-agent.service own AI).
+# 0DTE talks to SPY-DER only via HTTP :8787 and /var/lib/spy-der/* files.
 SPY_DER_REPO_URL="${SPY_DER_REPO_URL:-https://github.com/DGator86/SPY-DER.git}"
 SPY_DER_DIR="${SPY_DER_DIR:-/opt/spy-der}"
 SPY_DER_REF="${SPY_DER_REF:-origin/main}"
@@ -71,7 +72,7 @@ fi
 "$APP_DIR/venv/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
 
 if [ "$SPY_DER_ENABLED" = "1" ]; then
-    log "SPY-DER parallel track -> $SPY_DER_REF"
+    log "SPY-DER checkout -> $SPY_DER_REF (no pip install into 0DTE venv)"
     if [ ! -d "$SPY_DER_DIR/.git" ]; then
         git clone "$SPY_DER_REPO_URL" "$SPY_DER_DIR"
     fi
@@ -85,9 +86,14 @@ if [ "$SPY_DER_ENABLED" = "1" ]; then
     fi
     git -C "$SPY_DER_DIR" reset --hard "$SPY_TARGET"
     echo "SPY-DER commit: $(git -C "$SPY_DER_DIR" rev-parse --short HEAD)"
-    "$APP_DIR/venv/bin/pip" install --quiet -e "$SPY_DER_DIR"
+    # Ensure experience + spy-der state directories exist; agent/dojo units are
+    # owned by the SPY-DER deploy (spy-der-agent.service, spy-der-dojo-*).
+    mkdir -p /var/lib/spy-der/reports/dojo /var/lib/spy-der/configs \
+             "$DATA_DIR/spyder_experience/snapshots" \
+             "$DATA_DIR/spyder_experience/outcomes"
+    chown -R "$SVC_USER:$SVC_USER" /var/lib/spy-der "$DATA_DIR/spyder_experience" 2>/dev/null || true
 else
-    log "SPY-DER parallel track disabled (SPY_DER_ENABLED=$SPY_DER_ENABLED)"
+    log "SPY-DER checkout disabled (SPY_DER_ENABLED=$SPY_DER_ENABLED)"
 fi
 
 log "systemd unit"
@@ -109,9 +115,10 @@ systemctl daemon-reload
 systemctl enable --now zerodte-validate-daily.timer >/dev/null 2>&1 || true
 systemctl enable --now zerodte-validate-weekly.timer >/dev/null 2>&1 || true
 
-log "Learning timers (evening optimize + weekly deep optimize)"
-# Durable configs/reports under the data dir (survives /opt resets; writable
-# under ProtectSystem=strict). Seed from repo configs/ on first boot only.
+log "Legacy configs/ticks dirs (champion now preferred from /var/lib/spy-der)"
+# Durable configs under the data dir survive /opt resets. Learning/Dojo timers
+# are DEPRECATED — install unit files for cutover reference but do not enable.
+# Operators should enable spy-der-dojo-* + SPY-DER learning from SPY-DER deploy.
 mkdir -p "$DATA_DIR/configs/candidates" "$DATA_DIR/configs/promoted" \
          "$DATA_DIR/configs/archive" "$DATA_DIR/reports/promotion" \
          "$DATA_DIR/ticks"
@@ -120,13 +127,19 @@ if [ ! -f "$DATA_DIR/configs/champion.json" ] \
     cp -a "$APP_DIR/configs/champion.json" "$DATA_DIR/configs/champion.json"
 fi
 chown -R "$SVC_USER:$SVC_USER" "$DATA_DIR/configs" "$DATA_DIR/reports" "$DATA_DIR/ticks"
-for unit in zerodte-learn-evening zerodte-learn-weekly; do
-    install -m 644 "$APP_DIR/deploy/$unit.service" "/etc/systemd/system/$unit.service"
-    install -m 644 "$APP_DIR/deploy/$unit.timer" "/etc/systemd/system/$unit.timer"
+for unit in zerodte-learn-evening zerodte-learn-weekly \
+            zerodte-dojo-daily zerodte-dojo-recent zerodte-dojo-weekly; do
+    if [ -f "$APP_DIR/deploy/$unit.service" ]; then
+        install -m 644 "$APP_DIR/deploy/$unit.service" "/etc/systemd/system/$unit.service"
+    fi
+    if [ -f "$APP_DIR/deploy/$unit.timer" ]; then
+        install -m 644 "$APP_DIR/deploy/$unit.timer" "/etc/systemd/system/$unit.timer"
+    fi
+    # Do not enable deprecated AI timers; stop them if previously enabled.
+    systemctl disable --now "$unit.timer" >/dev/null 2>&1 || true
 done
 systemctl daemon-reload
-systemctl enable --now zerodte-learn-evening.timer >/dev/null 2>&1 || true
-systemctl enable --now zerodte-learn-weekly.timer >/dev/null 2>&1 || true
+log "Deprecated zerodte-learn-* / zerodte-dojo-* timers left disabled (use spy-der-*)"
 
 if [ ! -f "$ENV_FILE" ]; then
     # printf renders the color; a plain heredoc can't interpret \033 escapes

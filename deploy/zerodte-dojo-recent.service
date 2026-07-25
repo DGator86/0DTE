@@ -1,8 +1,10 @@
 [Unit]
+# DEPRECATED (Phase 5): AI / Dojo ownership moved to SPY-DER.
+# Keep for VPS cutover reference — deploy spy-der-dojo-recent.timer instead.
 # Every ~2 trading days (Mon/Wed/Fri): review the last 10 recorded sessions +
 # a medium universe sparring pass (10-day worlds, 2 generations). Deeper than
 # the daily run; still not the full lattice. Never auto-promotes.
-Description=0DTE dojo — recent-10-day review (every ~2 days)
+Description=DEPRECATED — use spy-der-dojo-recent (0DTE dojo recent)
 After=network-online.target
 Wants=network-online.target
 

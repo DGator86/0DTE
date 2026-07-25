@@ -224,20 +224,30 @@ def test_track_feedback_none_when_track_empty(tmp_path):
     assert track_feedback(str(tmp_path / "missing.sqlite")) is None
 
 
-def test_bridge_accepts_track_record_without_package():
-    """decide_spy_der_tick must tolerate the new kwarg when the spy_der
-    package is absent (returns UNAVAILABLE, never raises)."""
-    import spy_der_bridge as b
-    if b.spy_der_available():
-        pytest.skip("spy_der package installed; unavailable path not testable")
-    import datetime as dt
-    out = b.decide_spy_der_tick(
-        snapshot_id="s1", symbol="SPY",
-        session_date=dt.date(2026, 7, 23), underlying_price=600.0,
-        shadow_candidates=[], now=dt.datetime(2026, 7, 23, 15, 0),
+def test_decision_client_fallback_without_service():
+    """HTTP decision client fails closed to UNAVAILABLE when SPY-DER is down."""
+    from integrations.spy_der.contracts import build_market_packet
+    from integrations.spy_der.decision_client import DecisionClient
+
+    class Boom:
+        def post_json(self, url, payload, timeout):
+            raise RuntimeError("connection refused")
+
+    client = DecisionClient(
+        url="http://127.0.0.1:9/v1/decision",
+        retries=0,
+        transport=Boom(),
+        sleeper=lambda _s: None,
+    )
+    packet = build_market_packet(
+        snapshot_id="s1",
+        session_date="2026-07-23",
+        underlying_price=600.0,
         track_record={"n_trades": 3, "win_rate": 0.33, "total_pnl": -20.0},
     )
+    out = client.decide(packet, request_id="s1")
     assert out.action == "UNAVAILABLE"
+    assert out.available is False
 
 
 def test_journal_review_degrades_gracefully(tmp_path):

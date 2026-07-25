@@ -1,8 +1,10 @@
 [Unit]
+# DEPRECATED (Phase 5): AI / Dojo ownership moved to SPY-DER.
+# Keep for VPS cutover reference — deploy spy-der-dojo-weekly.timer instead.
 # Weekend deep dojo: the FULL 72-cell lattice (every archetype × tilt × vol),
 # calibrated from ALL recorded history (no recent-day window). The exhaustive
 # weekly robustness sweep. Never auto-promotes.
-Description=0DTE dojo — weekly full 72-universe lattice + calibration
+Description=DEPRECATED — use spy-der-dojo-weekly (0DTE dojo weekly)
 After=network-online.target
 Wants=network-online.target
 

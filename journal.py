@@ -151,7 +151,7 @@ CREATE TABLE IF NOT EXISTS validation_reports (
 CREATE INDEX IF NOT EXISTS ix_vr_date ON validation_reports(report_date);
 CREATE INDEX IF NOT EXISTS ix_vr_type ON validation_reports(report_type);
 
--- Adaptive Learning Engine (adaptive_learning/): full audit trail of every
+-- Adaptive Learning Engine (historical tables; writers moved to SPY-DER):
 -- learning cycle, challenger config, promotion decision, and feature score.
 -- All flexible payloads are JSON so new metrics never need a migration.
 CREATE TABLE IF NOT EXISTS learning_runs (
