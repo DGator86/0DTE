@@ -3991,22 +3991,41 @@
       }).join("") + "</div>");
 
     // phase 1 — recorded tape
+    // SPY-DER reports use evaluation/{n_snapshots}; older 0DTE dojo used
+    // walk_forward/{n_ticks}. Prefer whichever is present.
     const rec = phases.recorded || {};
     if (rec.status === "ok") {
       const wf = rec.walk_forward || {};
+      const ev = rec.evaluation || {};
       const boot = wf.session_pnl_bootstrap || {};
       const ci = (boot.ci_low != null && boot.ci_high != null)
         ? `${sign(boot.ci_low, 3)} … ${sign(boot.ci_high, 3)}` : "—";
+      const nSess = rec.n_sessions ?? ev.n_sessions;
+      const nTicks = rec.n_ticks ?? rec.n_snapshots ?? ev.n_decisions;
+      const meanPnl = wf.mean_pnl != null ? wf.mean_pnl : ev.mean_session_pnl;
+      const totalPnl = ev.total_pnl;
+      const winRate = wf.mean_win_rate != null ? wf.mean_win_rate : ev.win_rate;
+      const trades = ev.trades;
       parts.push('<h3 class="val-h3">Recorded tape — real-data walk-forward</h3>');
       parts.push('<div class="metrics">'
-        + metricCard("Sessions", String(rec.n_sessions ?? "—"))
-        + metricCard("Ticks", String(rec.n_ticks ?? "—"))
-        + metricCard("Mean fold P&L", sign(wf.mean_pnl, 3),
-            num(wf.mean_pnl) != null && wf.mean_pnl < 0 ? "warn" : "")
-        + metricCard("Mean Sharpe", fmt(wf.mean_sharpe, 2))
-        + metricCard("Profitable folds", `${wf.n_profitable ?? "—"}/${wf.n_valid_folds ?? "—"}`)
-        + metricCard("Session CI (95%)", ci)
+        + metricCard("Sessions", nSess == null ? "—" : String(nSess))
+        + metricCard("Snapshots", nTicks == null ? "—" : String(nTicks))
+        + metricCard("Mean sess P&L", sign(meanPnl, 3),
+            num(meanPnl) != null && meanPnl < 0 ? "warn" : "")
+        + metricCard("Total P&L", totalPnl == null ? "—" : sign(totalPnl, 3),
+            num(totalPnl) != null && totalPnl < 0 ? "warn" : "")
+        + metricCard("Trades", trades == null ? "—" : String(trades))
+        + metricCard("Win rate", winRate == null ? "—" : pct(winRate, 0))
+        + (wf.mean_sharpe != null
+          ? metricCard("Mean Sharpe", fmt(wf.mean_sharpe, 2)) : "")
+        + (wf.n_valid_folds != null
+          ? metricCard("Profitable folds",
+              `${wf.n_profitable ?? "—"}/${wf.n_valid_folds ?? "—"}`) : "")
+        + (ci !== "—" ? metricCard("Session CI (95%)", ci) : "")
         + "</div>");
+      if (rec.note) {
+        parts.push(`<p class="tj-sub">${esc(rec.note)}</p>`);
+      }
     } else if (rec.status || rec.note) {
       parts.push('<h3 class="val-h3">Recorded tape — real-data walk-forward</h3>');
       parts.push(`<p class="empty">${esc(rec.note || rec.status || "no recorded tape")}</p>`);
@@ -4022,6 +4041,9 @@
       parts.push(`<p class="tj-sub">outcome: <b class="mono">${esc(lrn.outcome || lrn.status || "—")}</b>`
         + (lrn.reason ? ` · reason: ${esc(lrn.reason)}` : "")
         + (lrn.note ? ` · ${esc(lrn.note)}` : "") + "</p>");
+      if (lrn.staged_path) {
+        parts.push(`<p class="tj-sub">staged: <span class="mono">${esc(lrn.staged_path)}</span></p>`);
+      }
       if (chips) parts.push(`<div class="lrn-rules">${chips}</div>`);
     }
 
