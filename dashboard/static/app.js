@@ -3946,6 +3946,69 @@
         <tbody>${rows}</tbody></table></div>`;
   }
 
+  const DOJO_PROMO_VERDICT = {
+    validated: ["promoted", "ok"],
+    rejected: ["rejected", "bad"],
+    not_actionable: ["nothing to promote", "dim"],
+    no_candidate: ["no candidate", "dim"],
+    skipped: ["not run", "dim"],
+    disabled: ["auto-promotion off", "warn"],
+    promotion_failed: ["validated but not written", "bad"],
+  };
+
+  function renderDojoPromotion(promo) {
+    if (!promo || !promo.status) return "";
+    const [label, tone] = DOJO_PROMO_VERDICT[promo.status] || [promo.status, "dim"];
+    const enacted = !!promo.enacted;
+    const parts = ['<h3 class="val-h3">Promotion trial</h3>'];
+    parts.push(`<p class="tj-sub">verdict: <b class="mono promo-${tone}">${esc(label)}</b>`
+      + (promo.note ? ` · ${esc(promo.note)}` : "") + "</p>");
+
+    const knobs = promo.knobs && Object.keys(promo.knobs).length
+      ? Object.entries(promo.knobs).map(([k, v]) => `${k}=${v}`).join(" · ")
+      : "";
+    if (knobs) {
+      parts.push(`<p class="tj-sub">change: <span class="mono">${esc(knobs)}</span></p>`);
+    }
+
+    // Champion vs candidate on the same tape — the comparison the gates ran on.
+    const cand = promo.candidate || {};
+    const inc = promo.incumbent || {};
+    if (cand.total_pnl != null || inc.total_pnl != null) {
+      const edge = num(cand.total_pnl) != null && num(inc.total_pnl) != null
+        ? cand.total_pnl - inc.total_pnl : null;
+      parts.push('<div class="metrics">'
+        + metricCard("Champion P&L", sign(inc.total_pnl, 3),
+            num(inc.total_pnl) != null && inc.total_pnl < 0 ? "warn" : "")
+        + metricCard("Candidate P&L", sign(cand.total_pnl, 3),
+            num(cand.total_pnl) != null && cand.total_pnl < 0 ? "warn" : "")
+        + metricCard("Edge", edge == null ? "—" : sign(edge, 3),
+            edge == null ? "" : edge > 0 ? "pos" : "neg")
+        + metricCard("Trades (champ → cand)",
+            `${inc.trades ?? "—"} → ${cand.trades ?? "—"}`)
+        + "</div>");
+    }
+
+    const gates = promo.gates || promo.rules || [];
+    if (gates.length) {
+      parts.push('<div class="lrn-rules">' + gates.map((g) =>
+        `<span class="lrn-rule ${g.passed ? "ok" : "bad"}" title="${esc(g.detail || "")}">`
+        + `${g.passed ? "✓" : "✗"} ${esc(g.name)}</span>`).join("") + "</div>");
+      // The blocking gate's detail is the answer to "why not?" — don't hide it
+      // in a tooltip no phone can open.
+      const blocked = gates.find((g) => !g.passed);
+      if (blocked && blocked.detail) {
+        parts.push(`<p class="tj-sub">${esc(blocked.name)}: ${esc(blocked.detail)}</p>`);
+      }
+    }
+    if (enacted && promo.champion_path) {
+      parts.push('<p class="tj-sub">champion: <span class="mono">'
+        + `${esc(promo.champion_path)}</span> — live decisions use it from the `
+        + "next tick</p>");
+    }
+    return parts.join("");
+  }
+
   function renderDojoDetail(rep) {
     $("dojo-detail-date").textContent = `${rep.report_date || "—"} · run #${rep.id}`;
     const m = rep.metrics || {};
@@ -4046,6 +4109,10 @@
       }
       if (chips) parts.push(`<div class="lrn-rules">${chips}</div>`);
     }
+
+    // phase 2b — promotion trial (SPY-DER re-runs the system with the staged
+    // change installed and promotes it itself; nothing here is a human queue).
+    parts.push(renderDojoPromotion(phases.promotion));
 
     // phase 3 — universe sparring
     const uni = phases.universe || {};
