@@ -45,6 +45,14 @@ html, body {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   min-height: 100vh;
+  /* Nothing may make the document wider than the layout viewport. When it did,
+     mobile Safari shrink-to-fit zoomed the whole page out, and the sticky
+     .topbar — which is only ever viewport-wide — covered a fraction of the
+     screen while page content showed through beside it (the "floating header").
+     `clip` is deliberate over `hidden`: it does not create a scroll container,
+     so `position: sticky` still resolves against the viewport. Wide content
+     (tables) must scroll inside its own .tj-scroll / .dojo-scroll wrapper. */
+  overflow-x: clip;
 }
 
 .hidden { display: none !important; }
@@ -91,11 +99,14 @@ html, body {
   display: flex;
   align-items: center;
   gap: 18px;
-  padding: 12px 20px;
+  /* viewport-fit=cover means the notch/curved corners can eat the edges in
+     landscape — keep the brand and the market pill clear of them. */
+  padding: 12px max(20px, env(safe-area-inset-right)) 12px max(20px, env(safe-area-inset-left));
   background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent), var(--bg-2);
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
+  left: 0;
   z-index: 50;
   flex-wrap: wrap;
 }
@@ -162,6 +173,22 @@ html, body {
 .meta-feeds-detail .feed-delayed b { color: var(--amber); }
 .meta-feeds-detail .feed-stale b { color: var(--amber); }
 .meta-feeds-detail .feed-missing b { color: var(--red); }
+
+/* On a phone the top bar wraps to three or four rows and, being sticky, parks
+   that whole stack on top of the content the user is reading. Tighten it: the
+   spacer stops forcing a break, the per-source feed detail collapses into the
+   Feeds chip it duplicates, and the rows that remain are compact. */
+@media (max-width: 640px) {
+  .topbar {
+    gap: 8px 12px;
+    padding: 8px max(12px, env(safe-area-inset-right)) 8px max(12px, env(safe-area-inset-left));
+  }
+  .topbar .brand .tag { display: none; }
+  .topbar .spot-hero .px { font-size: 22px; }
+  .topbar .meta-feeds-detail { display: none; }
+  .topbar .topbar-spacer { display: none; }
+  .topbar .pill { margin-left: auto; }
+}
 
 /* ---------------- Layout grid ---------------- */
 .grid {
@@ -597,6 +624,13 @@ html, body {
   padding: 12px 18px;
   display: flex; flex-direction: column; gap: 14px;
 }
+/* Panels are grid/flex items here, so their automatic minimum size is their
+   content's min-content width — a 9-column matrix or an unbreakable
+   /var/lib/spy-der/... path floors the track far past a phone viewport and
+   makes the whole document horizontally overflow (see html/body overflow-x).
+   min-width:0 lets the track collapse; the tables scroll in .dojo-scroll. */
+.journal-view > *,
+.validation-view > * { min-width: 0; }
 
 /* ---------------- Validation tab ---------------- */
 .validation-view {
@@ -646,6 +680,11 @@ html, body {
 
 .val-summary { font-size: 13px; line-height: 1.5; margin: 0 0 12px; }
 .val-note { font-size: 11px; color: var(--muted); margin: 10px 0 0; }
+/* Report prose quotes absolute paths (staged candidates, report files). Those
+   have no break opportunity a phone can use, so let them break anywhere —
+   `anywhere` (not `break-word`) because it also shrinks the min-content width
+   these panels are sized from. */
+.val-summary, .val-note, .tj-sub, .empty, .panel-sub { overflow-wrap: anywhere; }
 .val-h3 {
   margin: 16px 0 8px; font-size: 10px; font-weight: 700;
   letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted);
@@ -1079,6 +1118,12 @@ html, body {
 
 /* ===================== Dojo tab (matrix training) ===================== */
 .dojo-scroll { overflow-x: auto; }
+/* Promotion trial verdict — the Dojo promotes itself, so "what did it enact?"
+   has to read at a glance rather than hide in a gate tooltip. */
+.promo-ok   { color: var(--green); }
+.promo-bad  { color: var(--red); }
+.promo-warn { color: var(--amber); }
+.promo-dim  { color: var(--muted); }
 .dojo-matrix { margin-bottom: 8px; }
 .dojo-matrix td, .dojo-matrix th { white-space: nowrap; }
 .dojo-pos { color: var(--green); }

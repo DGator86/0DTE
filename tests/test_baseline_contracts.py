@@ -242,7 +242,8 @@ def test_appjs_render_and_refresh_inventory():
         "renderCompetition",
         "renderConeCoverage", "renderConeJournal",
         "renderDojoBadge", "renderDojoCoverage", "renderDojoDetail",
-        "renderDojoList", "renderDojoMatrix", "renderDynamics",
+        "renderDojoList", "renderDojoMatrix", "renderDojoPromotion",
+        "renderDynamics",
         "renderEdge", "renderFeatureImpactDetail", "renderForecast",
         "renderFunnel", "renderGexVariants", "renderJournal",
         "renderLearningBadge", "renderLearningCandidates",
@@ -307,7 +308,34 @@ def test_appjs_no_ambiguous_cross_version_fallbacks():
     assert "liveDoing" in js
 
 
-def test_appjs_consumes_feeds_section():
+def test_appjs_renders_the_dojo_promotion_phase():
+    """SPY-DER promotes its own champion; the Dojo tab must show that it did.
+
+    Without this block the only trace of an automatic promotion on the
+    dashboard is a flag chip, and 'why was my champion replaced?' has no
+    answer on screen.
+    """
+    js = _appjs()
+    assert "phases.promotion" in js
+    assert "renderDojoPromotion" in js
+    for shown in ("champion_path", "blocked", "gates", "incumbent"):
+        assert shown in js
+
+
+def test_dashboard_header_cannot_float_off_the_viewport():
+    """The sticky topbar is only ever viewport-wide.
+
+    When anything made the document wider than the layout viewport, mobile
+    Safari shrink-to-fit zoomed the page out and the header covered a fraction
+    of the screen with content showing through beside it. Wide content lives in
+    its own scroll container; the root clip is the backstop.
+    """
+    css = (ROOT / "dashboard" / "static" / "style.css").read_text(encoding="utf-8")
+    assert "overflow-x: clip" in css
+    # Panels are grid items; without min-width:0 the track floors at the
+    # min-content width of a 9-column matrix and the document overflows.
+    assert ".validation-view > *" in css
+    assert ".journal-view > *" in css
     js = _appjs()
     assert "feeds.overall_status" in js
     assert "option_chain" in js
