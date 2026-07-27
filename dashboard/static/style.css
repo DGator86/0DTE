@@ -1116,8 +1116,122 @@ html, body {
 .tab-dot.idle { background: var(--amber); }
 .tab-dot.off  { background: var(--muted-2); }
 
-/* ===================== Dojo tab (matrix training) ===================== */
+/* ===================== Dojo tab (matrix training) =====================
+   Read on a phone by one person asking "is this getting better?". The verdict
+   and the plain-language story lead; the panels that answer "by how much"
+   follow; everything else lives under a disclosure. */
 .dojo-scroll { overflow-x: auto; }
+
+.dojo-verdict { margin: 0 0 8px; }
+.dojo-pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12px; font-weight: 700; letter-spacing: 0.02em;
+  padding: 4px 12px; border-radius: 999px;
+  border: 1px solid var(--border-2); background: var(--panel-2); color: var(--muted);
+}
+.dojo-pill::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor;
+}
+.dojo-pill-ok   { color: var(--green); border-color: var(--green-dim); }
+.dojo-pill-warn { color: var(--amber); border-color: var(--amber-dim); }
+.dojo-pill-bad  { color: var(--red);   border-color: var(--red-dim); }
+.dojo-story {
+  font-size: 14px; line-height: 1.6; margin: 0 0 10px; color: var(--ink);
+}
+/* Numbers wear the mono face so they read as measurements; emphasised prose
+   does not — a monospaced sentence fragment reads as a code identifier. */
+.dojo-story b { font-weight: 700; }
+.dojo-story b.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+/* "Did anything change?" is the question the tab exists to answer — it does not
+   get to be the tail of a paragraph. */
+.dojo-story-action {
+  border-left: 2px solid var(--border-2); padding-left: 12px;
+  color: var(--ink); margin-bottom: 16px;
+}
+/* Why the run stopped where it did — schedule context, not a finding. */
+.dojo-stop {
+  font-size: 12px; line-height: 1.55; color: var(--muted);
+  margin: 0 0 14px;
+}
+
+/* Weakness chart. Profit/loss is carried by which side of the zero line a bar
+   sits on and by the signed value — never by hue alone: #2ec785 vs #ff5470 is
+   ΔE 4.4 under deuteranopia, which is indistinguishable. */
+.gap-chart { display: flex; flex-direction: column; gap: 3px; margin: 10px 0 8px; }
+.gap-row {
+  display: grid;
+  grid-template-columns: minmax(104px, 26%) 1fr minmax(58px, auto);
+  align-items: center; gap: 10px;
+  padding: 3px 0;
+}
+.gap-name { font-size: 12px; color: var(--ink); line-height: 1.3; min-width: 0; }
+.gap-n { display: block; font-size: 10px; color: var(--muted-2); }
+.gap-badge {
+  font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--blue);
+  border: 1px solid rgba(74,168,255,0.4); border-radius: 4px;
+  padding: 0 4px; margin-left: 5px; vertical-align: 1px;
+}
+.gap-track { position: relative; height: 14px; min-width: 0; }
+.gap-zero {
+  position: absolute; left: 50%; top: -1px; bottom: -1px;
+  width: 1px; background: var(--border-2);
+}
+.gap-bar { position: absolute; top: 2px; height: 10px; min-width: 2px; }
+.gap-neg { background: var(--red);   border-radius: 4px 0 0 4px; }
+.gap-pos { background: var(--green); border-radius: 0 4px 4px 0; }
+.gap-val { font-size: 12px; font-weight: 600; text-align: right; }
+.gap-val.pos { color: var(--green); }
+.gap-val.neg { color: var(--red); }
+/* Thin evidence is shown, not hidden — but it must not read like a finding. */
+.gap-thin .gap-bar { opacity: 0.4; }
+.gap-thin .gap-name, .gap-thin .gap-val { color: var(--muted); }
+
+/* Coverage heatmap. The question is "what has it never trained on?", so the
+   untrained cells are the figure and the trained ones are the ground: one hue,
+   light to dark, deliberately quiet, with "never" carrying a reserved status
+   colour plus a word — never colour alone. */
+.cov-table th[scope="row"] {
+  text-align: left; font-weight: 500; color: var(--ink);
+  text-transform: none; letter-spacing: 0; font-size: 12px;
+}
+.cov-table td {
+  text-align: right; font-variant-numeric: tabular-nums;
+  color: var(--muted); font-size: 11px;
+}
+.cov-none {
+  color: var(--amber); font-style: italic;
+  background: rgba(255,182,72,0.10);
+  box-shadow: inset 0 0 0 1px var(--amber-dim);
+}
+.cov-1 { background: rgba(46,199,133,0.06); }
+.cov-2 { background: rgba(46,199,133,0.13); }
+.cov-3 { background: rgba(46,199,133,0.22); color: var(--ink); }
+
+.val-h4 {
+  margin: 14px 0 6px; font-size: 10px; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted);
+}
+.dojo-more { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 10px; }
+.dojo-more > summary {
+  cursor: pointer; font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--muted); list-style: none;
+}
+.dojo-more > summary::-webkit-details-marker { display: none; }
+.dojo-more > summary::before { content: "▸ "; color: var(--muted-2); }
+.dojo-more[open] > summary::before { content: "▾ "; }
+.dojo-more > summary:hover { color: var(--ink); }
+.dojo-more-body { padding-top: 4px; }
+
+@media (max-width: 520px) {
+  /* Name and value stay on one line; the bar gets the full width beneath them.
+     Without the explicit rows the track's 1/-1 span pushes the value onto a
+     third line, orphaned from the row it belongs to. */
+  .gap-row { grid-template-columns: 1fr minmax(52px, auto); row-gap: 3px; }
+  .gap-name  { grid-row: 1; grid-column: 1; }
+  .gap-val   { grid-row: 1; grid-column: 2; }
+  .gap-track { grid-row: 2; grid-column: 1 / -1; }
+}
 /* Promotion trial verdict — the Dojo promotes itself, so "what did it enact?"
    has to read at a glance rather than hide in a gate tooltip. */
 .promo-ok   { color: var(--green); }

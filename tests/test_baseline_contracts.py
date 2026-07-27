@@ -242,8 +242,8 @@ def test_appjs_render_and_refresh_inventory():
         "renderCompetition",
         "renderConeCoverage", "renderConeJournal",
         "renderDojoBadge", "renderDojoCoverage", "renderDojoDetail",
-        "renderDojoList", "renderDojoMatrix", "renderDojoPromotion",
-        "renderDynamics",
+        "renderDojoGaps", "renderDojoList", "renderDojoPromotion",
+        "renderDojoRaw", "renderDojoStopReason", "renderDynamics",
         "renderEdge", "renderFeatureImpactDetail", "renderForecast",
         "renderFunnel", "renderGexVariants", "renderJournal",
         "renderLearningBadge", "renderLearningCandidates",
@@ -320,6 +320,29 @@ def test_appjs_renders_the_dojo_promotion_phase():
     assert "renderDojoPromotion" in js
     for shown in ("champion_path", "blocked", "gates", "incumbent"):
         assert shown in js
+
+
+def test_appjs_dojo_tab_speaks_english():
+    """The Dojo tab is read by a person, not by whoever wrote the report.
+
+    Internal names (archetype ids, knob keys, gate names) must reach the screen
+    through a lookup that says what they mean, and the run has to state what it
+    did in a sentence rather than leaving a reader to derive it from a table.
+    """
+    js = _appjs()
+    for table in ("ARCHETYPE_LABEL", "REGIME_LABEL", "GATE_LABEL", "KNOB_TEXT"):
+        assert table in js, f"{table} lookup missing — raw ids would reach the UI"
+    assert "dojoStory" in js
+    assert "dojoRejectReason" in js
+    # SPY-DER authors the schedule context ("it stopped because the nightly
+    # budget ran out, not because everything is fixed"); read it, do not
+    # re-derive it here and let the two repos drift.
+    assert "rep.human" in js
+    assert "stop_reason" in js
+    # Sample size is shown next to every gap: a one-session -108 is an anecdote,
+    # and the tab must not let it read like a finding.
+    assert "DOJO_THIN_SESSIONS" in js
+    assert "isTrainableGap" in js
 
 
 def test_dashboard_header_cannot_float_off_the_viewport():
