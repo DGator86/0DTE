@@ -477,17 +477,17 @@
     <!-- ===================== DOJO VIEW (matrix training) ===================== -->
     <div class="validation-view hidden" id="view-dojo">
       <section class="panel" id="dojo-list-panel">
-        <h2>Dojo training runs <span class="h2-right" id="dojo-count">—</span></h2>
+        <h2>Training runs <span class="h2-right" id="dojo-count">—</span></h2>
         <p class="empty" id="dojo-intro" style="margin:0 0 10px">
-          SPY-DER Dojo reports from <span class="mono">/var/lib/spy-der/reports/dojo/latest.json</span>:
-          recorded-tape walk-forward, an adaptive-learning cycle, and sparring
-          across Markov-generated market universes.
+          Each night SPY-DER re-trades recorded market days and thousands of
+          simulated ones, finds where it loses money, and tests a fix against
+          both before changing how it trades.
         </p>
-        <div class="val-list" id="dojo-list"><p class="empty">No SPY-DER dojo report yet —
-          enable <span class="mono">spy-der-dojo-*</span> timers on the VPS</p></div>
+        <div class="val-list" id="dojo-list"><p class="empty">No training run yet —
+          enable the <span class="mono">spy-der-dojo-*</span> timers on the VPS</p></div>
       </section>
       <section class="panel" id="dojo-detail-panel">
-        <h2>Training report <span class="h2-right" id="dojo-detail-date">—</span></h2>
+        <h2>What this run did <span class="h2-right" id="dojo-detail-date">—</span></h2>
         <div id="dojo-detail"><p class="empty">Select a training run</p></div>
       </section>
     </div>

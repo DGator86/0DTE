@@ -3832,6 +3832,25 @@
     $("tab-dojo-dot").classList.toggle("hidden", !warn);
   }
 
+  // One line per run in the picker: the outcome, not the phase statuses.
+  // "recorded tape: ok · sequential: ok · learner: promotion_recommended" told
+  // a reader which subsystems ran, never whether the system got any better.
+  function dojoRunLine(rep) {
+    const m = rep.metrics || {};
+    const phases = m.phases || {};
+    const ev = (phases.recorded || {}).evaluation || {};
+    const promo = phases.promotion || {};
+    const gaps = dojoGapRows(phases.universe).filter(isTrainableGap);
+    const bits = [];
+    if (num(ev.total_pnl) != null) bits.push(`${sign(ev.total_pnl, 1)} on real tape`);
+    bits.push(gaps.length
+      ? `${gaps.length} weak market type${gaps.length === 1 ? "" : "s"}`
+      : "no weak market types");
+    if (promo.enacted) bits.push("settings changed");
+    else if (promo.status === "rejected") bits.push("change rejected");
+    return bits.join(" · ");
+  }
+
   function renderDojoList() {
     $("dojo-count").textContent = String(dojoReports.length);
     if (!dojoReports.length) {
@@ -3850,7 +3869,7 @@
       return `<button class="val-row${sel}" type="button" data-id="${r.id}">
         <span class="val-dot ${dojoStatusCls(r)}"></span>
         <span class="mono val-date">${esc(r.report_date || "—")}</span>
-        <span class="val-sum">${esc((r.summary || "").slice(0, 110))}</span>
+        <span class="val-sum">${esc(dojoRunLine(r))}</span>
       </button>`;
     }).join("");
     document.querySelectorAll("#dojo-list .val-row").forEach((el) => {
@@ -3863,36 +3882,243 @@
     });
   }
 
-  function renderDojoMatrix(uni) {
+  /* ---------------- dojo tab: what training did, in English ----------------
+     This tab is read on a phone by one person deciding whether the system is
+     getting better. It leads with what happened and what it means; the raw
+     panels stay available under "Full numbers" for when that is the question.
+     --------------------------------------------------------------------- */
+  const ARCHETYPE_LABEL = {
+    calm_pin: "Calm / pinned", crash: "Crash", gap_shock: "Gap shock",
+    grind_down: "Grind down", grind_up: "Grind up", range_chop: "Range chop",
+    squeeze_melt_up: "Squeeze / melt-up", vol_expansion: "Vol expansion",
+  };
+  const REGIME_LABEL = {
+    breakout: "Breakout", compression: "Compression", drift_down: "Drift down",
+    drift_up: "Drift up", pin: "Pinned",
+  };
+  // Below this many scored sessions a number is an anecdote, not a finding —
+  // the same floor SPY-DER uses before it will train on an archetype.
+  const DOJO_THIN_SESSIONS = 3;
+
+  const archLabel = (a) => ARCHETYPE_LABEL[a] || String(a).replace(/_/g, " ");
+  const regimeLabel = (r) => REGIME_LABEL[r] || String(r).replace(/_/g, " ");
+
+  function dojoGapRows(uni) {
     const matrix = (uni && uni.archetype_matrix) || {};
-    const archs = Object.keys(matrix);
-    if (!archs.length) return "";
-    const rows = archs.map((a) => {
-      const m = matrix[a] || {};
-      const mean = num(m.mean_session_pnl);
-      const cls = mean == null ? "" : mean >= 0 ? "dojo-pos" : "dojo-neg";
-      return `<tr>
-        <td class="mono">${esc(a)}</td>
-        <td>${m.n_universes ?? 0}</td>
-        <td>${m.n_sessions ?? 0}</td>
-        <td>${m.trades ?? 0}</td>
-        <td class="${cls}">${sign(m.total_pnl, 3)}</td>
-        <td class="${cls}">${mean == null ? "—" : sign(mean, 3)}</td>
-        <td>${m.win_rate == null ? "—" : pct(m.win_rate, 0)}</td>
-        <td>${m.session_win_rate == null ? "—" : pct(m.session_win_rate, 0)}</td>
-        <td>${m.dir_hit == null ? "—" : pct(m.dir_hit, 0)}</td>
-      </tr>`;
-    }).join("");
-    return `<h3 class="val-h3">Robustness matrix — P&amp;L by market archetype</h3>
-      <div class="dojo-scroll"><table class="tj-table dojo-matrix">
-        <thead><tr><th>archetype</th><th>univ</th><th>sess</th><th>trades</th>
-        <th>total P&amp;L</th><th>mean/sess</th><th>trade win</th>
-        <th>sess win</th>
-        <th title="Directional hit rate, decomposed per session-day and charged to that day's actual archetype — same granularity as the P&amp;L columns">dir hit</th>
-        </tr></thead>
-        <tbody>${rows}</tbody></table></div>`;
+    return Object.entries(matrix)
+      .map(([archetype, m]) => ({
+        archetype,
+        mean: num(m.mean_session_pnl),
+        total: num(m.total_pnl),
+        sessions: +m.n_sessions || 0,
+        trades: +m.trades || 0,
+        dirHit: num(m.dir_hit),
+      }))
+      .filter((r) => r.mean != null)
+      // Actionable gaps lead, worst first; single-session losses sit below them
+      // however large. Sorting on magnitude alone puts a -108 anecdote at the
+      // top of the chart, which is the number a reader should trust least.
+      .sort((a, b) =>
+        (isTrainableGap(b) - isTrainableGap(a)) || (a.mean - b.mean));
   }
 
+  // A gap the Dojo will act on: losing money, with enough sessions to believe.
+  const isTrainableGap = (r) => (r.mean < 0 && r.sessions >= DOJO_THIN_SESSIONS ? 1 : 0);
+
+  // The knobs are internal names. Say what each one does to a trade instead.
+  const KNOB_TEXT = {
+    prefer_abstain_on_ood: "standing down when the forecast is unreliable",
+    min_confidence: (v) => `only trading above ${pct(v, 0)} confidence`,
+    risk_max_size_scalar: (v) => `capping position size at ${pct(v, 0)}`,
+    ood_threshold: null,
+  };
+
+  function dojoKnobText(knobs) {
+    const entries = Object.entries(knobs || {});
+    const said = entries.map(([k, v]) => {
+      const rule = KNOB_TEXT[k];
+      if (rule === null) return null;
+      if (typeof rule === "function") return rule(v);
+      if (rule) return rule;
+      return `${k}=${v}`;
+    }).filter(Boolean);
+    return said.length ? said.join(" and ") : "a settings change";
+  }
+
+  // Why a change was refused, in the terms the decision was actually made on.
+  function dojoRejectReason(promo) {
+    const blocked = (promo.gates || []).find((g) => !g.passed);
+    if (!blocked) return esc(promo.note || "a check failed");
+    const cand = promo.candidate || {};
+    const inc = promo.incumbent || {};
+    switch (blocked.name) {
+      case "pnl_edge":
+        return `it would have made <b class="num">${sign(cand.total_pnl, 2)}</b> instead of `
+          + `<b class="num">${sign(inc.total_pnl, 2)}</b> on the same days`;
+      case "evidence":
+        return "it did not trade enough to judge";
+      case "win_rate":
+        return `its hit rate fell too far (${pct(cand.win_rate, 0)} vs ${pct(inc.win_rate, 0)})`;
+      case "forward_transfer":
+        return "it did worse on days it had not seen";
+      case "retention":
+        return "it got worse on days it used to handle";
+      case "universe":
+        return "it did worse across the simulated markets";
+      case "archetype_repair":
+        return `it did not actually fix ${esc(archLabel(promo.target_archetype || ""))}`;
+      case "cooldown":
+        return "the settings were already changed too recently";
+      default:
+        return esc(blocked.detail || blocked.name);
+    }
+  }
+
+  /* ---- the headline: what this run did, as sentences ---- */
+  function dojoStory(rep) {
+    const m = rep.metrics || {};
+    const phases = m.phases || {};
+    const rec = phases.recorded || {};
+    const uni = phases.universe || {};
+    const lrn = phases.learner || {};
+    const promo = phases.promotion || {};
+    const ev = rec.evaluation || {};
+    const targets = m.training_targets || {};
+    const said = [];
+
+    // 1 — what it trained on.
+    const bits = [];
+    if (rec.status === "ok" && rec.n_sessions) {
+      bits.push(`<b class="num">${rec.n_sessions}</b> recorded session${rec.n_sessions === 1 ? "" : "s"}`);
+    }
+    if (uni.status === "ok" && uni.n_universes) {
+      bits.push(`<b class="num">${uni.n_universes}</b> simulated market${uni.n_universes === 1 ? "" : "s"}`);
+    }
+    const elapsed = num(m.elapsed_s);
+    if (bits.length) {
+      said.push(`Trained on ${bits.join(" and ")}`
+        + (elapsed != null ? `, in ${fmtDuration(elapsed)}.` : "."));
+    } else {
+      said.push("This run had nothing to train on — no recorded tape and no "
+        + "scored simulations.");
+    }
+
+    // 2 — how the live config did on real market data.
+    const pnl = num(ev.total_pnl);
+    if (pnl != null && ev.trades) {
+      const verb = pnl >= 0 ? "made" : "lost";
+      const winTxt = ev.win_rate == null ? "" : ` — <b class="num">${pct(ev.win_rate, 0)}</b> of them won`;
+      said.push(`On real market data the live settings ${verb} `
+        + `<b class="num">${sign(Math.abs(pnl), 2)}</b> over <b class="num">${ev.trades}</b> trades${winTxt}.`);
+    }
+
+    // 3 — where it is weak. This is the question the matrix exists to answer,
+    // so it gets said rather than left for the reader to derive from a table.
+    const rows = dojoGapRows(uni);
+    const losing = rows.filter((r) => r.mean < 0);
+    const gaps = losing.filter(isTrainableGap);
+    if (rows.length) {
+      if (losing.length) {
+        const worst = (gaps[0] || losing[0]);
+        const enough = gaps.length
+          ? `<b class="num">${gaps.length}</b> of them on enough sessions to act on`
+          : "none of them on enough sessions to act on yet";
+        said.push(`It loses money in <b class="num">${losing.length}</b> of `
+          + `<b class="num">${rows.length}</b> market types it sparred against — `
+          + `${enough}. Worst of those is <b>${archLabel(worst.archetype)}</b> at `
+          + `<b class="num">${sign(worst.mean, 2)}</b> a session.`);
+      } else {
+        said.push("It was profitable in every market type it sparred against.");
+      }
+    }
+
+    // 4 — what it did about it.
+    const knobs = dojoKnobText(promo.knobs);
+    const target = targets.targeted_archetype || promo.target_archetype;
+    const targetTxt = target ? ` to fix <b>${archLabel(target)}</b>` : "";
+    if (promo.enacted) {
+      said.push(`It changed how it trades${targetTxt} — <b>${esc(knobs)}</b> — `
+        + "after the change beat the current settings on every check. "
+        + "Live from the next tick.");
+    } else if (promo.status === "rejected") {
+      said.push(`It tried <b>${esc(knobs)}</b>${targetTxt}, then rejected it: `
+        + `${dojoRejectReason(promo)}.`);
+    } else if (promo.status === "disabled") {
+      said.push("Automatic changes are switched off, so nothing was applied.");
+    } else if (promo.status === "promotion_failed") {
+      said.push(`A validated change could not be written: ${esc(promo.note || "")}`);
+    } else if (lrn.outcome === "gated") {
+      said.push("It had a change in mind but the safety gates blocked staging it.");
+    } else if (rows.length && gaps.length) {
+      said.push(`It did not change anything this run${lrn.note ? ` — ${esc(lrn.note)}` : "."}`);
+    } else {
+      said.push("Nothing needed changing this run.");
+    }
+    return said;
+  }
+
+  function dojoStatusPill(rep) {
+    const phases = (rep.metrics || {}).phases || {};
+    const promo = phases.promotion || {};
+    if (promo.enacted) return ["Settings changed", "ok"];
+    if (promo.status === "promotion_failed") return ["Change failed to save", "bad"];
+    if (promo.status === "rejected") return ["Change rejected", "warn"];
+    if (promo.status === "disabled") return ["Auto-change off", "warn"];
+    return ["No change", "dim"];
+  }
+
+  /* ---- why the run stopped where it did ----
+     SPY-DER attaches a `human` block to every report (headline / data_story /
+     stop_reason / next_step). The stop reason is the one thing this renderer
+     cannot derive: "it stopped because the nightly budget ran out, not because
+     everything is fixed" is a fact about the schedule, not about the numbers.
+     Read it rather than restate it, so the two repos do not drift apart. */
+  function renderDojoStopReason(human) {
+    if (!human || typeof human !== "object") return "";
+    const lines = [human.stop_reason, human.next_step, human.data_story]
+      .filter((s) => typeof s === "string" && s.trim());
+    if (!lines.length) return "";
+    return `<p class="dojo-stop">${lines.map((s) => esc(s)).join(" ")}</p>`;
+  }
+
+  /* ---- where the system is weak ---- */
+  function renderDojoGaps(uni, targeted) {
+    const rows = dojoGapRows(uni);
+    if (!rows.length) return "";
+    const scale = Math.max(...rows.map((r) => Math.abs(r.mean)), 0.0001);
+    const bars = rows.map((r) => {
+      const width = (Math.abs(r.mean) / scale) * 50;
+      const neg = r.mean < 0;
+      const thin = r.sessions < DOJO_THIN_SESSIONS;
+      const isTarget = targeted && targeted === r.archetype;
+      const sessTxt = `${r.sessions} session${r.sessions === 1 ? "" : "s"}`;
+      return `<div class="gap-row${thin ? " gap-thin" : ""}"
+          title="${esc(archLabel(r.archetype))}: ${sign(r.mean, 3)} per session over ${sessTxt}, ${r.trades} trades">
+        <div class="gap-name">${esc(archLabel(r.archetype))}
+          ${isTarget ? '<span class="gap-badge">training</span>' : ""}
+          <span class="gap-n">${sessTxt}${thin ? " · thin" : ""}</span>
+        </div>
+        <div class="gap-track">
+          <span class="gap-zero"></span>
+          <span class="gap-bar ${neg ? "gap-neg" : "gap-pos"}"
+            style="width:${width.toFixed(2)}%;${neg ? "right" : "left"}:50%"></span>
+        </div>
+        <div class="gap-val mono ${neg ? "neg" : "pos"}">${sign(r.mean, 2)}</div>
+      </div>`;
+    }).join("");
+    const gaps = rows.filter(isTrainableGap);
+    return `<h3 class="val-h3">Where it is weak
+        <span class="tj-dim">(profit per session, by market type)</span></h3>
+      <div class="gap-chart">${bars}</div>
+      <p class="tj-sub">Bars run left of the line for a loss, right for a profit.
+        ${gaps.length
+          ? `The Dojo trains on the ones with at least ${DOJO_THIN_SESSIONS} sessions behind them — `
+            + `<b>${gaps.map((g) => esc(archLabel(g.archetype))).join(", ")}</b>.`
+          : "Nothing has enough losing sessions behind it to train on yet."}
+        Rows marked <i>thin</i> are single sessions and are not acted on.</p>`;
+  }
+
+  /* ---- what it has never seen ---- */
   function dojoCoverageGrid(raw) {
     // SPY-DER reports nest the archetype×regime counts under `.cells`
     // (`{cells: {calm_pin: {pin: n, ...}}, coverage_fraction, ...}`). Older
@@ -3907,241 +4133,221 @@
   }
 
   function renderDojoCoverage(uni) {
-    // Prefer evaluated-tick coverage (what the pipeline actually decided on);
-    // older reports only carry generated-minute coverage.
     const evaluated = !!(uni && uni.coverage_evaluated);
-    const cov = dojoCoverageGrid(
-      (uni && (uni.coverage_evaluated || uni.coverage)) || {}
-    );
+    const cov = dojoCoverageGrid((uni && (uni.coverage_evaluated || uni.coverage)) || {});
     const archs = Object.keys(cov).filter((a) => {
       const row = cov[a];
       return row && typeof row === "object" && !Array.isArray(row);
     });
     if (!archs.length) return "";
     const regimes = Object.keys(cov[archs[0]] || {});
-    const counts = archs.flatMap((a) => regimes.map((r) => {
-      const n = num(cov[a][r]);
-      return n == null ? 0 : n;
-    }));
+    const counts = archs.flatMap((a) => regimes.map((r) => num(cov[a][r]) || 0));
     const maxN = Math.max(1, ...counts);
-    const unit = evaluated ? "pipeline evaluations" : "generated minutes";
+    const total = uni.coverage_cells_total ?? archs.length * regimes.length;
+    const visited = evaluated
+      ? (uni.coverage_cells_evaluated_visited ?? uni.coverage_cells_visited)
+      : uni.coverage_cells_visited;
+    const missing = (total != null && visited != null) ? total - visited : counts.filter((n) => !n).length;
+    const unit = evaluated ? "decisions" : "minutes";
+
     const rows = archs.map((a) => {
       const cells = regimes.map((r) => {
         const n = num(cov[a][r]) || 0;
-        const heat = n === 0 ? "dojo-cov-0"
-          : n > maxN * 0.5 ? "dojo-cov-3"
-          : n > maxN * 0.15 ? "dojo-cov-2" : "dojo-cov-1";
-        return `<td class="${heat}" title="${n} ${unit}">${n || "·"}</td>`;
+        const heat = n === 0 ? "cov-none"
+          : n > maxN * 0.5 ? "cov-3"
+          : n > maxN * 0.15 ? "cov-2" : "cov-1";
+        return `<td class="${heat}" title="${esc(archLabel(a))} in ${esc(regimeLabel(r))}: ${n} ${unit}">`
+          + `${n ? n.toLocaleString() : "never"}</td>`;
       }).join("");
-      return `<tr><td class="mono">${esc(a)}</td>${cells}</tr>`;
+      return `<tr><th scope="row">${esc(archLabel(a))}</th>${cells}</tr>`;
     }).join("");
-    const visited = evaluated
-      ? (uni.coverage_cells_visited_evaluated ?? uni.coverage_cells_visited)
-      : uni.coverage_cells_visited;
-    const total = uni.coverage_cells_total;
-    return `<h3 class="val-h3">Situation coverage <span class="tj-dim">(${unit} per
-      archetype × regime — ${visited ?? "?"}/${total ?? "?"} cells)</span></h3>
-      <div class="dojo-scroll"><table class="tj-table dojo-matrix">
-        <thead><tr><th></th>${regimes.map((r) => `<th>${esc(r)}</th>`).join("")}</tr></thead>
+
+    const headline = missing > 0
+      ? `<b class="num">${missing}</b> of <b class="num">${total}</b> situations have never been trained`
+      : `All <b class="num">${total}</b> situations have been trained at least once`;
+    return `<h3 class="val-h3">What it has never seen</h3>
+      <p class="tj-sub">${headline} — a situation is a market type in a
+        particular regime. Darker means more ${unit} spent there.</p>
+      <div class="dojo-scroll"><table class="tj-table cov-table">
+        <thead><tr><th></th>${regimes.map((r) => `<th>${esc(regimeLabel(r))}</th>`).join("")}</tr></thead>
         <tbody>${rows}</tbody></table></div>`;
   }
 
+  /* ---- the change it tried, and why it stuck or not ---- */
   const DOJO_PROMO_VERDICT = {
-    validated: ["promoted", "ok"],
+    validated: ["applied", "ok"],
     rejected: ["rejected", "bad"],
-    not_actionable: ["nothing to promote", "dim"],
-    no_candidate: ["no candidate", "dim"],
+    not_actionable: ["nothing to apply", "dim"],
+    no_candidate: ["no change proposed", "dim"],
     skipped: ["not run", "dim"],
-    disabled: ["auto-promotion off", "warn"],
-    promotion_failed: ["validated but not written", "bad"],
+    disabled: ["switched off", "warn"],
+    promotion_failed: ["passed checks but could not be saved", "bad"],
+  };
+  const GATE_LABEL = {
+    actionable: "changes something live",
+    evidence: "enough trades to judge",
+    pnl_edge: "makes more money",
+    win_rate: "keeps its hit rate",
+    forward_transfer: "holds up on unseen days",
+    retention: "does not forget old days",
+    universe: "holds up in simulation",
+    archetype_repair: "fixes the market type it targeted",
+    cooldown: "not changing too often",
   };
 
   function renderDojoPromotion(promo) {
     if (!promo || !promo.status) return "";
     const [label, tone] = DOJO_PROMO_VERDICT[promo.status] || [promo.status, "dim"];
-    const enacted = !!promo.enacted;
-    const parts = ['<h3 class="val-h3">Promotion trial</h3>'];
-    parts.push(`<p class="tj-sub">verdict: <b class="mono promo-${tone}">${esc(label)}</b>`
-      + (promo.note ? ` · ${esc(promo.note)}` : "") + "</p>");
+    const parts = ['<h3 class="val-h3">The change it tested</h3>'];
+    const raw = Object.entries(promo.knobs || {}).map(([k, v]) => `${k}=${v}`).join(" · ");
+    parts.push(`<p class="tj-sub">${esc(dojoKnobText(promo.knobs))} — `
+      + `<b class="promo-${tone}">${esc(label)}</b>`
+      + (promo.target_archetype
+        ? ` · aimed at <b>${esc(archLabel(promo.target_archetype))}</b>` : "")
+      + (raw ? `<br><span class="mono tj-dim">${esc(raw)}</span>` : "") + "</p>");
 
-    const knobs = promo.knobs && Object.keys(promo.knobs).length
-      ? Object.entries(promo.knobs).map(([k, v]) => `${k}=${v}`).join(" · ")
-      : "";
-    if (knobs) {
-      parts.push(`<p class="tj-sub">change: <span class="mono">${esc(knobs)}</span></p>`);
-    }
-
-    // Champion vs candidate on the same tape — the comparison the gates ran on.
     const cand = promo.candidate || {};
     const inc = promo.incumbent || {};
     if (cand.total_pnl != null || inc.total_pnl != null) {
       const edge = num(cand.total_pnl) != null && num(inc.total_pnl) != null
         ? cand.total_pnl - inc.total_pnl : null;
       parts.push('<div class="metrics">'
-        + metricCard("Champion P&L", sign(inc.total_pnl, 3),
-            num(inc.total_pnl) != null && inc.total_pnl < 0 ? "warn" : "")
-        + metricCard("Candidate P&L", sign(cand.total_pnl, 3),
-            num(cand.total_pnl) != null && cand.total_pnl < 0 ? "warn" : "")
-        + metricCard("Edge", edge == null ? "—" : sign(edge, 3),
+        + metricCard("Now", sign(inc.total_pnl, 2), num(inc.total_pnl) < 0 ? "warn" : "")
+        + metricCard("Proposed", sign(cand.total_pnl, 2), num(cand.total_pnl) < 0 ? "warn" : "")
+        + metricCard("Difference", edge == null ? "—" : sign(edge, 2),
             edge == null ? "" : edge > 0 ? "pos" : "neg")
-        + metricCard("Trades (champ → cand)",
-            `${inc.trades ?? "—"} → ${cand.trades ?? "—"}`)
+        + metricCard("Trades", `${inc.trades ?? "—"} → ${cand.trades ?? "—"}`)
         + "</div>");
     }
 
-    const gates = promo.gates || promo.rules || [];
+    const gates = promo.gates || [];
     if (gates.length) {
       parts.push('<div class="lrn-rules">' + gates.map((g) =>
         `<span class="lrn-rule ${g.passed ? "ok" : "bad"}" title="${esc(g.detail || "")}">`
-        + `${g.passed ? "✓" : "✗"} ${esc(g.name)}</span>`).join("") + "</div>");
-      // The blocking gate's detail is the answer to "why not?" — don't hide it
-      // in a tooltip no phone can open.
+        + `${g.passed ? "✓" : "✗"} ${esc(GATE_LABEL[g.name] || g.name)}</span>`).join("") + "</div>");
       const blocked = gates.find((g) => !g.passed);
-      if (blocked && blocked.detail) {
-        parts.push(`<p class="tj-sub">${esc(blocked.name)}: ${esc(blocked.detail)}</p>`);
+      if (blocked) {
+        // Labelling this line with the check's name reads as a contradiction —
+        // "makes more money: candidate +58.20 vs champion +77.00". Say why not.
+        parts.push(`<p class="tj-sub"><b>Not applied because</b> `
+          + `${dojoRejectReason(promo)} `
+          + `<span class="tj-dim">(${esc(blocked.detail || blocked.name)})</span></p>`);
       }
     }
-    if (enacted && promo.champion_path) {
-      parts.push('<p class="tj-sub">champion: <span class="mono">'
-        + `${esc(promo.champion_path)}</span> — live decisions use it from the `
-        + "next tick</p>");
+    if (promo.enacted && promo.champion_path) {
+      parts.push('<p class="tj-sub">Saved to <span class="mono">'
+        + `${esc(promo.champion_path)}</span> — live decisions use it from the next tick.</p>`);
     }
     return parts.join("");
+  }
+
+  /* ---- everything else, for when the numbers are the question ---- */
+  function renderDojoRaw(rep) {
+    const m = rep.metrics || {};
+    const phases = m.phases || {};
+    const cfg = m.config || {};
+    const uni = phases.universe || {};
+    const rec = phases.recorded || {};
+    const ev = rec.evaluation || {};
+    const rows = dojoGapRows(uni);
+    const matrix = rows.length
+      ? `<h4 class="val-h4">Profit by market type</h4>
+        <div class="dojo-scroll"><table class="tj-table dojo-matrix">
+          <thead><tr><th>market type</th><th>worlds</th><th>sessions</th><th>trades</th>
+          <th>total P&amp;L</th><th>per session</th><th>sessions won</th>
+          <th title="Share of sessions whose direction the system called correctly">direction</th>
+          </tr></thead><tbody>${rows.map((r) => {
+            const m2 = (uni.archetype_matrix || {})[r.archetype] || {};
+            const cls = r.mean >= 0 ? "dojo-pos" : "dojo-neg";
+            return `<tr><td class="mono">${esc(r.archetype)}</td>
+              <td>${m2.n_universes ?? 0}</td><td>${r.sessions}</td><td>${r.trades}</td>
+              <td class="${cls}">${sign(r.total, 3)}</td><td class="${cls}">${sign(r.mean, 3)}</td>
+              <td>${m2.session_win_rate == null ? "—" : pct(m2.session_win_rate, 0)}</td>
+              <td>${r.dirHit == null ? "—" : pct(r.dirHit, 0)}</td></tr>`;
+          }).join("")}</tbody></table></div>` : "";
+
+    const panels = uni.archetype_authorities || {};
+    const panelNames = Object.keys(panels);
+    const authorities = panelNames.length
+      ? `<h4 class="val-h4">Current vs proposed, per market type</h4>
+        <div class="dojo-scroll"><table class="tj-table dojo-matrix">
+          <thead><tr><th>market type</th><th>current</th><th>proposed</th><th>baseline</th></tr></thead>
+          <tbody>${panelNames.sort().map((a) => {
+            const p = panels[a] || {};
+            const cell = (x) => x ? `${sign(x.total_pnl, 2)} <span class="tj-dim">/ ${x.trades}t</span>` : "—";
+            return `<tr><td class="mono">${esc(a)}</td><td>${cell(p.champion)}</td>
+              <td>${cell(p.challenger || p.candidate)}</td><td>${cell(p.baseline)}</td></tr>`;
+          }).join("")}</tbody></table></div>` : "";
+
+    const evo = (uni.evolution_applied || []).map((p) =>
+      `<li>generation ${p.generation}: more worlds for `
+      + `<span class="mono">${esc((p.targets || []).join(", "))}</span></li>`).join("");
+
+    return `<details class="dojo-more"><summary>Full numbers</summary>
+      <div class="dojo-more-body">
+        ${matrix}${authorities}
+        ${evo ? `<h4 class="val-h4">Where the extra training went</h4><ul class="val-recs">${evo}</ul>` : ""}
+        <h4 class="val-h4">Run</h4>
+        <div class="metrics">
+          ${metricCard("Snapshots scored", rec.n_snapshots == null ? "—" : String(rec.n_snapshots))}
+          ${metricCard("Simulated snapshots", uni.n_snapshots == null ? "—" : String(uni.n_snapshots))}
+          ${metricCard("Generations", String(cfg.generations ?? "—"))}
+          ${metricCard("Worlds per generation", String(cfg.universes_per_gen ?? "—"))}
+          ${metricCard("Lattice", cfg.full_lattice ? "full" : "sample")}
+          ${metricCard("Mean session P&L", sign(ev.mean_session_pnl, 3))}
+        </div>
+        ${(rep.flags || []).length ? '<h4 class="val-h4">Flags</h4><div class="chips">'
+          + rep.flags.map((f) => `<span class="chip ${f.severity === "warn" ? "warn"
+            : f.severity === "alert" ? "veto" : ""}" title="${esc(f.detail || "")}">`
+            + `${esc(f.flag)}</span>`).join("") + "</div>" : ""}
+        ${(phases.learner || {}).staged_path
+          ? `<p class="tj-sub">Staged candidate: <span class="mono">${esc(phases.learner.staged_path)}</span></p>`
+          : ""}
+      </div></details>`;
   }
 
   function renderDojoDetail(rep) {
     $("dojo-detail-date").textContent = `${rep.report_date || "—"} · run #${rep.id}`;
     const m = rep.metrics || {};
     const phases = m.phases || {};
+    const rec = phases.recorded || {};
+    const uni = phases.universe || {};
+    const ev = rec.evaluation || {};
+    const targets = m.training_targets || {};
+    const [pillText, pillTone] = dojoStatusPill(rep);
     const parts = [];
-    const cfg = m.config || {};
-    const elapsed = num(m.elapsed_s);
 
-    parts.push(`<p class="val-summary">${esc(rep.summary || "—")}</p>`);
+    parts.push(`<p class="dojo-verdict"><span class="dojo-pill dojo-pill-${pillTone}">`
+      + `${esc(pillText)}</span></p>`);
+    // The last sentence is always what the run *did* — it gets its own line so
+    // the answer to "did anything change?" is not buried mid-paragraph.
+    const said = dojoStory(rep);
+    parts.push(`<p class="dojo-story">${said.slice(0, -1).join(" ")}</p>`);
+    parts.push(`<p class="dojo-story dojo-story-action">${said[said.length - 1]}</p>`);
+    parts.push(renderDojoStopReason(rep.human));
+
+    // The four numbers a person actually asks for, in words they use.
     parts.push('<div class="metrics">'
-      + metricCard("Elapsed", elapsed == null ? "—" : fmtDuration(elapsed))
-      + metricCard("Lattice", cfg.full_lattice ? "full" : "sample")
-      + metricCard("Generations", String(cfg.generations ?? "—"))
-      + metricCard("Universes/gen", String(cfg.universes_per_gen ?? "—"))
+      + metricCard("Real sessions", rec.n_sessions == null ? "—" : String(rec.n_sessions))
+      + metricCard("Profit on real tape", sign(ev.total_pnl, 2),
+          num(ev.total_pnl) != null && ev.total_pnl < 0 ? "warn" : "pos")
+      + metricCard("Trades won", ev.win_rate == null ? "—" : pct(ev.win_rate, 0))
+      + metricCard("Simulated markets", uni.n_universes == null ? "—" : String(uni.n_universes))
       + "</div>");
 
-    const flags = rep.flags || [];
-    if (flags.length) {
-      parts.push('<div class="chips">' + flags.map((f) =>
-        `<span class="chip ${f.severity === "warn" ? "warn" : f.severity === "alert" ? "veto" : ""}"
-          title="${esc(f.detail || "")}">${esc(f.flag)}</span>`).join("") + "</div>");
-      // Loud banner: a finished run with no tape looks like "no results" otherwise.
-      const thin = flags.filter((f) =>
-        /no_recorded|insufficient/i.test(String(f.flag || ""))
-        || /insufficient|no .*tape|need/i.test(String(f.detail || ""))
-      );
-      if (thin.length) {
-        parts.push('<p class="empty" style="margin-top:10px">'
-          + 'This Dojo run <b>finished</b>, but there was nothing useful to train on: '
-          + esc(thin.map((f) => f.detail || f.flag).join(" · "))
-          + ". Coverage below is synthetic only — P&amp;L stays empty until the "
-          + "shadow loop records market sessions.</p>");
-      }
+    const thin = (rec.status && rec.status !== "ok") || uni.status === "skipped";
+    if (thin) {
+      const why = [rec.note, uni.note].filter(Boolean).join(" · ");
+      parts.push(`<p class="empty" style="margin-top:10px">This run finished but had
+        little to work with: ${esc(why || "no recorded tape")}.</p>`);
     }
 
-    // phase status strip
-    parts.push('<div class="chips" style="margin-top:8px">' +
-      ["recorded", "learner", "universe"].map((p) => {
-        const ph = phases[p] || {};
-        const st = ph.status || ph.outcome || "—";
-        const cls = st === "ok" ? "ok" : (st === "error" ? "veto" : "warn");
-        return `<span class="chip ${cls}" title="${esc(ph.note || "")}">${esc(DOJO_PHASE_LABEL[p])}: ${esc(String(st))}</span>`;
-      }).join("") + "</div>");
-
-    // phase 1 — recorded tape
-    // SPY-DER reports use evaluation/{n_snapshots}; older 0DTE dojo used
-    // walk_forward/{n_ticks}. Prefer whichever is present.
-    const rec = phases.recorded || {};
-    if (rec.status === "ok") {
-      const wf = rec.walk_forward || {};
-      const ev = rec.evaluation || {};
-      const boot = wf.session_pnl_bootstrap || {};
-      const ci = (boot.ci_low != null && boot.ci_high != null)
-        ? `${sign(boot.ci_low, 3)} … ${sign(boot.ci_high, 3)}` : "—";
-      const nSess = rec.n_sessions ?? ev.n_sessions;
-      const nTicks = rec.n_ticks ?? rec.n_snapshots ?? ev.n_decisions;
-      const meanPnl = wf.mean_pnl != null ? wf.mean_pnl : ev.mean_session_pnl;
-      const totalPnl = ev.total_pnl;
-      const winRate = wf.mean_win_rate != null ? wf.mean_win_rate : ev.win_rate;
-      const trades = ev.trades;
-      parts.push('<h3 class="val-h3">Recorded tape — real-data walk-forward</h3>');
-      parts.push('<div class="metrics">'
-        + metricCard("Sessions", nSess == null ? "—" : String(nSess))
-        + metricCard("Snapshots", nTicks == null ? "—" : String(nTicks))
-        + metricCard("Mean sess P&L", sign(meanPnl, 3),
-            num(meanPnl) != null && meanPnl < 0 ? "warn" : "")
-        + metricCard("Total P&L", totalPnl == null ? "—" : sign(totalPnl, 3),
-            num(totalPnl) != null && totalPnl < 0 ? "warn" : "")
-        + metricCard("Trades", trades == null ? "—" : String(trades))
-        + metricCard("Win rate", winRate == null ? "—" : pct(winRate, 0))
-        + (wf.mean_sharpe != null
-          ? metricCard("Mean Sharpe", fmt(wf.mean_sharpe, 2)) : "")
-        + (wf.n_valid_folds != null
-          ? metricCard("Profitable folds",
-              `${wf.n_profitable ?? "—"}/${wf.n_valid_folds ?? "—"}`) : "")
-        + (ci !== "—" ? metricCard("Session CI (95%)", ci) : "")
-        + "</div>");
-      if (rec.note) {
-        parts.push(`<p class="tj-sub">${esc(rec.note)}</p>`);
-      }
-    } else if (rec.status || rec.note) {
-      parts.push('<h3 class="val-h3">Recorded tape — real-data walk-forward</h3>');
-      parts.push(`<p class="empty">${esc(rec.note || rec.status || "no recorded tape")}</p>`);
-    }
-
-    // phase 2 — learner
-    const lrn = phases.learner || {};
-    if (lrn.status === "ok" || lrn.outcome) {
-      parts.push('<h3 class="val-h3">Adaptive learner</h3>');
-      const rules = ((lrn.decision || {}).rules) || [];
-      const chips = rules.map((r) =>
-        `<span class="lrn-rule ${r.passed ? "ok" : "bad"}" title="${esc(r.detail || "")}">${r.passed ? "✓" : "✗"} ${esc(r.name)}</span>`).join("");
-      parts.push(`<p class="tj-sub">outcome: <b class="mono">${esc(lrn.outcome || lrn.status || "—")}</b>`
-        + (lrn.reason ? ` · reason: ${esc(lrn.reason)}` : "")
-        + (lrn.note ? ` · ${esc(lrn.note)}` : "") + "</p>");
-      if (lrn.staged_path) {
-        parts.push(`<p class="tj-sub">staged: <span class="mono">${esc(lrn.staged_path)}</span></p>`);
-      }
-      if (chips) parts.push(`<div class="lrn-rules">${chips}</div>`);
-    }
-
-    // phase 2b — promotion trial (SPY-DER re-runs the system with the staged
-    // change installed and promotes it itself; nothing here is a human queue).
+    parts.push(renderDojoGaps(uni, targets.targeted_archetype));
     parts.push(renderDojoPromotion(phases.promotion));
+    parts.push(renderDojoCoverage(uni));
+    parts.push(renderDojoRaw(rep));
 
-    // phase 3 — universe sparring
-    const uni = phases.universe || {};
-    if (uni.status === "ok") {
-      parts.push('<h3 class="val-h3">Universe sparring</h3>');
-      parts.push('<div class="metrics">'
-        + metricCard("Universes", String(uni.n_universes ?? "—"))
-        + metricCard("Snapshots", String(uni.n_snapshots ?? "—"))
-        + metricCard("Scored", String(uni.n_scored_universes ?? "—"))
-        + metricCard("Days/universe", String(uni.universe_days ?? "—"))
-        + "</div>");
-      if (uni.note) {
-        parts.push(`<p class="tj-sub">${esc(uni.note)}</p>`);
-      }
-      parts.push(renderDojoMatrix(uni));
-      parts.push(renderDojoCoverage(uni));
-      // `generations` is a count in current SPY-DER reports; older ones used an array.
-      const gens = Array.isArray(uni.generations)
-        ? uni.generations.length
-        : num(uni.generations);
-      if (gens != null && gens > 1) {
-        parts.push(`<p class="tj-sub">${gens} generations ·
-          ${uni.n_universes ?? "?"} universes`
-          + (uni.lattice_size != null ? ` of a ${uni.lattice_size}-cell lattice` : "")
-          + ` · each generation re-weights toward the weakest archetypes</p>`);
-      }
-    }
-
-    $("dojo-detail").innerHTML = parts.join("");
+    $("dojo-detail").innerHTML = parts.filter(Boolean).join("");
   }
 
   async function refreshDojo() {
